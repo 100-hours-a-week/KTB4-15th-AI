@@ -13,6 +13,7 @@ from app.main import app
 from app.virtual_fitting import router
 from app.virtual_fitting.exceptions import (
     FittingModelError,
+    FittingPostprocessError,
     FittingTimeoutError,
     InvalidFittingCombinationError,
     ProductImageMissingError,
@@ -24,6 +25,7 @@ from app.virtual_fitting.prompt import build_fitting_prompt
 from app.virtual_fitting.providers.base import FittingResult
 from app.virtual_fitting.providers.comment import MOCK_COMMENT, MOCK_TITLE, MockCommentProvider
 from app.virtual_fitting.providers.runware import RunwareConfigError, RunwarePrunaProvider
+from app.virtual_fitting.providers.runware_comment import RunwareCommentProvider
 from app.virtual_fitting.repositories.product_repository import ProductRepository
 from app.virtual_fitting.service import VirtualFittingService
 from tests.virtual_fitting_fixtures import make_bottom, make_top
@@ -92,6 +94,7 @@ def no_external_network(monkeypatch):
 
     monkeypatch.setattr("app.virtual_fitting.providers.runware.urlopen", forbidden)
     monkeypatch.setattr("app.virtual_fitting.providers.pruna.urlopen", forbidden)
+    monkeypatch.setattr("app.virtual_fitting.providers.runware_comment.urlopen", forbidden)
 
 
 @pytest.fixture
@@ -236,6 +239,7 @@ def test_invalid_request_is_400_and_service_is_not_opened(client, use_service, b
         (UnsupportedSubCategoryError("없는 카테고리"), 500, "unsupported_sub_category"),
         (FittingModelError("boom"), 502, "fitting_model_failed"),
         (FittingTimeoutError("slow"), 504, "fitting_timeout"),
+        (FittingPostprocessError("llm failed"), 500, "fitting_postprocess_failed"),
     ],
 )
 def test_domain_error_becomes_the_common_error_shape(client, use_service, error, status, message):
@@ -277,6 +281,8 @@ def test_service_is_assembled_from_the_v1_components(connection):
         assert isinstance(service.repository, ProductRepository)
         assert isinstance(service.fitting_provider, RunwarePrunaProvider)
         assert isinstance(service.comment_provider, MockCommentProvider)
+        # description_summary 가 DB 에 생기기 전까지 production 은 Mock 을 쓴다 (A-2 에서 교체).
+        assert not isinstance(service.comment_provider, RunwareCommentProvider)
         # 트랜잭션을 연 채로 Runware 응답을 기다리지 않는다.
         assert connection.autocommit is True
         assert connection.closed is False

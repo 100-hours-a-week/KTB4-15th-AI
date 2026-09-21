@@ -52,3 +52,10 @@ class UnsupportedSubCategoryError(VirtualFittingError):
     def __init__(self, sub_category: str):
         self.sub_category = sub_category
         super().__init__(f"영어 garment 명칭 매핑이 없는 sub_category 입니다: {sub_category!r}")
+
+
+class FittingPostprocessError(VirtualFittingError):
+    """가상피팅 이미지는 만들어졌지만 llm_comment / llm_title 생성에 실패했을 때 (명세 V1 표)."""
+
+    status_code = 500
+    message = "fitting_postprocess_failed"
