@@ -396,7 +396,14 @@ def test_connection_failure_is_500_database_error_without_details(client, monkey
 
     assert response.status_code == 500
     assert response.json() == DB_ERROR_BODY
-    for leaked in ("secret-password", "db-host", "10.0.0.5", "5432", "Connection refused", SECRET_URL):
+    for leaked in (
+        "secret-password",
+        "db-host",
+        "10.0.0.5",
+        "5432",
+        "Connection refused",
+        SECRET_URL,
+    ):
         assert leaked not in response.text
     assert len(attempts) == 1  # 재시도 없음
     # 서버 로그에는 원인이 남되(traceback 체인), DATABASE_URL 과 비밀번호는 없다.
@@ -489,7 +496,11 @@ def test_the_connection_is_closed_when_fitting_fails(
 @pytest.mark.parametrize(
     ("rows", "status", "message"),
     [
-        ([TOP_ROW, (3, "https://img/top2.jpg", "상의", "후디")], 422, "invalid_fitting_combination"),
+        (
+            [TOP_ROW, (3, "https://img/top2.jpg", "상의", "후디")],
+            422,
+            "invalid_fitting_combination",
+        ),
         ([(1, None, "상의", "스웨트셔츠")], 422, "product_image_missing"),
         ([(1, "https://img/x.jpg", "상의", "없는 카테고리")], 500, "unsupported_sub_category"),
     ],

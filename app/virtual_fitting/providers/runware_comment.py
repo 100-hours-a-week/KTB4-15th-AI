@@ -150,7 +150,9 @@ class RunwareCommentProvider:
     def generate_comment(self, result_image_url: str, description_summaries: Sequence[str]) -> str:
         if not result_image_url.startswith(("http://", "https://")):
             raise ValueError("result_image_url 은 http(s) URL 이어야 합니다.")
-        if not description_summaries or any(not summary.strip() for summary in description_summaries):
+        if not description_summaries or any(
+            not summary.strip() for summary in description_summaries
+        ):
             raise ValueError("description_summaries 는 비어 있지 않은 문자열이어야 합니다.")
 
         return self._run(build_comment_task(result_image_url, description_summaries, _task_uuid()))

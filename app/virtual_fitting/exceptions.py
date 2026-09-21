@@ -62,9 +62,10 @@ class FittingPostprocessError(VirtualFittingError):
 
 
 class FittingDatabaseError(VirtualFittingError):
-    """AI PostgreSQL 연결 또는 상품 조회 자체가 실패했을 때. 조회는 성공했는데 상품이 없는 경우가 아니다.
+    """AI PostgreSQL 연결 또는 상품 조회 자체가 실패했을 때.
 
-    psycopg 의 원인 예외는 `from` 으로만 연결한다. 응답과 이 메시지에는 접속 정보나 DB 상세를 싣지 않는다.
+    조회는 성공했는데 상품이 없는 경우가 아니다. psycopg 의 원인 예외는 `from` 으로만
+    연결한다. 응답과 이 메시지에는 접속 정보나 DB 상세를 싣지 않는다.
     """
 
     status_code = 500
