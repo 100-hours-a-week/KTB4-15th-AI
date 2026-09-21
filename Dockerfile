@@ -18,9 +18,9 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /build
 
-# 운영 의존성은 버전이 고정된 requirements.txt 기준으로 설치한다.
+# 운영 의존성은 해시 고정된 requirements.txt 기준으로 설치한다.
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --require-hashes -r requirements.txt
 
 # =========================
 # 2. Test stage
@@ -31,10 +31,12 @@ FROM builder AS test
 
 # 테스트/린트용 dev 의존성은 test stage에만 설치한다.
 COPY requirements-dev.txt .
-RUN pip install -r requirements-dev.txt
+RUN pip install --require-hashes -r requirements-dev.txt
 
 WORKDIR /app
 
+# pyproject.toml의 ruff/pytest 설정을 로컬 개발 환경과 동일하게 적용한다.
+COPY pyproject.toml .
 COPY app ./app
 COPY tests ./tests
 
