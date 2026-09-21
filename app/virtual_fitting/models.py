@@ -14,3 +14,12 @@ class FittingProduct:
     image_url: str | None
     main_category: str
     sub_category: str
+
+
+@dataclass(frozen=True)
+class VirtualFittingResult:
+    """Service 의 최종 결과. API 응답 형식은 schemas.SyncFittingResponse 가 담당한다."""
+
+    result_image_url: str
+    llm_comment: str
+    llm_title: str

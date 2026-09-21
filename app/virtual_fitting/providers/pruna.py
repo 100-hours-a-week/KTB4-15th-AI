@@ -8,21 +8,19 @@ POST https://api.pruna.ai/v1/predictions
 
 import json
 import os
-import socket
 from collections.abc import Callable, Mapping
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from app.virtual_fitting.exceptions import FittingModelError, FittingTimeoutError
+from app.virtual_fitting.exceptions import FittingModelError
 from app.virtual_fitting.providers.base import FittingInput, FittingResult
+from app.virtual_fitting.providers.http import send_request
 
 PRUNA_ENDPOINT = "https://api.pruna.ai/v1/predictions"
 PRUNA_MODEL = "p-image-try-on"
 API_KEY_ENV = "PRUNA_API_KEY"
 # Try-Sync 는 서버에서 60초까지 기다리므로 그보다 조금 길게 잡는다.
 DEFAULT_TIMEOUT = 70.0
-_ERROR_BODY_LIMIT = 200
 
 
 class PrunaConfigError(RuntimeError):
@@ -65,10 +63,6 @@ def parse_result(body: bytes) -> FittingResult:
     return FittingResult(result_image_url=url)
 
 
-def _is_timeout(error: BaseException) -> bool:
-    return isinstance(error, (socket.timeout, TimeoutError))
-
-
 class PrunaDirectProvider:
     """FittingProvider 구현체. Pruna API 를 직접 호출한다."""
 
@@ -92,19 +86,9 @@ class PrunaDirectProvider:
             headers=self._headers(),
             method="POST",
         )
-        try:
-            with self._opener(request, timeout=self.timeout) as response:
-                body = response.read()
-        except HTTPError as error:
-            raise self._http_error(error) from error
-        except URLError as error:
-            if _is_timeout(error.reason):
-                raise FittingTimeoutError("Pruna 요청 시간이 초과되었습니다.") from error
-            raise FittingModelError("Pruna 요청에 실패했습니다.") from error
-        except TimeoutError as error:
-            raise FittingTimeoutError("Pruna 요청 시간이 초과되었습니다.") from error
-        except OSError as error:
-            raise FittingModelError("Pruna 요청에 실패했습니다.") from error
+        body = send_request(
+            request, opener=self._opener, timeout=self.timeout, service="Pruna"
+        )
         return parse_result(body)
 
     def _headers(self) -> Mapping[str, str]:
@@ -114,13 +98,3 @@ class PrunaDirectProvider:
             "Try-Sync": "true",
             "Content-Type": "application/json",
         }
-
-    @staticmethod
-    def _http_error(error: HTTPError) -> Exception:
-        if error.code == 504:
-            return FittingTimeoutError("Pruna 동기 요청이 시간 내에 완료되지 않았습니다.")
-        try:
-            detail = error.read()[:_ERROR_BODY_LIMIT].decode("utf-8", "replace")
-        except OSError:
-            detail = ""
-        return FittingModelError(f"Pruna HTTP 오류: {error.code} {detail}".strip())

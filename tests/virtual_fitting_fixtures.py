@@ -1,4 +1,3 @@
-
 from app.virtual_fitting.models import BOTTOM_CATEGORY, TOP_CATEGORY, FittingProduct
 
 

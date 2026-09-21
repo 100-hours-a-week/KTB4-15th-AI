@@ -49,7 +49,7 @@ def select_fitting_products(
 ) -> list[FittingProduct]:
     """조회 → 존재 확인 → 조합 검증 → 상의 → 하의 정렬.
 
-    반환 리스트의 순서가 Pruna 의 garment_images[i] ↔ prompt 의 Garment (i+1) 순서다.
+    반환 리스트의 순서가 garment_image_urls[i] ↔ prompt 의 (i+1)번째 garment image 순서다.
     """
     found = {
         int(product.product_code): product

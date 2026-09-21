@@ -54,7 +54,7 @@ def _input():
     return FittingInput(
         person_image_url="https://example.com/user.png",
         garment_image_urls=["https://img/top.jpg", "https://img/bottom.jpg"],
-        prompt="Garment 1: 후디.\nGarment 2: 데님 팬츠.\nDress the person with the provided garments.",
+        prompt="Dress the person in the sweatshirt from the first garment image and the slim pants from the second garment image.",
     )
 
 
