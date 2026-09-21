@@ -9,7 +9,8 @@ POST https://api.pruna.ai/v1/predictions
 import json
 import os
 import socket
-from typing import Any, Callable, Mapping, Optional
+from collections.abc import Callable, Mapping
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -73,11 +74,11 @@ class PrunaDirectProvider:
 
     def __init__(
         self,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         *,
         endpoint: str = PRUNA_ENDPOINT,
         timeout: float = DEFAULT_TIMEOUT,
-        opener: Optional[Callable[..., Any]] = None,
+        opener: Callable[..., Any] | None = None,
     ) -> None:
         self._api_key = api_key if api_key is not None else get_pruna_api_key()
         self.endpoint = endpoint
@@ -100,7 +101,7 @@ class PrunaDirectProvider:
             if _is_timeout(error.reason):
                 raise FittingTimeoutError("Pruna 요청 시간이 초과되었습니다.") from error
             raise FittingModelError("Pruna 요청에 실패했습니다.") from error
-        except (socket.timeout, TimeoutError) as error:
+        except TimeoutError as error:
             raise FittingTimeoutError("Pruna 요청 시간이 초과되었습니다.") from error
         except OSError as error:
             raise FittingModelError("Pruna 요청에 실패했습니다.") from error
@@ -120,6 +121,6 @@ class PrunaDirectProvider:
             return FittingTimeoutError("Pruna 동기 요청이 시간 내에 완료되지 않았습니다.")
         try:
             detail = error.read()[:_ERROR_BODY_LIMIT].decode("utf-8", "replace")
-        except Exception:
+        except OSError:
             detail = ""
         return FittingModelError(f"Pruna HTTP 오류: {error.code} {detail}".strip())
