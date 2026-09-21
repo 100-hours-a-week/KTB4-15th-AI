@@ -8,13 +8,14 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 
+import psycopg
 from fastapi import APIRouter, Depends
 
 from app.config.database import get_connection
 from app.errors import ErrorResponse, error_response
 from app.security import verify_internal_key
 from app.virtual_fitting import controller
-from app.virtual_fitting.exceptions import VirtualFittingError
+from app.virtual_fitting.exceptions import FittingDatabaseError, VirtualFittingError
 from app.virtual_fitting.providers.comment import MockCommentProvider
 from app.virtual_fitting.providers.runware import RunwarePrunaProvider
 from app.virtual_fitting.repositories.product_repository import ProductRepository
@@ -45,7 +46,10 @@ def open_virtual_fitting_service() -> Iterator[VirtualFittingService]:
     Depends 로 만들지 않는 이유: FastAPI 는 body 검증이 실패한 요청에서도 의존성을 먼저
     실행한다. 그러면 잘못된 요청마다 DB 연결을 열고, 설정이 빠진 서버는 400 대신 500 을 낸다.
     """
-    connection = get_connection()
+    try:
+        connection = get_connection()
+    except psycopg.Error as error:
+        raise FittingDatabaseError("AI PostgreSQL 연결에 실패했습니다.") from error
     try:
         # SELECT 뒤에 트랜잭션을 연 채로 Runware 응답(최대 60초)을 기다리지 않게 한다.
         connection.autocommit = True

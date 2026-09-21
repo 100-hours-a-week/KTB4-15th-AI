@@ -3,8 +3,10 @@
 Service 와 외부 서비스를 fake 로 바꿔 API 계층만 본다. 실제 DB, Runware, Pruna 는 부르지 않는다.
 """
 
+import logging
 from contextlib import nullcontext
 
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
@@ -12,6 +14,7 @@ from app.config import settings
 from app.main import app
 from app.virtual_fitting import router
 from app.virtual_fitting.exceptions import (
+    FittingDatabaseError,
     FittingModelError,
     FittingPostprocessError,
     FittingTimeoutError,
@@ -240,6 +243,7 @@ def test_invalid_request_is_400_and_service_is_not_opened(client, use_service, b
         (FittingModelError("boom"), 502, "fitting_model_failed"),
         (FittingTimeoutError("slow"), 504, "fitting_timeout"),
         (FittingPostprocessError("llm failed"), 500, "fitting_postprocess_failed"),
+        (FittingDatabaseError("db failed"), 500, "database_error"),
     ],
 )
 def test_domain_error_becomes_the_common_error_shape(client, use_service, error, status, message):
@@ -304,3 +308,198 @@ def test_connection_is_closed_when_assembly_fails(connection, monkeypatch):
         pass
 
     assert connection.closed is True
+
+
+# --- PostgreSQL 오류 (실제 DB 없이 fake connection 으로) ---
+
+SECRET_URL = "postgresql://user:secret-password@db-host:5432/db"
+LIBPQ_MESSAGE = 'connection to server at "db-host" (10.0.0.5), port 5432 failed: Connection refused'
+DB_ERROR_BODY = {"code": 500, "message": "database_error", "data": None}
+TOP_ROW = (1, "https://img/top.jpg", "상의", "스웨트셔츠")
+BOTTOM_ROW = (2, "https://img/bottom.jpg", "하의", "슬림 팬츠")
+
+
+class RowsCursor:
+    def __init__(self, rows, error=None):
+        self._rows = rows
+        self._error = error
+
+    def execute(self, sql, params):
+        if self._error is not None:
+            raise self._error
+
+    def fetchall(self):
+        return self._rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+
+class DbConnection(FakeConnection):
+    """실제 ProductRepository 가 쓰는 cursor 를 가진 fake. query 오류나 결과 행을 정할 수 있다."""
+
+    def __init__(self, rows=(), error=None):
+        super().__init__()
+        self._rows = list(rows)
+        self._error = error
+
+    def cursor(self):
+        return RowsCursor(self._rows, self._error)
+
+
+class RaisingFittingProvider:
+    def __init__(self, error):
+        self._error = error
+
+    def try_on(self, fitting_input):
+        raise self._error
+
+
+@pytest.fixture
+def real_assembly(monkeypatch):
+    """실제 open_virtual_fitting_service 를 쓰되 DB connection 과 VTON Provider 만 바꾼다."""
+    monkeypatch.setenv("RUNWARE_VTON_API_KEY", "test-vton-key")
+
+    def use(connection, provider=None):
+        monkeypatch.setattr(router, "get_connection", lambda: connection)
+        if provider is not None:
+            monkeypatch.setattr(router, "RunwarePrunaProvider", lambda: provider)
+        return connection
+
+    return use
+
+
+def _fitting_request(client, *codes):
+    body = {
+        "user_image_url": "https://example.com/person.jpg",
+        "products": [{"product_code": code} for code in codes],
+    }
+    return client.post(URL, json=body, headers=AUTH)
+
+
+def test_connection_failure_is_500_database_error_without_details(client, monkeypatch, caplog):
+    monkeypatch.setenv("DATABASE_URL", SECRET_URL)
+    monkeypatch.setenv("RUNWARE_VTON_API_KEY", "test-vton-key")
+    attempts = []
+
+    def failing_connect(url, **kwargs):
+        attempts.append(url)
+        raise psycopg.OperationalError(LIBPQ_MESSAGE)
+
+    monkeypatch.setattr(psycopg, "connect", failing_connect)
+
+    with caplog.at_level(logging.ERROR):
+        response = _fitting_request(client, "1")
+
+    assert response.status_code == 500
+    assert response.json() == DB_ERROR_BODY
+    for leaked in ("secret-password", "db-host", "10.0.0.5", "5432", "Connection refused", SECRET_URL):
+        assert leaked not in response.text
+    assert len(attempts) == 1  # 재시도 없음
+    # 서버 로그에는 원인이 남되(traceback 체인), DATABASE_URL 과 비밀번호는 없다.
+    assert "database_error" in caplog.text
+    assert "OperationalError" in caplog.text
+    assert "secret-password" not in caplog.text
+    assert SECRET_URL not in caplog.text
+
+
+def test_connection_failure_never_tries_to_close_a_missing_connection(client, monkeypatch):
+    closes = []
+    monkeypatch.setattr(FakeConnection, "close", lambda self: closes.append(self))
+
+    def failing():
+        raise psycopg.OperationalError(LIBPQ_MESSAGE)
+
+    monkeypatch.setattr(router, "get_connection", failing)
+
+    response = _fitting_request(client, "1")
+
+    assert response.json() == DB_ERROR_BODY
+    assert closes == []
+
+
+def test_query_failure_is_500_database_error_and_the_connection_is_closed(
+    client, real_assembly, caplog
+):
+    connection = real_assembly(DbConnection(error=psycopg.OperationalError(LIBPQ_MESSAGE)))
+
+    with caplog.at_level(logging.ERROR):
+        response = _fitting_request(client, "1")
+
+    assert response.status_code == 500
+    assert response.json() == DB_ERROR_BODY
+    assert "db-host" not in response.text and "Connection refused" not in response.text
+    assert connection.closed is True
+    assert "OperationalError" in caplog.text
+
+
+def test_query_that_succeeds_with_no_rows_is_404_not_a_database_error(client, real_assembly):
+    connection = real_assembly(DbConnection(rows=[]))
+
+    response = _fitting_request(client, "999")
+
+    assert response.status_code == 404
+    assert response.json() == {"code": 404, "message": "product_not_found", "data": None}
+    assert connection.closed is True
+
+
+def test_successful_lookup_runs_the_whole_flow_and_closes_the_connection(client, real_assembly):
+    provider = FakeFittingProvider()
+    connection = real_assembly(DbConnection(rows=[TOP_ROW, BOTTOM_ROW]), provider)
+
+    response = _fitting_request(client, "2", "1")
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "result_image_url": "https://im.runware.ai/fake.jpg",
+        "llm_title": MOCK_TITLE,
+        "llm_comment": MOCK_COMMENT,
+    }
+    [fitting_input] = provider.inputs
+    assert list(fitting_input.garment_image_urls) == ["https://img/top.jpg", "https://img/bottom.jpg"]
+    assert connection.closed is True
+
+
+@pytest.mark.parametrize(
+    ("error", "status", "message"),
+    [
+        (FittingModelError("boom"), 502, "fitting_model_failed"),
+        (FittingTimeoutError("slow"), 504, "fitting_timeout"),
+        (RuntimeError("어딘가 터짐"), 500, "internal_server_error"),
+    ],
+    ids=["vton-error", "vton-timeout", "unexpected"],
+)
+def test_the_connection_is_closed_when_fitting_fails(
+    client, real_assembly, error, status, message
+):
+    connection = real_assembly(
+        DbConnection(rows=[TOP_ROW, BOTTOM_ROW]), RaisingFittingProvider(error)
+    )
+
+    response = _fitting_request(client, "1", "2")
+
+    assert response.status_code == status
+    assert response.json() == {"code": status, "message": message, "data": None}
+    assert connection.closed is True
+
+
+@pytest.mark.parametrize(
+    ("rows", "status", "message"),
+    [
+        ([TOP_ROW, (3, "https://img/top2.jpg", "상의", "후디")], 422, "invalid_fitting_combination"),
+        ([(1, None, "상의", "스웨트셔츠")], 422, "product_image_missing"),
+        ([(1, "https://img/x.jpg", "상의", "없는 카테고리")], 500, "unsupported_sub_category"),
+    ],
+    ids=["combination", "image-missing", "unsupported-sub-category"],
+)
+def test_existing_domain_errors_keep_their_meaning(client, real_assembly, rows, status, message):
+    real_assembly(DbConnection(rows=rows), FakeFittingProvider())
+    codes = [str(row[0]) for row in rows]
+
+    response = _fitting_request(client, *codes)
+
+    assert response.status_code == status
+    assert response.json() == {"code": status, "message": message, "data": None}
