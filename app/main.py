@@ -13,6 +13,7 @@ from app.chat.graph import build_graph
 from app.config import settings
 from app.config.checkpointer import checkpointer_scope
 from app.errors import register_error_handlers
+from app.virtual_fitting import router as virtual_fitting_router
 
 
 @asynccontextmanager
@@ -27,8 +28,8 @@ app = FastAPI(title="KTB4-15th AI Server", lifespan=lifespan)
 
 register_error_handlers(app)
 app.include_router(chat_router.router)
+app.include_router(virtual_fitting_router.router)
 # 도메인이 늘어나면 여기에 한 줄씩 추가한다
-# app.include_router(virtual_fitting_router.router)
 
 
 def run() -> None:
