@@ -1,0 +1,4 @@
+ruff
+pytest
+httpx
+python-dotenv
