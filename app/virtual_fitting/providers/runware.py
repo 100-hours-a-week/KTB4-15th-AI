@@ -1,7 +1,7 @@
 """Runware 플랫폼 경유 Pruna p-image-try-on 동기 가상피팅 Provider.
 
 POST https://api.runware.ai/v1
-  헤더: Authorization: Bearer <RUNWARE_API_KEY>
+  헤더: Authorization: Bearer <RUNWARE_VTON_API_KEY>
   본문: [{"taskType": "imageInference", "model": "prunaai:p-image@try-on",
           "inputs": {"referenceImages": [{"image", "role": "person" | "garment"}]},
           "positivePrompt", "deliveryMethod": "sync", ...}]
@@ -21,20 +21,31 @@ from app.virtual_fitting.providers.http import send_request
 
 RUNWARE_ENDPOINT = "https://api.runware.ai/v1"
 RUNWARE_MODEL = "prunaai:p-image@try-on"
-API_KEY_ENV = "RUNWARE_API_KEY"
+# Runware 키는 용도별로 나눈다. VTON Provider 는 VTON 키만 쓴다.
+VTON_API_KEY_ENV = "RUNWARE_VTON_API_KEY"
+LLM_API_KEY_ENV = "RUNWARE_LLM_API_KEY"
 DEFAULT_TIMEOUT = 60.0
 _ERROR_DETAIL_LIMIT = 200
 
 
 class RunwareConfigError(RuntimeError):
-    """RUNWARE_API_KEY가 설정되지 않았을 때 발생한다."""
+    """RUNWARE_VTON_API_KEY / RUNWARE_LLM_API_KEY가 설정되지 않았을 때 발생한다."""
 
 
-def get_runware_api_key() -> str:
-    key = os.getenv(API_KEY_ENV)
+def _read_api_key(env_name: str) -> str:
+    key = os.getenv(env_name)
     if not key or not key.strip():
-        raise RunwareConfigError(f"{API_KEY_ENV} 환경변수가 설정되지 않았습니다.")
+        raise RunwareConfigError(f"{env_name} 환경변수가 설정되지 않았습니다.")
     return key.strip()
+
+
+def get_runware_vton_api_key() -> str:
+    return _read_api_key(VTON_API_KEY_ENV)
+
+
+def get_runware_llm_api_key() -> str:
+    """Runware LLM comment/title Provider 가 쓸 키. 지금은 startup 검증에만 쓴다."""
+    return _read_api_key(LLM_API_KEY_ENV)
 
 
 def build_payload(fitting_input: FittingInput, task_uuid: str) -> list:
@@ -92,7 +103,7 @@ class RunwarePrunaProvider:
         timeout: float = DEFAULT_TIMEOUT,
         opener: Callable[..., Any] | None = None,
     ) -> None:
-        self._api_key = api_key if api_key is not None else get_runware_api_key()
+        self._api_key = api_key if api_key is not None else get_runware_vton_api_key()
         self.endpoint = endpoint
         self.timeout = timeout
         self._opener = opener or urlopen

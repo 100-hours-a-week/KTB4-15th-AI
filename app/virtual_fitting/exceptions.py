@@ -52,3 +52,21 @@ class UnsupportedSubCategoryError(VirtualFittingError):
     def __init__(self, sub_category: str):
         self.sub_category = sub_category
         super().__init__(f"영어 garment 명칭 매핑이 없는 sub_category 입니다: {sub_category!r}")
+
+
+class FittingPostprocessError(VirtualFittingError):
+    """가상피팅 이미지는 만들어졌지만 llm_comment / llm_title 생성에 실패했을 때 (명세 V1 표)."""
+
+    status_code = 500
+    message = "fitting_postprocess_failed"
+
+
+class FittingDatabaseError(VirtualFittingError):
+    """AI PostgreSQL 연결 또는 상품 조회 자체가 실패했을 때.
+
+    조회는 성공했는데 상품이 없는 경우가 아니다. psycopg 의 원인 예외는 `from` 으로만
+    연결한다. 응답과 이 메시지에는 접속 정보나 DB 상세를 싣지 않는다.
+    """
+
+    status_code = 500
+    message = "database_error"

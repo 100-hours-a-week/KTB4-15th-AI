@@ -52,7 +52,10 @@ def _input():
     return FittingInput(
         person_image_url="https://example.com/user.png",
         garment_image_urls=["https://img/top.jpg", "https://img/bottom.jpg"],
-        prompt="Dress the person in the sweatshirt from the first garment image and the slim pants from the second garment image.",
+        prompt=(
+            "Dress the person in the sweatshirt from the first garment image "
+            "and the slim pants from the second garment image."
+        ),
     )
 
 
@@ -190,7 +193,7 @@ def test_api_key_is_not_leaked_in_error_messages():
 
 
 def test_reads_api_key_from_environment(monkeypatch):
-    monkeypatch.setenv("RUNWARE_API_KEY", f"  {API_KEY}  ")
+    monkeypatch.setenv("RUNWARE_VTON_API_KEY", f"  {API_KEY}  ")
     opener = FakeOpener(SUCCESS)
 
     RunwarePrunaProvider(opener=opener).try_on(_input())
@@ -202,12 +205,43 @@ def test_reads_api_key_from_environment(monkeypatch):
 @pytest.mark.parametrize("value", [None, "", "   "])
 def test_missing_api_key_raises_config_error(monkeypatch, value):
     if value is None:
-        monkeypatch.delenv("RUNWARE_API_KEY", raising=False)
+        monkeypatch.delenv("RUNWARE_VTON_API_KEY", raising=False)
     else:
-        monkeypatch.setenv("RUNWARE_API_KEY", value)
+        monkeypatch.setenv("RUNWARE_VTON_API_KEY", value)
     with pytest.raises(RunwareConfigError):
         RunwarePrunaProvider()
 
 
 def test_satisfies_fitting_provider_interface():
     assert isinstance(_provider(FakeOpener(SUCCESS)), FittingProvider)
+
+
+def test_uses_only_the_vton_key_and_ignores_the_llm_key(monkeypatch):
+    monkeypatch.setenv("RUNWARE_VTON_API_KEY", "vton-key-value")
+    monkeypatch.setenv("RUNWARE_LLM_API_KEY", "llm-key-value")
+    opener = FakeOpener(SUCCESS)
+
+    RunwarePrunaProvider(opener=opener).try_on(_input())
+
+    [(request, _)] = opener.calls
+    assert request.get_header("Authorization") == "Bearer vton-key-value"
+    sent = request.data.decode() + str(dict(request.header_items()))
+    assert "llm-key-value" not in sent
+
+
+def test_llm_key_alone_is_not_enough_for_the_vton_provider(monkeypatch):
+    monkeypatch.delenv("RUNWARE_VTON_API_KEY", raising=False)
+    monkeypatch.setenv("RUNWARE_LLM_API_KEY", "llm-key-value")
+
+    with pytest.raises(RunwareConfigError) as exc_info:
+        RunwarePrunaProvider()
+
+    assert str(exc_info.value) == "RUNWARE_VTON_API_KEY 환경변수가 설정되지 않았습니다."
+
+
+def test_legacy_generic_key_is_no_longer_used(monkeypatch):
+    monkeypatch.delenv("RUNWARE_VTON_API_KEY", raising=False)
+    monkeypatch.setenv("RUNWARE_API_KEY", "legacy-key-value")
+
+    with pytest.raises(RunwareConfigError):
+        RunwarePrunaProvider()

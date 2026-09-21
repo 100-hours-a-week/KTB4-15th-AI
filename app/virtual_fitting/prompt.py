@@ -7,7 +7,10 @@ _ORDINALS = (
     "first", "second", "third", "fourth", "fifth", "sixth",
     "seventh", "eighth", "ninth", "tenth", "eleventh",
 )
-_PRESERVE = "Preserve the person's face, hair, body shape, pose, hands, camera angle, and background."
+_PRESERVE = (
+    "Preserve the person's face, hair, body shape, pose, hands, "
+    "camera angle, and background."
+)
 
 
 def build_fitting_prompt(products: Sequence[FittingProduct]) -> str:
@@ -16,12 +19,16 @@ def build_fitting_prompt(products: Sequence[FittingProduct]) -> str:
     정렬은 호출 전에 끝나 있어야 하며, garment_image_urls 도 같은 순서여야 한다.
     """
     parts = [
-        f"the {get_english_sub_category(product.sub_category)} from the {_ORDINALS[index]} garment image"
+        f"the {get_english_sub_category(product.sub_category)} "
+        f"from the {_ORDINALS[index]} garment image"
         for index, product in enumerate(products)
     ]
     if len(parts) == 1:
         dress = f"Dress the person in {parts[0]}."
-        realism = "Keep the garment realistic with natural folds, accurate fit, and believable shadows."
+        realism = (
+            "Keep the garment realistic with natural folds, accurate fit, "
+            "and believable shadows."
+        )
     else:
         dress = f"Dress the person in {', '.join(parts[:-1])} and {parts[-1]}."
         which = "both garments" if len(parts) == 2 else "all garments"

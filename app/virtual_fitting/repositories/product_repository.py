@@ -1,6 +1,9 @@
 from collections.abc import Sequence
 from typing import Any
 
+import psycopg
+
+from app.virtual_fitting.exceptions import FittingDatabaseError
 from app.virtual_fitting.models import FittingProduct
 
 _SELECT_COLUMNS = (
@@ -37,7 +40,10 @@ class ProductRepository:
         codes = sorted({int(code) for code in product_codes})
         if not codes:
             return []
-        with self._connection.cursor() as cursor:
-            cursor.execute(build_select_sql(), (codes,))
-            rows = cursor.fetchall()
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(build_select_sql(), (codes,))
+                rows = cursor.fetchall()
+        except psycopg.Error as error:
+            raise FittingDatabaseError("AI PostgreSQL 상품 조회에 실패했습니다.") from error
         return [_row_to_product(row) for row in rows]

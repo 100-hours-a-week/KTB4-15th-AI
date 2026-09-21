@@ -13,10 +13,18 @@ from app.chat.graph import build_graph
 from app.config import settings
 from app.config.checkpointer import checkpointer_scope
 from app.errors import register_error_handlers
+from app.virtual_fitting import router as virtual_fitting_router
+from app.virtual_fitting.providers.runware import (
+    get_runware_llm_api_key,
+    get_runware_vton_api_key,
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 가상피팅이 쓰는 Runware 키다. 빠진 채로 뜨면 첫 요청에서야 500 이 나므로 여기서 멈춘다.
+    get_runware_vton_api_key()
+    get_runware_llm_api_key()
     async with checkpointer_scope() as checkpointer:
         app.state.checkpointer = checkpointer
         app.state.graph = build_graph(checkpointer)
@@ -27,8 +35,8 @@ app = FastAPI(title="KTB4-15th AI Server", lifespan=lifespan)
 
 register_error_handlers(app)
 app.include_router(chat_router.router)
+app.include_router(virtual_fitting_router.router)
 # 도메인이 늘어나면 여기에 한 줄씩 추가한다
-# app.include_router(virtual_fitting_router.router)
 
 
 def run() -> None:

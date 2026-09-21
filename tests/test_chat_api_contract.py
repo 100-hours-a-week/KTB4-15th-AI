@@ -18,6 +18,8 @@ def client(monkeypatch):
     monkeypatch.setattr(settings, "INTERNAL_API_KEY", KEY)
     monkeypatch.setattr(settings, "AUTH_DISABLED", False)
     monkeypatch.setattr(settings, "CHECKPOINT_DSN", "")
+    monkeypatch.setenv("RUNWARE_VTON_API_KEY", "test-vton-key")
+    monkeypatch.setenv("RUNWARE_LLM_API_KEY", "test-llm-key")
     with TestClient(app, raise_server_exceptions=False) as test_client:
         yield test_client
 
