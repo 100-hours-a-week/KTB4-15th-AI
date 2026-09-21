@@ -2,7 +2,6 @@
 
 import io
 import json
-import socket
 from urllib.error import HTTPError, URLError
 
 import pytest
@@ -55,7 +54,7 @@ def _input():
     return FittingInput(
         person_image_url="https://example.com/user.png",
         garment_image_urls=["https://img/top.jpg", "https://img/bottom.jpg"],
-        prompt="Garment 1: 후디.\nGarment 2: 데님 팬츠.\nDress the person with the provided garments.",
+        prompt="Dress the person in the sweatshirt from the first garment image and the slim pants from the second garment image.",
     )
 
 
@@ -145,7 +144,7 @@ def test_http_504_becomes_timeout_error():
 
 @pytest.mark.parametrize(
     "error",
-    [socket.timeout("timed out"), TimeoutError(), URLError(socket.timeout("timed out"))],
+    [TimeoutError("timed out"), TimeoutError(), URLError(TimeoutError("timed out"))],
 )
 def test_timeout_becomes_timeout_error(error):
     with pytest.raises(FittingTimeoutError) as exc_info:

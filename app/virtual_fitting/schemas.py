@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field
 
+
 class FittingProductRequest(BaseModel):
     # DB의 product_code는 BIGINT 이므로 숫자 문자열만 허용한다.
     product_code: str = Field(pattern=r"^[0-9]{1,18}$")

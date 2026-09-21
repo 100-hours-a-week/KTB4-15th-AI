@@ -1,6 +1,6 @@
 """요청된 product_code 를 조회하고 조합을 검증한 뒤 상의 → 하의 순으로 정렬한다."""
 
-from typing import Sequence
+from collections.abc import Sequence
 
 from app.virtual_fitting.exceptions import (
     InvalidFittingCombinationError,
@@ -49,7 +49,7 @@ def select_fitting_products(
 ) -> list[FittingProduct]:
     """조회 → 존재 확인 → 조합 검증 → 상의 → 하의 정렬.
 
-    반환 리스트의 순서가 Pruna 의 garment_images[i] ↔ prompt 의 Garment (i+1) 순서다.
+    반환 리스트의 순서가 garment_image_urls[i] ↔ prompt 의 (i+1)번째 garment image 순서다.
     """
     found = {
         int(product.product_code): product

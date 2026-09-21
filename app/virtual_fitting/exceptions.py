@@ -1,10 +1,6 @@
-"""가상피팅 도메인 예외.
+"""가상피팅 도메인 예외. Router 에서 이 값으로 HTTP Response 의 code / message 를 구성한다."""
 
-status_code / message 는 API 명세서(1단계)의 V1 특수 오류 처리 표를 따른다.
-Router 에서 이 값으로 HTTP Response 의 code / message 를 구성한다.
-"""
-
-from typing import Sequence
+from collections.abc import Sequence
 
 
 class VirtualFittingError(Exception):
@@ -45,3 +41,14 @@ class FittingModelError(VirtualFittingError):
 class FittingTimeoutError(VirtualFittingError):
     status_code = 504
     message = "fitting_timeout"
+
+
+class UnsupportedSubCategoryError(VirtualFittingError):
+    """DB 의 sub_category 가 영어 garment 명칭 매핑에 없을 때. 요청이 아니라 데이터/매핑 문제다."""
+
+    status_code = 500
+    message = "unsupported_sub_category"
+
+    def __init__(self, sub_category: str):
+        self.sub_category = sub_category
+        super().__init__(f"영어 garment 명칭 매핑이 없는 sub_category 입니다: {sub_category!r}")
