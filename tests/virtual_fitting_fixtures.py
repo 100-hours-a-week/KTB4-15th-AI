@@ -1,4 +1,3 @@
-from typing import Optional
 
 from app.virtual_fitting.models import BOTTOM_CATEGORY, TOP_CATEGORY, FittingProduct
 
@@ -7,7 +6,7 @@ def make_product(
     code: str,
     main_category: str = TOP_CATEGORY,
     sub_category: str = "스웨트셔츠",
-    image_url: Optional[str] = "https://img.29cm.co.kr/item/example.jpg",
+    image_url: str | None = "https://img.29cm.co.kr/item/example.jpg",
 ) -> FittingProduct:
     return FittingProduct(
         product_code=code,

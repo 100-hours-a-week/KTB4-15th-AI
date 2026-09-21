@@ -4,7 +4,7 @@ status_code / message 는 API 명세서(1단계)의 V1 특수 오류 처리 표�
 Router 에서 이 값으로 HTTP Response 의 code / message 를 구성한다.
 """
 
-from typing import Sequence
+from collections.abc import Sequence
 
 
 class VirtualFittingError(Exception):
