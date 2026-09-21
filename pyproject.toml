@@ -1,0 +1,15 @@
+# 로컬 개발용 설정.
+#
+# 주의: 현재 Dockerfile 의 test stage 는 app/ 과 tests/ 만 COPY 하므로 이 파일이
+# 이미지에 들어가지 않는다. 따라서 CI 의 ruff 는 여기 설정이 아니라 기본 규칙으로
+# 돌고, pytest 도 여기 설정을 읽지 못한다. tests/conftest.py 가 import 경로를
+# 직접 세우는 이유가 그것이다. 클라우드 쪽에 `COPY pyproject.toml .` 추가를 요청해
+# 두 환경의 규칙을 맞추는 편이 낫다.
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
