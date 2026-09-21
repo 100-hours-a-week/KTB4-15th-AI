@@ -1,6 +1,6 @@
 """요청된 product_code 를 조회하고 조합을 검증한 뒤 상의 → 하의 순으로 정렬한다."""
 
-from typing import Sequence
+from collections.abc import Sequence
 
 from app.virtual_fitting.exceptions import (
     InvalidFittingCombinationError,

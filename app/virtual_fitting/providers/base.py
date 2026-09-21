@@ -4,8 +4,9 @@ Service 는 이 모듈의 타입에만 의존하고, Pruna/Runware 같은 구체
 주입받아 사용한다.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol, Sequence, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
