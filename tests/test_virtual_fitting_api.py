@@ -99,6 +99,8 @@ def client(monkeypatch):
     monkeypatch.setattr(settings, "INTERNAL_API_KEY", KEY)
     monkeypatch.setattr(settings, "AUTH_DISABLED", False)
     monkeypatch.setattr(settings, "CHECKPOINT_DSN", "")
+    monkeypatch.setenv("RUNWARE_VTON_API_KEY", "test-vton-key")
+    monkeypatch.setenv("RUNWARE_LLM_API_KEY", "test-llm-key")
     with TestClient(app, raise_server_exceptions=False) as test_client:
         yield test_client
 
@@ -265,7 +267,7 @@ def test_endpoint_is_in_the_openapi_surface():
 def connection(monkeypatch):
     conn = FakeConnection()
     monkeypatch.setattr(router, "get_connection", lambda: conn)
-    monkeypatch.setenv("RUNWARE_API_KEY", "test-runware-key")
+    monkeypatch.setenv("RUNWARE_VTON_API_KEY", "test-vton-key")
     return conn
 
 
@@ -290,7 +292,7 @@ def test_connection_is_closed_when_the_request_fails(connection):
 
 
 def test_connection_is_closed_when_assembly_fails(connection, monkeypatch):
-    monkeypatch.delenv("RUNWARE_API_KEY")
+    monkeypatch.delenv("RUNWARE_VTON_API_KEY")
 
     with pytest.raises(RunwareConfigError), router.open_virtual_fitting_service():
         pass
