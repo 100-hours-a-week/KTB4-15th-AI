@@ -35,3 +35,13 @@ class ProductImageMissingError(VirtualFittingError):
     def __init__(self, product_code: str):
         self.product_code = product_code
         super().__init__(f"상품 image_url이 없습니다: {product_code}")
+
+
+class FittingModelError(VirtualFittingError):
+    status_code = 502
+    message = "fitting_model_failed"
+
+
+class FittingTimeoutError(VirtualFittingError):
+    status_code = 504
+    message = "fitting_timeout"
