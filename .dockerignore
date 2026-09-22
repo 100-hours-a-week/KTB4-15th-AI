@@ -1,0 +1,19 @@
+# 빌드 컨텍스트에서 제외한다. 이미지에 들어가지 않더라도 컨텍스트 업로드가 느려지고,
+# 캐시 키가 무관한 변경에 흔들린다.
+.git
+.gitignore
+.github
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+docs
+README.md
