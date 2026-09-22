@@ -46,7 +46,7 @@ env:
 jobs:
   build-and-push:
     if: ${{ github.event_name == 'push' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 25
     environment: production
     permissions:
