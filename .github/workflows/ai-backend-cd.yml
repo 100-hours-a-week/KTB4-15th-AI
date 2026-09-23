@@ -9,7 +9,7 @@ run-name: >-
 on:
   # main이 갱신되면 자동 배포 (develop→main 머지, hotfix→main 머지 모두 포함)
   push:
-    branches: ["feature/cd"]
+    branches: ["main"]
     # 문서만 바뀐 커밋으로 다운타임을 만들지 않는다.
     # CD는 필수 상태 체크가 아니므로 경로 필터를 써도 머지가 막히지 않는다.
     paths-ignore:
@@ -55,10 +55,10 @@ jobs:
     outputs:
       tag: ${{ steps.vars.outputs.tag }}
     steps:
-      - name: Guard - feature/cd 브랜치 확인
-        if: ${{ github.ref != 'refs/heads/feature/cd' }}
+      - name: Guard - main 브랜치 확인
+        if: ${{ github.ref != 'refs/heads/main' }}
         run: |
-          echo "feature/cd 브랜치만 배포할 수 있습니다. 현재 ref: ${GITHUB_REF}"
+          echo "main 브랜치만 배포할 수 있습니다. 현재 ref: ${GITHUB_REF}"
           exit 1
 
       - name: Checkout
@@ -110,10 +110,10 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - name: Guard - feature/cd 브랜치 확인
-        if: ${{ github.ref != 'refs/heads/feature/cd' }}
+      - name: Guard - main 브랜치 확인
+        if: ${{ github.ref != 'refs/heads/main' }}
         run: |
-          echo "feature/cd 브랜치의 워크플로만 운영에 배포할 수 있습니다. 현재 ref: ${GITHUB_REF}"
+          echo "main 브랜치의 워크플로만 운영에 배포할 수 있습니다. 현재 ref: ${GITHUB_REF}"
           exit 1
 
       - name: 배포 태그와 사유 확정
