@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app import health as health_router
 from app.chat import router as chat_router
 from app.chat.graph import build_graph
 from app.config import settings
@@ -34,6 +35,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="KTB4-15th AI Server", lifespan=lifespan)
 
 register_error_handlers(app)
+app.include_router(health_router.router)
 app.include_router(chat_router.router)
 app.include_router(virtual_fitting_router.router)
 # 도메인이 늘어나면 여기에 한 줄씩 추가한다
