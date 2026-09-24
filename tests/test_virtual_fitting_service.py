@@ -2,7 +2,9 @@
 
 import pytest
 
+from app.clients.s3 import ImageStorageError
 from app.virtual_fitting.exceptions import (
+    FittingImageStorageError,
     FittingModelError,
     FittingTimeoutError,
     InvalidFittingCombinationError,
@@ -23,6 +25,7 @@ from tests.virtual_fitting_fixtures import make_bottom, make_top
 
 USER_IMAGE_URL = "https://example.com/users/15/body.png"
 RESULT_URL = "https://example.com/result.jpg"
+RESULT_KEY = "virtual-fitting/results/result.jpg"
 
 
 class FakeRepository:
@@ -64,6 +67,18 @@ class FakeCommentProvider:
         return f"title of ({comment})"
 
 
+class FakeImageStorage:
+    def __init__(self, error=None):
+        self.error = error
+        self.urls = []
+
+    def store_remote_image(self, url, key_prefix):
+        if self.error:
+            raise self.error
+        self.urls.append((url, key_prefix))
+        return RESULT_KEY
+
+
 def _request(*codes):
     return SyncFittingRequest(
         user_image_url=USER_IMAGE_URL,
@@ -71,11 +86,12 @@ def _request(*codes):
     )
 
 
-def _service(repository, fitting_provider=None, comment_provider=None):
+def _service(repository, fitting_provider=None, comment_provider=None, image_storage=None):
     return VirtualFittingService(
         repository,
         fitting_provider or FakeFittingProvider(),
         comment_provider or MockCommentProvider(),
+        image_storage or FakeImageStorage(),
     )
 
 
@@ -121,19 +137,19 @@ def test_single_product_is_passed_alone():
     assert fitting_input.prompt == build_fitting_prompt([BOTTOM])
 
 
-def test_result_image_url_comes_from_fitting_provider():
+def test_result_image_is_stored_and_s3_key_is_returned():
     provider = FakeFittingProvider(result_image_url="https://example.com/other.jpg")
 
     result = _service(FakeRepository(TOP), provider).fit(_request("1"))
 
-    assert result.result_image_url == "https://example.com/other.jpg"
+    assert result.result_image_key == RESULT_KEY
 
 
 def test_mock_comment_and_title_are_included_in_result():
     result = _service(FakeRepository(TOP, BOTTOM)).fit(_request("1", "2"))
 
     assert result == VirtualFittingResult(
-        result_image_url=RESULT_URL, llm_comment=MOCK_COMMENT, llm_title=MOCK_TITLE
+        result_image_key=RESULT_KEY, llm_comment=MOCK_COMMENT, llm_title=MOCK_TITLE
     )
 
 
@@ -185,3 +201,10 @@ def test_fitting_provider_errors_propagate_unchanged(error):
 
     assert exc_info.value is error
     assert comment_provider.comment_calls == []
+
+
+def test_s3_storage_failure_has_a_specific_domain_error():
+    storage = FakeImageStorage(ImageStorageError("s3 unavailable"))
+
+    with pytest.raises(FittingImageStorageError):
+        _service(FakeRepository(TOP), image_storage=storage).fit(_request("1"))

@@ -12,7 +12,7 @@ def sync_fit(service: VirtualFittingService, request: SyncFittingRequest) -> Syn
     result = service.fit(request)
     return SyncFittingResponse(
         data=SyncFittingData(
-            result_image_url=result.result_image_url,
+            result_image_key=result.result_image_key,
             llm_title=result.llm_title,
             llm_comment=result.llm_comment,
         )
