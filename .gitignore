@@ -11,11 +11,15 @@ venv/
 .env.*
 !.env.example
 
+# Downloaded body image validation models
+models/body_image_validation/
+
 # Test and coverage artifacts
 .pytest_cache/
 .ruff_cache/
 .coverage
 htmlcov/
+*-validated.png
 
 # IDE
 .idea/

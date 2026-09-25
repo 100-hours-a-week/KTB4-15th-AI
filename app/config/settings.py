@@ -39,3 +39,13 @@ RECOMMENDATION_MEMORY_TURNS = int(os.getenv("RECOMMENDATION_MEMORY_TURNS", "2"))
 # 상품 테이블과 섞이지 않도록 DSN에서 전용 스키마를 지정한다.
 #   postgresql://user:password@host:5432/ai?options=-csearch_path%3Dlanggraph
 CHECKPOINT_DSN = os.getenv("CHECKPOINT_DSN", "")
+
+# 공용 AWS/S3 설정. boto3 자격증명은 EC2 IAM Role(로컬에서는 표준 AWS credential
+# chain)에서 읽고, 코드나 환경변수에 access key를 직접 두지 않는다.
+AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
+S3_BUCKET = os.getenv("S3_BUCKET", "")
+
+# PostgreSQL pool 크기. 가상피팅 상품 조회는 짧은 SELECT만 수행하고 connection을 즉시
+# 반환한다. 외부 모델 응답을 기다리는 동안 connection을 점유하지 않는다.
+DATABASE_POOL_MIN_SIZE = int(os.getenv("DATABASE_POOL_MIN_SIZE", "1"))
+DATABASE_POOL_MAX_SIZE = int(os.getenv("DATABASE_POOL_MAX_SIZE", "10"))

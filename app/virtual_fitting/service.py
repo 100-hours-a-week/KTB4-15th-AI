@@ -1,3 +1,5 @@
+from app.clients.s3 import ImageStorage, ImageStorageError
+from app.virtual_fitting.exceptions import FittingImageStorageError
 from app.virtual_fitting.models import VirtualFittingResult
 from app.virtual_fitting.product_selection import select_fitting_products
 from app.virtual_fitting.prompt import build_fitting_prompt
@@ -15,10 +17,12 @@ class VirtualFittingService:
         repository: ProductRepository,
         fitting_provider: FittingProvider,
         comment_provider: CommentProvider,
+        image_storage: ImageStorage,
     ):
         self.repository = repository
         self.fitting_provider = fitting_provider
         self.comment_provider = comment_provider
+        self.image_storage = image_storage
 
     def fit(self, request: SyncFittingRequest) -> VirtualFittingResult:
         # 상의 → 하의 순서. garment_image_urls 와 prompt 의 N번째 garment image 가 같은 순서를 쓴다.
@@ -33,12 +37,19 @@ class VirtualFittingService:
                 prompt=build_fitting_prompt(products),
             )
         )
+        try:
+            result_image_key = self.image_storage.store_remote_image(
+                fitting_result.result_image_url,
+                "virtual-fitting/results",
+            )
+        except ImageStorageError as error:
+            raise FittingImageStorageError("가상피팅 결과 S3 저장에 실패했습니다.") from error
 
         llm_comment = self.comment_provider.generate_comment(products)
         llm_title = self.comment_provider.generate_title(llm_comment)
 
         return VirtualFittingResult(
-            result_image_url=fitting_result.result_image_url,
+            result_image_key=result_image_key,
             llm_comment=llm_comment,
             llm_title=llm_title,
         )

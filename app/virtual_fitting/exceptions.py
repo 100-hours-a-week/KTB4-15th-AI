@@ -70,3 +70,10 @@ class FittingDatabaseError(VirtualFittingError):
 
     status_code = 500
     message = "database_error"
+
+
+class FittingImageStorageError(VirtualFittingError):
+    """가상피팅 결과 이미지를 영구 S3 저장소로 옮기지 못했을 때."""
+
+    status_code = 500
+    message = "fitting_image_storage_failed"

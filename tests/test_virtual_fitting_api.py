@@ -4,7 +4,7 @@ Service 와 외부 서비스를 fake 로 바꿔 API 계층만 본다. 실제 DB,
 """
 
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import psycopg
 import pytest
@@ -15,6 +15,7 @@ from app.main import app
 from app.virtual_fitting import router
 from app.virtual_fitting.exceptions import (
     FittingDatabaseError,
+    FittingImageStorageError,
     FittingModelError,
     FittingPostprocessError,
     FittingTimeoutError,
@@ -41,7 +42,7 @@ BODY = {
     "products": [{"product_code": "123"}, {"product_code": "456"}],
 }
 RESULT = VirtualFittingResult(
-    result_image_url="https://im.runware.ai/result.jpg",
+    result_image_key="virtual-fitting/results/result.jpg",
     llm_comment="테스트 코멘트",
     llm_title="테스트 제목",
 )
@@ -86,6 +87,23 @@ class FakeConnection:
 
     def close(self):
         self.closed = True
+
+
+class FakePool:
+    def __init__(self, connection):
+        self._connection = connection
+
+    @contextmanager
+    def connection(self):
+        try:
+            yield self._connection
+        finally:
+            self._connection.close()
+
+
+class FakeImageStorage:
+    def store_remote_image(self, url, key_prefix):
+        return "virtual-fitting/results/fake.jpg"
 
 
 @pytest.fixture(autouse=True)
@@ -138,7 +156,7 @@ def test_success_returns_the_common_shape(client, use_service):
         "code": 200,
         "message": "fitting_succeeded",
         "data": {
-            "result_image_url": "https://im.runware.ai/result.jpg",
+            "result_image_key": "virtual-fitting/results/result.jpg",
             "llm_title": "테스트 제목",
             "llm_comment": "테스트 코멘트",
         },
@@ -161,7 +179,9 @@ def test_full_flow_with_real_service_and_fake_externals(client, use_service):
     bottom = make_bottom("2", sub_category="슬림 팬츠", image_url="https://img/bottom.jpg")
     provider = FakeFittingProvider()
     use_service(
-        VirtualFittingService(FakeRepository(top, bottom), provider, MockCommentProvider())
+        VirtualFittingService(
+            FakeRepository(top, bottom), provider, MockCommentProvider(), FakeImageStorage()
+        )
     )
 
     response = client.post(
@@ -177,7 +197,7 @@ def test_full_flow_with_real_service_and_fake_externals(client, use_service):
         "code": 200,
         "message": "fitting_succeeded",
         "data": {
-            "result_image_url": "https://im.runware.ai/fake.jpg",
+            "result_image_key": "virtual-fitting/results/fake.jpg",
             "llm_title": MOCK_TITLE,
             "llm_comment": MOCK_COMMENT,
         },
@@ -244,6 +264,7 @@ def test_invalid_request_is_400_and_service_is_not_opened(client, use_service, b
         (FittingTimeoutError("slow"), 504, "fitting_timeout"),
         (FittingPostprocessError("llm failed"), 500, "fitting_postprocess_failed"),
         (FittingDatabaseError("db failed"), 500, "database_error"),
+        (FittingImageStorageError("s3 failed"), 500, "fitting_image_storage_failed"),
     ],
 )
 def test_domain_error_becomes_the_common_error_shape(client, use_service, error, status, message):
@@ -274,7 +295,8 @@ def test_endpoint_is_in_the_openapi_surface():
 @pytest.fixture
 def connection(monkeypatch):
     conn = FakeConnection()
-    monkeypatch.setattr(router, "get_connection", lambda: conn)
+    monkeypatch.setattr(router, "get_connection_pool", lambda: FakePool(conn))
+    monkeypatch.setattr(router, "S3ImageStorage", FakeImageStorage)
     monkeypatch.setenv("RUNWARE_VTON_API_KEY", "test-vton-key")
     return conn
 
@@ -287,27 +309,27 @@ def test_service_is_assembled_from_the_v1_components(connection):
         assert isinstance(service.comment_provider, MockCommentProvider)
         # description_summary 가 DB 에 생기기 전까지 production 은 Mock 을 쓴다 (A-2 에서 교체).
         assert not isinstance(service.comment_provider, RunwareCommentProvider)
-        # 트랜잭션을 연 채로 Runware 응답을 기다리지 않는다.
-        assert connection.autocommit is True
+        # Service 조립만으로는 pool에서 connection을 빌리지 않는다.
+        assert connection.autocommit is False
         assert connection.closed is False
 
-    assert connection.closed is True
+    assert connection.closed is False
 
 
-def test_connection_is_closed_when_the_request_fails(connection):
+def test_connection_is_not_acquired_when_failure_happens_before_query(connection):
     with pytest.raises(FittingTimeoutError), router.open_virtual_fitting_service():
         raise FittingTimeoutError("slow")
 
-    assert connection.closed is True
+    assert connection.closed is False
 
 
-def test_connection_is_closed_when_assembly_fails(connection, monkeypatch):
+def test_connection_is_not_acquired_when_assembly_fails(connection, monkeypatch):
     monkeypatch.delenv("RUNWARE_VTON_API_KEY")
 
     with pytest.raises(RunwareConfigError), router.open_virtual_fitting_service():
         pass
 
-    assert connection.closed is True
+    assert connection.closed is False
 
 
 # --- PostgreSQL 오류 (실제 DB 없이 fake connection 으로) ---
@@ -364,7 +386,8 @@ def real_assembly(monkeypatch):
     monkeypatch.setenv("RUNWARE_VTON_API_KEY", "test-vton-key")
 
     def use(connection, provider=None):
-        monkeypatch.setattr(router, "get_connection", lambda: connection)
+        monkeypatch.setattr(router, "get_connection_pool", lambda: FakePool(connection))
+        monkeypatch.setattr(router, "S3ImageStorage", FakeImageStorage)
         if provider is not None:
             monkeypatch.setattr(router, "RunwarePrunaProvider", lambda: provider)
         return connection
@@ -385,11 +408,11 @@ def test_connection_failure_is_500_database_error_without_details(client, monkey
     monkeypatch.setenv("RUNWARE_VTON_API_KEY", "test-vton-key")
     attempts = []
 
-    def failing_connect(url, **kwargs):
-        attempts.append(url)
+    def failing_pool():
+        attempts.append(1)
         raise psycopg.OperationalError(LIBPQ_MESSAGE)
 
-    monkeypatch.setattr(psycopg, "connect", failing_connect)
+    monkeypatch.setattr(router, "get_connection_pool", failing_pool)
 
     with caplog.at_level(logging.ERROR):
         response = _fitting_request(client, "1")
@@ -420,7 +443,7 @@ def test_connection_failure_never_tries_to_close_a_missing_connection(client, mo
     def failing():
         raise psycopg.OperationalError(LIBPQ_MESSAGE)
 
-    monkeypatch.setattr(router, "get_connection", failing)
+    monkeypatch.setattr(router, "get_connection_pool", failing)
 
     response = _fitting_request(client, "1")
 
@@ -461,7 +484,7 @@ def test_successful_lookup_runs_the_whole_flow_and_closes_the_connection(client,
 
     assert response.status_code == 200
     assert response.json()["data"] == {
-        "result_image_url": "https://im.runware.ai/fake.jpg",
+        "result_image_key": "virtual-fitting/results/fake.jpg",
         "llm_title": MOCK_TITLE,
         "llm_comment": MOCK_COMMENT,
     }
