@@ -5,6 +5,7 @@
 .github
 .venv
 venv
+models/body_image_validation
 __pycache__
 *.py[cod]
 .pytest_cache
@@ -14,6 +15,7 @@ __pycache__
 .env.*
 !.env.example
 *.log
+*-validated.png
 .DS_Store
 docs
 README.md
