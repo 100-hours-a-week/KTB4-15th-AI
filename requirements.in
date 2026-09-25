@@ -1,7 +1,14 @@
 langgraph
 langgraph-checkpoint-postgres
-psycopg[binary]
+psycopg[binary,pool]
 fastapi
 uvicorn[standard]
 openai
 pydantic
+boto3
+Pillow
+numpy
+mediapipe
+opencv-python-headless
+python-multipart
+rembg[cpu]

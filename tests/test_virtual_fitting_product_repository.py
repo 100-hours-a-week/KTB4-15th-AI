@@ -1,5 +1,7 @@
 """실제 PostgreSQL 없이 ProductRepository 의 SQL/파라미터/row 변환을 검증한다."""
 
+from contextlib import contextmanager
+
 import psycopg
 import pytest
 
@@ -49,6 +51,19 @@ class FakeConnection:
         return self.cursor_instance
 
 
+class FakePool:
+    def __init__(self, connection):
+        self.connection_instance = connection
+
+    @contextmanager
+    def connection(self):
+        yield self.connection_instance
+
+
+def repository(connection):
+    return ProductRepository(FakePool(connection))
+
+
 TOP_ROW = (
     4120937,
     "https://img.29cm.co.kr/item/top.jpg",
@@ -58,9 +73,9 @@ TOP_ROW = (
 
 
 def test_find_by_codes_returns_products():
-    repository = ProductRepository(FakeConnection([TOP_ROW]))
+    product_repository = repository(FakeConnection([TOP_ROW]))
 
-    products = repository.find_by_codes(["4120937"])
+    products = product_repository.find_by_codes(["4120937"])
 
     assert products == [
         FittingProduct(
@@ -75,7 +90,7 @@ def test_find_by_codes_returns_products():
 def test_find_by_codes_uses_single_parameterized_query():
     connection = FakeConnection([TOP_ROW])
 
-    ProductRepository(connection).find_by_codes(["4120937", "3", "4120937"])
+    repository(connection).find_by_codes(["4120937", "3", "4120937"])
 
     [(sql, params)] = connection.cursor_instance.executed
     assert sql == build_select_sql()
@@ -84,13 +99,13 @@ def test_find_by_codes_uses_single_parameterized_query():
 
 
 def test_find_by_codes_returns_empty_when_not_found():
-    assert ProductRepository(FakeConnection([])).find_by_codes(["9"]) == []
+    assert repository(FakeConnection([])).find_by_codes(["9"]) == []
 
 
 def test_find_by_codes_skips_query_for_empty_input():
     connection = FakeConnection([])
 
-    assert ProductRepository(connection).find_by_codes([]) == []
+    assert repository(connection).find_by_codes([]) == []
     assert connection.cursor_instance.executed == []
 
 
@@ -116,10 +131,10 @@ def test_select_only_needed_columns():
     ids=["execute", "fetch", "cursor", "undefined-table"],
 )
 def test_psycopg_error_becomes_a_database_error_without_details(failure):
-    repository = ProductRepository(FakeConnection([TOP_ROW], **failure))
+    product_repository = repository(FakeConnection([TOP_ROW], **failure))
 
     with pytest.raises(FittingDatabaseError) as exc_info:
-        repository.find_by_codes(["4120937"])
+        product_repository.find_by_codes(["4120937"])
 
     error = exc_info.value
     assert (error.status_code, error.message) == (500, "database_error")
@@ -129,22 +144,22 @@ def test_psycopg_error_becomes_a_database_error_without_details(failure):
 
 
 def test_non_database_errors_are_not_hidden_as_database_errors():
-    repository = ProductRepository(FakeConnection([], execute_error=RuntimeError("bug")))
+    product_repository = repository(FakeConnection([], execute_error=RuntimeError("bug")))
 
     with pytest.raises(RuntimeError, match="bug"):
-        repository.find_by_codes(["1"])
+        product_repository.find_by_codes(["1"])
 
 
 def test_invalid_product_code_is_a_programming_error_not_a_database_error():
     with pytest.raises(ValueError):
-        ProductRepository(FakeConnection([])).find_by_codes(["abc"])
+        repository(FakeConnection([])).find_by_codes(["abc"])
 
 
 def test_successful_query_with_no_rows_is_not_a_database_error():
-    repository = ProductRepository(FakeConnection([]))
+    product_repository = repository(FakeConnection([]))
 
-    assert repository.find_by_codes(["999"]) == []
+    assert product_repository.find_by_codes(["999"]) == []
     with pytest.raises(ProductNotFoundError) as exc_info:
-        select_fitting_products(["999"], repository)
+        select_fitting_products(["999"], product_repository)
     assert not isinstance(exc_info.value, FittingDatabaseError)
     assert (exc_info.value.status_code, exc_info.value.message) == (404, "product_not_found")

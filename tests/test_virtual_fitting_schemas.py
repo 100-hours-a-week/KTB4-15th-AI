@@ -64,7 +64,7 @@ def test_rejects_non_numeric_product_code(code):
 def test_response_default_code_and_message():
     response = SyncFittingResponse(
         data={
-            "result_image_url": "https://example.com/result.jpg",
+            "result_image_key": "virtual-fitting/results/result.jpg",
             "llm_title": "제목",
             "llm_comment": "코멘트",
         }

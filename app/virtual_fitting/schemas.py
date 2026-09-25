@@ -12,7 +12,7 @@ class SyncFittingRequest(BaseModel):
 
 
 class SyncFittingData(BaseModel):
-    result_image_url: str
+    result_image_key: str
     llm_title: str
     llm_comment: str
 

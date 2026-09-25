@@ -11,7 +11,8 @@ from contextlib import contextmanager
 import psycopg
 from fastapi import APIRouter, Depends
 
-from app.config.database import get_connection
+from app.clients.s3 import S3ImageStorage
+from app.config.database import DatabaseConfigError, get_connection_pool
 from app.errors import ErrorResponse, error_response
 from app.security import verify_internal_key
 from app.virtual_fitting import controller
@@ -41,25 +42,21 @@ router = APIRouter(
 
 @contextmanager
 def open_virtual_fitting_service() -> Iterator[VirtualFittingService]:
-    """요청 하나가 쓸 Service 를 조립하고, 끝나면 DB connection 을 닫는다.
+    """요청 하나가 쓸 Service를 조립하고 DB connection을 pool에 즉시 반환한다.
 
     Depends 로 만들지 않는 이유: FastAPI 는 body 검증이 실패한 요청에서도 의존성을 먼저
     실행한다. 그러면 잘못된 요청마다 DB 연결을 열고, 설정이 빠진 서버는 400 대신 500 을 낸다.
     """
     try:
-        connection = get_connection()
-    except psycopg.Error as error:
+        connection_pool = get_connection_pool()
+    except (DatabaseConfigError, psycopg.Error) as error:
         raise FittingDatabaseError("AI PostgreSQL 연결에 실패했습니다.") from error
-    try:
-        # SELECT 뒤에 트랜잭션을 연 채로 Runware 응답(최대 60초)을 기다리지 않게 한다.
-        connection.autocommit = True
-        yield VirtualFittingService(
-            repository=ProductRepository(connection),
-            fitting_provider=RunwarePrunaProvider(),
-            comment_provider=MockCommentProvider(),
-        )
-    finally:
-        connection.close()
+    yield VirtualFittingService(
+        repository=ProductRepository(connection_pool),
+        fitting_provider=RunwarePrunaProvider(),
+        comment_provider=MockCommentProvider(),
+        image_storage=S3ImageStorage(),
+    )
 
 
 # Service 가 동기 HTTP(urllib)와 동기 DB(psycopg)를 쓰므로 async def 가 아니라 def 로 둔다.
