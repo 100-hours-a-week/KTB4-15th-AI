@@ -1,6 +1,5 @@
 """전신 이미지 fail-fast 검증, 전처리, S3 저장 orchestration."""
 
-import logging
 import uuid
 from typing import Protocol
 
@@ -8,14 +7,12 @@ from PIL import Image
 
 from app.body_image_validation import validation_rules
 from app.body_image_validation.background import encode_png
-from app.body_image_validation.brightness import BrightnessCheckError, brightness_warnings
+from app.body_image_validation.brightness import BrightnessCheckError, validate_brightness
 from app.body_image_validation.detectors import PersonDetector, PoseDetector
 from app.body_image_validation.exceptions import BodyImageSystemError
 from app.body_image_validation.image_io import decode_image
 from app.body_image_validation.models import BodyImageValidationResult
 from app.clients.s3 import ImageStorage, ImageStorageError
-
-logger = logging.getLogger(__name__)
 
 
 class BackgroundRemover(Protocol):
@@ -58,10 +55,9 @@ class BodyImageValidationService:
         validation_rules.validate_frontal_pose(landmarks, person_box, image.width)
 
         try:
-            warnings = brightness_warnings(image, person_box)
+            validate_brightness(image, person_box)
         except BrightnessCheckError as error:
-            logger.warning("brightness check skipped: %s", error)
-            warnings = []
+            raise BodyImageSystemError("BRIGHTNESS_CHECK_FAILED") from error
 
         try:
             result = self.background_remover.remove(image)
@@ -76,4 +72,4 @@ class BodyImageValidationService:
             self.image_storage.upload_bytes(png, key, "image/png")
         except ImageStorageError as error:
             raise BodyImageSystemError("IMAGE_UPLOAD_FAILED") from error
-        return BodyImageValidationResult(s3_key=key, warnings=warnings)
+        return BodyImageValidationResult(s3_key=key)

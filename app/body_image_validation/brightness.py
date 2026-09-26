@@ -1,16 +1,15 @@
-"""사람 bbox 영역의 HSV V 평균을 이용한 비차단성 밝기 warning."""
+"""사람 bbox 영역의 HSV V 평균을 이용한 밝기 검증."""
 
 import numpy as np
 from PIL import Image
 
+from app.body_image_validation.exceptions import user_error
 from app.body_image_validation.models import BoundingBox
 from app.config import body_image_validation as config
 
-TOO_DARK_WARNING = "IMAGE_TOO_DARK"
-
 
 class BrightnessCheckError(RuntimeError):
-    """밝기 warning 계산만 건너뛸 수 있는 오류."""
+    """밝기 검증만 건너뛸 수 있는 시스템 오류."""
 
 
 def mean_value_channel(image: Image.Image, box: BoundingBox) -> float:
@@ -35,5 +34,6 @@ def mean_value_channel(image: Image.Image, box: BoundingBox) -> float:
     return float(hsv[:, :, 2].mean())
 
 
-def brightness_warnings(image: Image.Image, box: BoundingBox) -> list[str]:
-    return [TOO_DARK_WARNING] if mean_value_channel(image, box) < config.DARK_THRESHOLD else []
+def validate_brightness(image: Image.Image, box: BoundingBox) -> None:
+    if mean_value_channel(image, box) < config.DARK_THRESHOLD:
+        raise user_error("IMAGE_TOO_DARK")

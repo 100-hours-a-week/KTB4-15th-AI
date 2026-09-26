@@ -49,7 +49,7 @@ def main() -> int:
             background_remover,
             LocalImageStorage(output),
         )
-        result = service.validate(args.image.read_bytes())
+        service.validate(args.image.read_bytes())
     except BodyImageValidationError as error:
         print(f"검증 실패: {error.reason_code} - {error.reason or error.message}")
         return 1
@@ -57,7 +57,7 @@ def main() -> int:
         person_detector.close()
         pose_detector.close()
 
-    print(f"검증 성공: warnings={result.warnings}")
+    print("검증 성공")
     print(f"배경 제거 결과: {output}")
     return 0
 
