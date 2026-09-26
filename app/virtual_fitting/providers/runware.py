@@ -87,8 +87,8 @@ def parse_result(body: bytes) -> FittingResult:
     url = item.get("imageURL") if isinstance(item, dict) else None
     if not isinstance(url, str) or not url.startswith(("http://", "https://")):
         raise FittingModelError("Runware 응답에 결과 이미지 URL(imageURL)이 없습니다.")
-    # TODO: imageURL 은 Runware CDN URL 이라 장기 보관용이 아니다. 추후 AI Server 가
-    # 결과 이미지를 다운로드해 S3 에 저장하고, S3 URL 을 최종 result_image_url 로 사용한다.
+    # imageURL 은 Runware CDN URL 이라 장기 보관용이 아니다. VirtualFittingService 가 이 URL 의
+    # 이미지를 내려받아 S3 에 저장하고, Backend 에는 URL 이 아니라 result_image_key 만 돌려준다.
     return FittingResult(result_image_url=url)
 
 
