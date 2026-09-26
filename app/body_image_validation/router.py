@@ -3,7 +3,7 @@
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, UploadFile
 
 from app.body_image_validation.exceptions import BodyImageValidationError
 from app.body_image_validation.runtime import BodyImageRuntimeError, runtime_manager
@@ -12,6 +12,7 @@ from app.body_image_validation.schemas import (
     BodyImageValidationResponse,
 )
 from app.body_image_validation.service import BodyImageValidationService
+from app.clients.s3 import S3ConfigError
 from app.config import body_image_validation as config
 from app.errors import ErrorResponse, error_response
 from app.security import verify_internal_key
@@ -35,17 +36,13 @@ def get_service() -> BodyImageValidationService:
     return runtime_manager.get_service()
 
 
-UserIdForm = Annotated[int, Form(gt=0)]
 ImageFile = Annotated[UploadFile, File()]
 @router.post("/api/v1/validation/body-image", response_model=BodyImageValidationResponse)
-def validate_body_image(
-    user_id: UserIdForm,
-    image: ImageFile,
-):
+def validate_body_image(image: ImageFile):
     try:
         service = get_service()
         body = image.file.read(config.MAX_IMAGE_BYTES + 1)
-        result = service.validate(user_id, body)
+        result = service.validate(body)
         return BodyImageValidationResponse(
             data=BodyImageValidationData(s3_key=result.s3_key, warnings=result.warnings)
         )
@@ -56,6 +53,13 @@ def validate_body_image(
         if error.reason is not None:
             data["reason"] = error.reason
         return error_response(error.status_code, error.message, data)
+    except S3ConfigError:
+        logger.exception("body image validation S3 configuration error")
+        return error_response(
+            500,
+            "body_image_validation_system_failed",
+            {"reason_code": S3ConfigError.reason_code},
+        )
     except BodyImageRuntimeError:
         logger.exception("body image validation runtime unavailable")
         return error_response(

@@ -109,9 +109,9 @@ def service(person=None, pose=None, remover=None, storage=None):
 def test_success_removes_background_and_uploads_rgba_png():
     storage = FakeStorage()
 
-    result = service(storage=storage).validate(42, image_bytes())
+    result = service(storage=storage).validate(image_bytes())
 
-    assert result.s3_key.startswith("users/42/body-images/")
+    assert result.s3_key.startswith("body-images/")
     assert result.s3_key.endswith(".png")
     assert result.warnings == []
     [(body, key, content_type)] = storage.uploads
@@ -128,7 +128,7 @@ def test_brightness_failure_is_logged_and_skipped(monkeypatch, caplog):
         "app.body_image_validation.service.brightness_warnings", fail_brightness
     )
 
-    result = service().validate(42, image_bytes())
+    result = service().validate(image_bytes())
 
     assert result.warnings == []
     assert "brightness check skipped" in caplog.text
@@ -148,6 +148,6 @@ def test_brightness_failure_is_logged_and_skipped(monkeypatch, caplog):
 )
 def test_system_failures_have_specific_reason_codes(kwargs, reason_code):
     with pytest.raises(BodyImageSystemError) as exc_info:
-        service(**kwargs).validate(42, image_bytes())
+        service(**kwargs).validate(image_bytes())
 
     assert exc_info.value.reason_code == reason_code

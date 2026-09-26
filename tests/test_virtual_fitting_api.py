@@ -10,6 +10,7 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
+from app.clients.s3 import S3ImageStorage
 from app.config import settings
 from app.main import app
 from app.virtual_fitting import router
@@ -491,6 +492,34 @@ def test_successful_lookup_runs_the_whole_flow_and_closes_the_connection(client,
     [fitting_input] = provider.inputs
     assert list(fitting_input.garment_image_urls) == ["https://img/top.jpg", "https://img/bottom.jpg"]
     assert connection.closed is True
+
+
+def test_missing_s3_bucket_is_s3_config_error_before_any_external_call(
+    client, real_assembly, monkeypatch, caplog
+):
+    provider = FakeFittingProvider()
+    connection = real_assembly(DbConnection(rows=[TOP_ROW, BOTTOM_ROW]), provider)
+    # real_assembly 는 S3ImageStorage 를 fake 로 바꾸므로, 이 테스트만 진짜 클래스로 되돌린다.
+    monkeypatch.setattr(router, "S3ImageStorage", S3ImageStorage)
+    monkeypatch.setattr(settings, "S3_BUCKET", "")
+
+    def forbidden_client():
+        raise AssertionError("S3 설정이 없으면 boto3 client 도 만들면 안 된다")
+
+    monkeypatch.setattr("app.clients.s3.get_s3_client", forbidden_client)
+
+    with caplog.at_level(logging.ERROR):
+        response = _fitting_request(client, "1", "2")
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "code": 500,
+        "message": "fitting_image_storage_failed",
+        "data": {"reason_code": "S3_CONFIG_ERROR"},
+    }
+    assert provider.inputs == []  # 외부 가상피팅 API 는 부르지 않았다
+    assert connection.closed is False  # 상품 조회(DB)까지도 가지 않았다
+    assert "S3_BUCKET" in caplog.text
 
 
 @pytest.mark.parametrize(

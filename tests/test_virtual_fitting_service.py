@@ -145,6 +145,16 @@ def test_result_image_is_stored_and_s3_key_is_returned():
     assert result.result_image_key == RESULT_KEY
 
 
+def test_only_the_provider_result_image_is_stored_under_the_fitting_prefix():
+    storage = FakeImageStorage()
+    provider = FakeFittingProvider(result_image_url="https://example.com/other.jpg")
+
+    _service(FakeRepository(TOP, BOTTOM), provider, image_storage=storage).fit(_request("1", "2"))
+
+    # 사용자 원본/상품 이미지가 아니라 provider 결과 이미지 하나만, 가상피팅 prefix 로 저장한다.
+    assert storage.urls == [("https://example.com/other.jpg", "virtual-fitting/results")]
+
+
 def test_mock_comment_and_title_are_included_in_result():
     result = _service(FakeRepository(TOP, BOTTOM)).fit(_request("1", "2"))
 

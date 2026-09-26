@@ -11,12 +11,16 @@ from contextlib import contextmanager
 import psycopg
 from fastapi import APIRouter, Depends
 
-from app.clients.s3 import S3ImageStorage
+from app.clients.s3 import S3ConfigError, S3ImageStorage
 from app.config.database import DatabaseConfigError, get_connection_pool
 from app.errors import ErrorResponse, error_response
 from app.security import verify_internal_key
 from app.virtual_fitting import controller
-from app.virtual_fitting.exceptions import FittingDatabaseError, VirtualFittingError
+from app.virtual_fitting.exceptions import (
+    FittingDatabaseError,
+    FittingImageStorageError,
+    VirtualFittingError,
+)
 from app.virtual_fitting.providers.comment import MockCommentProvider
 from app.virtual_fitting.providers.runware import RunwarePrunaProvider
 from app.virtual_fitting.repositories.product_repository import ProductRepository
@@ -70,3 +74,12 @@ def sync_fitting(request: SyncFittingRequest):
         if error.status_code >= 500:
             logger.exception("sync-fitting failed: %s", error.message)
         return error_response(error.status_code, error.message)
+    except S3ConfigError:
+        # S3ImageStorage() 는 Service 조립 단계에서 만들어지므로 외부 가상피팅 API 를 부르기 전에
+        # 여기서 멈춘다. 일반 internal_server_error 와 구분하도록 reason_code 를 싣는다.
+        logger.exception("sync-fitting S3 configuration error")
+        return error_response(
+            FittingImageStorageError.status_code,
+            FittingImageStorageError.message,
+            {"reason_code": S3ConfigError.reason_code},
+        )

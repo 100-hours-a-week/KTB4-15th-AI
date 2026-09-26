@@ -7,9 +7,8 @@ from pathlib import Path
 from app.body_image_validation.background import RembgBackgroundRemover
 from app.body_image_validation.detectors import MediaPipePersonDetector, MediaPipePoseDetector
 from app.body_image_validation.service import BodyImageValidationService
-from app.clients.s3 import S3ImageStorage
+from app.clients.s3 import S3ConfigError, S3ImageStorage, get_s3_bucket
 from app.config import body_image_validation as config
-from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +68,10 @@ class BodyImageRuntimeManager:
             if self._runtime is not None:
                 return
             try:
-                if not settings.S3_BUCKET.strip():
-                    raise BodyImageRuntimeError("S3_BUCKET 환경변수가 설정되지 않았습니다.")
+                get_s3_bucket()
                 self._runtime = BodyImageRuntime()
                 self._error = None
-            except BodyImageRuntimeError as error:
+            except (S3ConfigError, BodyImageRuntimeError) as error:
                 self._error = error
                 logger.warning("body image validation runtime is unavailable: %s", error)
 
@@ -81,6 +79,8 @@ class BodyImageRuntimeManager:
         if self._runtime is None:
             self.start()
         if self._runtime is None:
+            if isinstance(self._error, S3ConfigError):
+                raise S3ConfigError(str(self._error)) from self._error
             raise BodyImageRuntimeError("전신 이미지 검증 runtime을 초기화하지 못했습니다.") from self._error
         return self._runtime.service
 

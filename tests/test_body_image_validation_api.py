@@ -4,6 +4,8 @@ from fastapi.testclient import TestClient
 from app.body_image_validation import router
 from app.body_image_validation.exceptions import BodyImageSystemError, user_error
 from app.body_image_validation.models import BodyImageValidationResult
+from app.body_image_validation.runtime import BodyImageRuntimeError
+from app.clients.s3 import S3ConfigError
 from app.config import settings
 from app.main import app
 
@@ -15,13 +17,13 @@ AUTH = {"Authorization": f"Bearer {KEY}"}
 class StubService:
     def __init__(self, result=None, error=None):
         self.result = result or BodyImageValidationResult(
-            s3_key="users/7/body-images/example.png", warnings=[]
+            s3_key="body-images/example.png", warnings=[]
         )
         self.error = error
         self.calls = []
 
-    def validate(self, user_id, body):
-        self.calls.append((user_id, body))
+    def validate(self, body):
+        self.calls.append(body)
         if self.error:
             raise self.error
         return self.result
@@ -45,14 +47,13 @@ def use_service(monkeypatch, service):
 def test_success_contract_and_multipart_fields(client, monkeypatch):
     service = StubService(
         BodyImageValidationResult(
-            s3_key="users/7/body-images/example.png", warnings=["IMAGE_TOO_DARK"]
+            s3_key="body-images/example.png", warnings=["IMAGE_TOO_DARK"]
         )
     )
     use_service(monkeypatch, service)
 
     response = client.post(
         URL,
-        data={"user_id": "7"},
         files={"image": ("body.png", b"image-body", "image/png")},
         headers=AUTH,
     )
@@ -62,11 +63,11 @@ def test_success_contract_and_multipart_fields(client, monkeypatch):
         "code": 200,
         "message": "body_image_validation_success",
         "data": {
-            "s3_key": "users/7/body-images/example.png",
+            "s3_key": "body-images/example.png",
             "warnings": ["IMAGE_TOO_DARK"],
         },
     }
-    assert service.calls == [(7, b"image-body")]
+    assert service.calls == [b"image-body"]
 
 
 def test_user_failure_returns_first_reason(client, monkeypatch):
@@ -74,7 +75,6 @@ def test_user_failure_returns_first_reason(client, monkeypatch):
 
     response = client.post(
         URL,
-        data={"user_id": "7"},
         files={"image": ("body.png", b"image-body", "image/png")},
         headers=AUTH,
     )
@@ -98,7 +98,6 @@ def test_system_failure_is_distinct_from_user_validation(client, monkeypatch):
 
     response = client.post(
         URL,
-        data={"user_id": "7"},
         files={"image": ("body.png", b"image-body", "image/png")},
         headers=AUTH,
     )
@@ -111,13 +110,68 @@ def test_system_failure_is_distinct_from_user_validation(client, monkeypatch):
     }
 
 
-def test_authentication_is_required(client, monkeypatch):
+def test_request_does_not_need_user_id_and_ignores_a_legacy_one(client, monkeypatch):
     service = StubService()
     use_service(monkeypatch, service)
 
     response = client.post(
         URL,
         data={"user_id": "7"},
+        files={"image": ("body.png", b"image-body", "image/png")},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["s3_key"] == "body-images/example.png"
+    assert service.calls == [b"image-body"]
+
+
+def test_missing_s3_bucket_is_s3_config_error_before_any_processing(client, monkeypatch):
+    def misconfigured():
+        raise S3ConfigError("S3_BUCKET 환경변수가 설정되지 않았습니다.")
+
+    monkeypatch.setattr(router, "get_service", misconfigured)
+
+    response = client.post(
+        URL,
+        files={"image": ("body.png", b"image-body", "image/png")},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "code": 500,
+        "message": "body_image_validation_system_failed",
+        "data": {"reason_code": "S3_CONFIG_ERROR"},
+    }
+
+
+def test_unavailable_runtime_is_a_system_failure_not_a_success(client, monkeypatch):
+    def unavailable():
+        raise BodyImageRuntimeError("전신 이미지 모델 파일이 없습니다.")
+
+    monkeypatch.setattr(router, "get_service", unavailable)
+
+    response = client.post(
+        URL,
+        files={"image": ("body.png", b"image-body", "image/png")},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "code": 500,
+        "message": "body_image_validation_system_failed",
+        "data": {"reason_code": "BODY_IMAGE_RUNTIME_UNAVAILABLE"},
+    }
+
+
+def test_authentication_is_required(client, monkeypatch):
+    service = StubService()
+    use_service(monkeypatch, service)
+
+    response = client.post(
+        URL,
         files={"image": ("body.png", b"image-body", "image/png")},
     )
 
@@ -126,7 +180,7 @@ def test_authentication_is_required(client, monkeypatch):
 
 
 def test_missing_multipart_field_is_invalid_request(client):
-    response = client.post(URL, data={"user_id": "7"}, headers=AUTH)
+    response = client.post(URL, headers=AUTH)
 
     assert response.status_code == 400
     assert response.json() == {"code": 400, "message": "invalid_request", "data": None}
