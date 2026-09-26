@@ -72,5 +72,16 @@ class LLMClient:
         except Exception as exc:  # 상위에서 SSE error 이벤트로 변환한다
             raise LLMError(str(exc)) from exc
 
+    async def embed(self, text: str) -> list[float]:
+        """검색 질의 한 줄을 벡터로 바꾼다. 모델은 상품 쪽 임베딩과 같은 settings.EMBEDDING_MODEL."""
+        try:
+            response = await self.client.embeddings.create(
+                model=settings.EMBEDDING_MODEL,
+                input=[text],
+            )
+            return response.data[0].embedding
+        except Exception as exc:  # 상위에서 recommendation_search_failed 로 변환한다
+            raise LLMError(str(exc)) from exc
+
 
 llm = LLMClient()

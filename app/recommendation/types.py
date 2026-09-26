@@ -24,6 +24,13 @@ class Product(TypedDict):
     image_url: str
     detail_url: str
     color: str
+    price: int
+    # 상품의 대분류. DB 의 main_category("상의"/"하의")를 ITEM_TYPES 로 바꿔 보낸다 (2026-09-27 Backend 합의).
+    item_type: str
     # 검색 기반은 사전 생성한 description_summary를 그대로 쓴다.
     # 찜 기반은 요청 시점에 생성하며, 그 상품의 생성이 실패하면 빈 문자열이 온다.
     llm_comment: str
+
+
+# DB main_category → API item_type
+ITEM_TYPES = {"상의": "TOP", "하의": "BOTTOM"}
