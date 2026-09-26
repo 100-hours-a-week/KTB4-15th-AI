@@ -19,7 +19,7 @@ class WishlistCommentError(RecommendationError):
 class Product(TypedDict):
     """단계1 §7의 products 계약."""
 
-    product_id: str
+    product_code: str
     product_name: str
     image_url: str
     detail_url: str

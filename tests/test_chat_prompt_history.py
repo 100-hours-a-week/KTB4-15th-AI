@@ -5,8 +5,8 @@ from app.chat.graph.prompts import RECOMMENDATION_KIND, history_for_prompt
 from app.config import settings
 
 
-def _products(name, product_id):
-    return [{"product_name": name, "product_id": product_id}]
+def _products(name, product_code):
+    return [{"product_name": name, "product_code": product_code}]
 
 
 def test_recommendation_message_is_numbered():

@@ -113,7 +113,7 @@ def apply_color_quota(rows: list[dict], *, top_k: int, color_given: bool) -> lis
 #       들어오면 이 함수는 어떻게 되고, 그 예외는 search_products 의 except 안에서 나나 밖에서 나나?
 def _to_product(row: dict) -> Product:
     return Product(
-        product_id=str(row["product_code"]),
+        product_code=str(row["product_code"]),
         product_name=row["product_name"],
         image_url=row["image_url"],
         detail_url=row["detail_url"],

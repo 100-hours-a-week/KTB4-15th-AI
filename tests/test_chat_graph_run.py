@@ -15,7 +15,7 @@ from app.chat.graph.state import initial_state
 
 PRODUCTS = [
     {
-        "product_id": "0000011",
+        "product_code": "0000011",
         "product_name": "오버핏 후드 집업",
         "image_url": "https://example.com/11.jpg",
         "detail_url": "https://example.com/p/11",

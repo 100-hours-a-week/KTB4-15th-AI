@@ -35,7 +35,7 @@ from app.config import settings
 
 SAMPLE = [
     {
-        "product_id": "0000001",
+        "product_code": "0000001",
         "product_name": "오버핏 코튼 셔츠",
         "image_url": "https://example.com/products/0000001.jpg",
         "detail_url": "https://shop.example.com/products/0000001",
@@ -45,7 +45,7 @@ SAMPLE = [
         "llm_comment": "차분한 네이비 컬러와 여유로운 실루엣이 특징인 셔츠입니다.",
     },
     {
-        "product_id": "0000002",
+        "product_code": "0000002",
         "product_name": "미니멀 드롭 숄더 셔츠",
         "image_url": "https://example.com/products/0000002.jpg",
         "detail_url": "https://shop.example.com/products/0000002",
@@ -55,7 +55,7 @@ SAMPLE = [
         "llm_comment": "깔끔한 디자인과 오버핏이 특징인 셔츠입니다.",
     },
     {
-        "product_id": "0000003",
+        "product_code": "0000003",
         "product_name": "데일리 레귤러 셔츠",
         "image_url": "https://example.com/products/0000003.jpg",
         "detail_url": "https://shop.example.com/products/0000003",
