@@ -1,7 +1,7 @@
 import pytest
 from PIL import Image
 
-from app.body_image_validation.brightness import brightness_warnings
+from app.body_image_validation.brightness import validate_brightness
 from app.body_image_validation.exceptions import UserImageValidationError
 from app.body_image_validation.models import BoundingBox, Landmark, PersonDetection
 from app.body_image_validation.validation_rules import (
@@ -142,10 +142,14 @@ def test_frontal_rule_rejects_shoulder_visibility_asymmetry():
     )
 
 
-def test_brightness_boundary_59_60():
+def test_brightness_boundary_59_60(monkeypatch):
     box = BoundingBox(0, 0, 20, 20)
 
-    assert brightness_warnings(Image.new("RGB", (20, 20), (59, 59, 59)), box) == [
-        "IMAGE_TOO_DARK"
-    ]
-    assert brightness_warnings(Image.new("RGB", (20, 20), (60, 60, 60)), box) == []
+    monkeypatch.setattr("app.body_image_validation.brightness.mean_value_channel", lambda *_: 59)
+    assert (
+        reason_from(lambda: validate_brightness(Image.new("RGB", (20, 20), (59, 59, 59)), box))
+        == "IMAGE_TOO_DARK"
+    )
+
+    monkeypatch.setattr("app.body_image_validation.brightness.mean_value_channel", lambda *_: 60)
+    validate_brightness(Image.new("RGB", (20, 20), (60, 60, 60)), box)

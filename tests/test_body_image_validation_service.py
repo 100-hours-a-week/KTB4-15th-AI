@@ -4,7 +4,11 @@ import pytest
 from PIL import Image
 
 from app.body_image_validation.brightness import BrightnessCheckError
-from app.body_image_validation.exceptions import BodyImageSystemError
+from app.body_image_validation.exceptions import (
+    BodyImageSystemError,
+    UserImageValidationError,
+    user_error,
+)
 from app.body_image_validation.models import BoundingBox, Landmark, PersonDetection
 from app.body_image_validation.service import BodyImageValidationService
 from app.clients.s3 import ImageStorageError
@@ -113,25 +117,43 @@ def test_success_removes_background_and_uploads_rgba_png():
 
     assert result.s3_key.startswith("body-images/")
     assert result.s3_key.endswith(".png")
-    assert result.warnings == []
     [(body, key, content_type)] = storage.uploads
     assert key == result.s3_key
     assert content_type == "image/png"
     assert Image.open(BytesIO(body)).mode == "RGBA"
 
 
-def test_brightness_failure_is_logged_and_skipped(monkeypatch, caplog):
+def test_brightness_check_failure_is_system_failure(monkeypatch):
+    storage = FakeStorage()
+
     def fail_brightness(*args):
         raise BrightnessCheckError("opencv failed")
 
     monkeypatch.setattr(
-        "app.body_image_validation.service.brightness_warnings", fail_brightness
+        "app.body_image_validation.service.validate_brightness", fail_brightness
     )
 
-    result = service().validate(image_bytes())
+    with pytest.raises(BodyImageSystemError) as exc_info:
+        service(storage=storage).validate(image_bytes())
 
-    assert result.warnings == []
-    assert "brightness check skipped" in caplog.text
+    assert exc_info.value.reason_code == "BRIGHTNESS_CHECK_FAILED"
+    assert storage.uploads == []
+
+
+def test_too_dark_image_fails_before_background_removal(monkeypatch):
+    remover = FakeBackgroundRemover()
+    storage = FakeStorage()
+
+    def too_dark(*args):
+        raise user_error("IMAGE_TOO_DARK")
+
+    monkeypatch.setattr("app.body_image_validation.service.validate_brightness", too_dark)
+
+    with pytest.raises(UserImageValidationError) as exc_info:
+        service(remover=remover, storage=storage).validate(image_bytes())
+
+    assert exc_info.value.reason_code == "IMAGE_TOO_DARK"
+    assert storage.uploads == []
 
 
 @pytest.mark.parametrize(
