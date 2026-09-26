@@ -14,7 +14,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # slim 이미지에서 OpenCV가 사용하는 XCB 런타임 라이브러리를 설치한다.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libegl1 libgl1 libgles2 libglib2.0-0 libxcb1 \
+ && apt-get install -y --no-install-recommends \
+      libegl1 \
+      libgl1 \
+      libgles2 \
+      libglib2.0-0 \
+      libxcb1 \
  && rm -rf /var/lib/apt/lists/*
 
 # runtime에 그대로 복사할 운영 venv를 만든다.
@@ -30,6 +35,7 @@ RUN pip install --require-hashes -r requirements.txt
 # 전신 이미지 검증에 필요한 모델을 checksum 검증 후 이미지에 포함한다.
 COPY scripts/download_body_image_models.py ./scripts/
 RUN python scripts/download_body_image_models.py /build/models/body_image_validation
+
 
 # =========================
 # 2. Test stage
@@ -54,6 +60,7 @@ RUN ruff check app tests \
  && pytest -q \
  && touch /tmp/.tests-passed
 
+
 # =========================
 # 3. Runtime stage
 # - 운영용 최종 이미지
@@ -64,13 +71,36 @@ FROM ${PYTHON_IMAGE} AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH" \
-    REMBG_HOME=/app/models/body_image_validation
+    REMBG_HOME="/app/models/body_image_validation" \
+    HOME="/home/app" \
+    XDG_CACHE_HOME="/home/app/.cache" \
+    NUMBA_CACHE_DIR="/home/app/.cache/numba" \
+    MPLCONFIGDIR="/home/app/.cache/matplotlib"
 
 # FastAPI 애플리케이션은 root 권한이 필요 없으므로 non-root 사용자로 실행한다.
+# Numba/Matplotlib 등이 런타임 캐시를 기록할 수 있도록 app 전용 cache 디렉터리를 만든다.
 RUN groupadd --system --gid 1001 app \
- && useradd --system --uid 1001 --gid app app \
+ && useradd \
+      --system \
+      --uid 1001 \
+      --gid app \
+      --home-dir /home/app \
+      --shell /usr/sbin/nologin \
+      app \
+ && mkdir -p \
+      /home/app/.cache/numba \
+      /home/app/.cache/matplotlib \
+ && chown -R app:app /home/app \
+ && chmod 700 \
+      /home/app/.cache/numba \
+      /home/app/.cache/matplotlib \
  && apt-get update \
- && apt-get install -y --no-install-recommends libegl1 libgl1 libgles2 libglib2.0-0 libxcb1 \
+ && apt-get install -y --no-install-recommends \
+      libegl1 \
+      libgl1 \
+      libgles2 \
+      libglib2.0-0 \
+      libxcb1 \
  && rm -rf /var/lib/apt/lists/*
 
 # test stage가 성공해야만 최종 이미지가 만들어지도록 한다.
@@ -80,11 +110,13 @@ COPY --from=test /tmp/.tests-passed /tmp/.tests-passed
 COPY --from=builder /opt/venv /opt/venv
 
 # builder에서 검증한 모델을 runtime 이미지에 포함한다.
+# 모델은 runtime에서 읽기만 하므로 app 사용자에게 쓰기 권한을 부여하지 않는다.
 COPY --from=builder /build/models/body_image_validation /app/models/body_image_validation
 
 WORKDIR /app
 
 # 운영 이미지에는 테스트 코드를 포함하지 않는다.
+# 애플리케이션 코드 역시 runtime에서는 읽기만 사용한다.
 COPY app ./app
 
 USER app
