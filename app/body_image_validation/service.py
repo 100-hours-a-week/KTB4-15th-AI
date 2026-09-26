@@ -35,7 +35,7 @@ class BodyImageValidationService:
         self.background_remover = background_remover
         self.image_storage = image_storage
 
-    def validate(self, user_id: int, image_body: bytes) -> BodyImageValidationResult:
+    def validate(self, image_body: bytes) -> BodyImageValidationResult:
         image = decode_image(image_body)
         try:
             detections = self.person_detector.detect(image)
@@ -71,7 +71,7 @@ class BodyImageValidationService:
             png = encode_png(result)
         except (OSError, ValueError) as error:
             raise BodyImageSystemError("IMAGE_ENCODING_FAILED") from error
-        key = f"users/{user_id}/body-images/{uuid.uuid4()}.png"
+        key = f"body-images/{uuid.uuid4()}.png"
         try:
             self.image_storage.upload_bytes(png, key, "image/png")
         except ImageStorageError as error:

@@ -4,23 +4,32 @@ boto3의 표준 credential provider chain을 사용한다. 운영에서는 EC2 I
 자격증명을 공급하며 access key를 코드에 받거나 저장하지 않는다.
 """
 
-import mimetypes
 import uuid
 from collections.abc import Callable
 from functools import lru_cache
-from pathlib import PurePosixPath
+from io import BytesIO
 from typing import Any, Protocol, runtime_checkable
-from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+from PIL import Image
 
 from app.config import settings
 
 DEFAULT_DOWNLOAD_TIMEOUT = 30.0
 MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024
 
+# Pillow 가 실제 bytes 에서 판별한 format -> (Content-Type, 확장자).
+_IMAGE_TYPES = {
+    "PNG": ("image/png", ".png"),
+    "JPEG": ("image/jpeg", ".jpg"),
+    "WEBP": ("image/webp", ".webp"),
+}
+
 
 class S3ConfigError(RuntimeError):
     """필수 S3 설정이 없을 때 발생한다."""
+
+    reason_code = "S3_CONFIG_ERROR"
 
 
 class ImageStorageError(RuntimeError):
@@ -48,11 +57,20 @@ def get_s3_client() -> Any:
     return boto3.client("s3", region_name=settings.AWS_REGION)
 
 
-def _extension_for(url: str, content_type: str) -> str:
-    suffix = PurePosixPath(urlparse(url).path).suffix.lower()
-    if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
-        return suffix
-    return mimetypes.guess_extension(content_type.split(";", 1)[0]) or ".png"
+def _detect_image_type(body: bytes) -> tuple[str, str]:
+    """실제 이미지 bytes 로 (Content-Type, 확장자)를 정한다.
+
+    원격 응답의 Content-Type 헤더나 URL 확장자는 누락/오기(text/plain,
+    application/octet-stream 등)가 흔해서 믿지 않는다. 헤더가 정상이면 결과가 같다.
+    """
+    try:
+        with Image.open(BytesIO(body)) as image:
+            detected = _IMAGE_TYPES.get(image.format)
+    except (OSError, ValueError, Image.DecompressionBombError):
+        detected = None
+    if detected is None:
+        raise ImageStorageError("가상피팅 결과 이미지가 지원하는 형식(PNG/JPEG/WEBP)이 아닙니다.")
+    return detected
 
 
 class S3ImageStorage:
@@ -84,10 +102,10 @@ class S3ImageStorage:
         try:
             with self._opener(request, timeout=DEFAULT_DOWNLOAD_TIMEOUT) as response:
                 body = response.read(MAX_REMOTE_IMAGE_BYTES + 1)
-                content_type = response.headers.get_content_type()
         except (OSError, TimeoutError) as error:
             raise ImageStorageError("가상피팅 결과 이미지 다운로드에 실패했습니다.") from error
         if not body or len(body) > MAX_REMOTE_IMAGE_BYTES:
             raise ImageStorageError("가상피팅 결과 이미지 크기가 허용 범위를 벗어났습니다.")
-        key = f"{key_prefix}/{uuid.uuid4()}{_extension_for(url, content_type)}"
+        content_type, extension = _detect_image_type(body)
+        key = f"{key_prefix}/{uuid.uuid4()}{extension}"
         return self.upload_bytes(body, key, content_type)
