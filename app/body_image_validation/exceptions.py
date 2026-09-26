@@ -42,6 +42,7 @@ USER_REASONS = {
     "ARMS_NOT_VISIBLE": "양팔이 모두 보이도록 촬영해주세요.",
     "LEGS_NOT_VISIBLE": "양다리가 모두 보이도록 촬영해주세요.",
     "NOT_FRONTAL": "카메라를 정면으로 바라보고 촬영해주세요.",
+    "IMAGE_TOO_DARK": "사진이 너무 어둡습니다. 밝은 곳에서 다시 촬영해주세요.",
 }
 
 

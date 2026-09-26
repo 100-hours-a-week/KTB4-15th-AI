@@ -43,9 +43,7 @@ def validate_body_image(image: ImageFile):
         service = get_service()
         body = image.file.read(config.MAX_IMAGE_BYTES + 1)
         result = service.validate(body)
-        return BodyImageValidationResponse(
-            data=BodyImageValidationData(s3_key=result.s3_key, warnings=result.warnings)
-        )
+        return BodyImageValidationResponse(data=BodyImageValidationData(s3_key=result.s3_key))
     except BodyImageValidationError as error:
         if error.status_code >= 500:
             logger.exception("body image validation failed: %s", error.reason_code)

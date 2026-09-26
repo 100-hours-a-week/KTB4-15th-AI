@@ -5,7 +5,6 @@ from pydantic import BaseModel
 
 class BodyImageValidationData(BaseModel):
     s3_key: str
-    warnings: list[str]
 
 
 class BodyImageValidationResponse(BaseModel):

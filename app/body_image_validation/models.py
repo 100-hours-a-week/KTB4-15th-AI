@@ -28,4 +28,3 @@ class PersonDetection:
 @dataclass(frozen=True)
 class BodyImageValidationResult:
     s3_key: str
-    warnings: list[str]

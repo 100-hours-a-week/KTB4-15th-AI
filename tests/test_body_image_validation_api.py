@@ -16,9 +16,7 @@ AUTH = {"Authorization": f"Bearer {KEY}"}
 
 class StubService:
     def __init__(self, result=None, error=None):
-        self.result = result or BodyImageValidationResult(
-            s3_key="body-images/example.png", warnings=[]
-        )
+        self.result = result or BodyImageValidationResult(s3_key="body-images/example.png")
         self.error = error
         self.calls = []
 
@@ -45,11 +43,7 @@ def use_service(monkeypatch, service):
 
 
 def test_success_contract_and_multipart_fields(client, monkeypatch):
-    service = StubService(
-        BodyImageValidationResult(
-            s3_key="body-images/example.png", warnings=["IMAGE_TOO_DARK"]
-        )
-    )
+    service = StubService()
     use_service(monkeypatch, service)
 
     response = client.post(
@@ -62,10 +56,7 @@ def test_success_contract_and_multipart_fields(client, monkeypatch):
     assert response.json() == {
         "code": 200,
         "message": "body_image_validation_success",
-        "data": {
-            "s3_key": "body-images/example.png",
-            "warnings": ["IMAGE_TOO_DARK"],
-        },
+        "data": {"s3_key": "body-images/example.png"},
     }
     assert service.calls == [b"image-body"]
 
@@ -86,6 +77,26 @@ def test_user_failure_returns_first_reason(client, monkeypatch):
         "data": {
             "reason_code": "FULL_BODY_NOT_VISIBLE",
             "reason": "머리부터 발끝까지 모두 나오도록 전신을 촬영해주세요.",
+        },
+    }
+
+
+def test_too_dark_image_is_user_failure(client, monkeypatch):
+    use_service(monkeypatch, StubService(error=user_error("IMAGE_TOO_DARK")))
+
+    response = client.post(
+        URL,
+        files={"image": ("body.png", b"image-body", "image/png")},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": 422,
+        "message": "body_image_validation_failed",
+        "data": {
+            "reason_code": "IMAGE_TOO_DARK",
+            "reason": "사진이 너무 어둡습니다. 밝은 곳에서 다시 촬영해주세요.",
         },
     }
 
