@@ -34,13 +34,13 @@ def test_done_always_has_products_key():
 
 
 def test_done_carries_recommended_products():
-    items = [{"product_id": "0000001", "product_name": "셔츠", "price": 39000, "item_type": "TOP"}]
+    items = [{"product_code": "0000001", "product_name": "셔츠", "price": 39000, "item_type": "TOP"}]
     data = json.loads(sse.done(123, sse.SEARCH_DONE_CONTENT, items).split("data: ", 1)[1])
     assert data == {"chat_id": 123, "content": "조건에 맞는 옷을 검색해봤습니다.", "products": items}
 
 
 def test_products_event_is_one_payload():
-    items = [{"product_id": "0000001", "product_name": "셔츠"}]
+    items = [{"product_code": "0000001", "product_name": "셔츠"}]
     raw = sse.products(123, items)
     assert raw.count("data: ") == 1
     assert json.loads(raw.split("data: ", 1)[1])["products"] == items

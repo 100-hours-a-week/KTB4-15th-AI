@@ -22,7 +22,7 @@ from app.recommendation import search as search_module
 from app.recommendation.search import search_products
 
 PRODUCT_KEYS = {
-    "product_id", "product_name", "image_url", "detail_url", "color", "price", "item_type",
+    "product_code", "product_name", "image_url", "detail_url", "color", "price", "item_type",
     "llm_comment",
 }
 

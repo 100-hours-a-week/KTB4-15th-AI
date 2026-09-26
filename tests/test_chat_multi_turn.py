@@ -20,7 +20,7 @@ THREAD = {"configurable": {"thread_id": "multi-turn"}}
 
 PRODUCTS = [
     {
-        "product_id": "0000001",
+        "product_code": "0000001",
         "product_name": "오버핏 코튼 셔츠",
         "image_url": "https://example.com/1.jpg",
         "detail_url": "https://example.com/p/1",

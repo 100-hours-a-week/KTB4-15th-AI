@@ -14,7 +14,7 @@ from app.chat.schemas import ChatRequest
 
 PRODUCTS = [
     {
-        "product_id": "4097486",
+        "product_code": "4097486",
         "product_name": "리넨 블랜디드 커브드 팬츠",
         "image_url": "https://example.com/1.jpg",
         "detail_url": "https://example.com/p/1",
