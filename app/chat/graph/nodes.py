@@ -157,7 +157,8 @@ async def search(state: dict) -> dict:
     )
 
     # 0건이면 빈 배열 그대로 내보낸다. 문구는 프론트가 만든다.
-    writer({"event": sse.PRODUCTS, "products": products})
+    # done 의 content 는 말풍선이 없는 이 턴을 위해 합의한 고정 문구로 채운다.
+    writer({"event": sse.PRODUCTS, "products": products, "done_content": sse.SEARCH_DONE_CONTENT})
 
     return {
         "messages": [_recommendation_message(products)],

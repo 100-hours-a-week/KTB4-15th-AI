@@ -27,6 +27,11 @@ SUMMARY_MAX_OUTPUT_TOKENS = int(os.getenv("SUMMARY_MAX_OUTPUT_TOKENS", "300"))
 # 검색 기반 추천은 Top 3 (단계1 §7, 단계5 §3.2)
 TOP_K = int(os.getenv("TOP_K", "3"))
 
+# 검색 질의와 상품 설명을 같은 모델로 임베딩해야 거리가 의미를 갖는다 (단계5 §3.5).
+# 차원은 scripts/db/schema.sql 의 embedding vector(1536) 과 한 몸이다. 적재 스크립트
+# scripts/pipeline/embed_products.py 도 이 값을 읽는다.
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+
 # 프롬프트에 남겨둘 추천 목록의 개수. 오래된 추천까지 계속 끌고 가면
 # analyze 입력이 길어져 TTFT 예산을 먹는다.
 RECOMMENDATION_MEMORY_TURNS = int(os.getenv("RECOMMENDATION_MEMORY_TURNS", "2"))
@@ -49,3 +54,8 @@ S3_BUCKET = os.getenv("S3_BUCKET", "")
 # 반환한다. 외부 모델 응답을 기다리는 동안 connection을 점유하지 않는다.
 DATABASE_POOL_MIN_SIZE = int(os.getenv("DATABASE_POOL_MIN_SIZE", "1"))
 DATABASE_POOL_MAX_SIZE = int(os.getenv("DATABASE_POOL_MAX_SIZE", "10"))
+
+# 검색 기반 추천 전용 async pool 크기. 검색은 한 턴에 짧은 SELECT 한 번이고, 임베딩 API 를
+# 기다리는 동안에는 connection 을 잡지 않는다. 검색이 실제로 많아지면 값만 올린다.
+SEARCH_DB_POOL_MIN_SIZE = int(os.getenv("SEARCH_DB_POOL_MIN_SIZE", "1"))
+SEARCH_DB_POOL_MAX_SIZE = int(os.getenv("SEARCH_DB_POOL_MAX_SIZE", "5"))
