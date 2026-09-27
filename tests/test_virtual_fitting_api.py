@@ -32,7 +32,11 @@ from app.virtual_fitting.providers.comment import MOCK_COMMENT, MOCK_TITLE, Mock
 from app.virtual_fitting.providers.runware import RunwareConfigError, RunwarePrunaProvider
 from app.virtual_fitting.providers.runware_comment import RunwareCommentProvider
 from app.virtual_fitting.repositories.product_repository import ProductRepository
-from app.virtual_fitting.service import VirtualFittingService
+from app.virtual_fitting.service import (
+    FALLBACK_COMMENT,
+    FALLBACK_TITLE,
+    VirtualFittingService,
+)
 from tests.virtual_fitting_fixtures import make_bottom, make_top
 
 KEY = "test-internal-key"
@@ -299,6 +303,7 @@ def connection(monkeypatch):
     monkeypatch.setattr(router, "get_connection_pool", lambda: FakePool(conn))
     monkeypatch.setattr(router, "S3ImageStorage", FakeImageStorage)
     monkeypatch.setenv("RUNWARE_VTON_API_KEY", "test-vton-key")
+    monkeypatch.setenv("RUNWARE_LLM_API_KEY", "test-llm-key")
     return conn
 
 
@@ -307,9 +312,8 @@ def test_service_is_assembled_from_the_v1_components(connection):
         assert isinstance(service, VirtualFittingService)
         assert isinstance(service.repository, ProductRepository)
         assert isinstance(service.fitting_provider, RunwarePrunaProvider)
-        assert isinstance(service.comment_provider, MockCommentProvider)
-        # description_summary 가 DB 에 생기기 전까지 production 은 Mock 을 쓴다 (A-2 에서 교체).
-        assert not isinstance(service.comment_provider, RunwareCommentProvider)
+        assert isinstance(service.comment_provider, RunwareCommentProvider)
+        assert not isinstance(service.comment_provider, MockCommentProvider)
         # Service 조립만으로는 pool에서 connection을 빌리지 않는다.
         assert connection.autocommit is False
         assert connection.closed is False
@@ -338,8 +342,8 @@ def test_connection_is_not_acquired_when_assembly_fails(connection, monkeypatch)
 SECRET_URL = "postgresql://user:secret-password@db-host:5432/db"
 LIBPQ_MESSAGE = 'connection to server at "db-host" (10.0.0.5), port 5432 failed: Connection refused'
 DB_ERROR_BODY = {"code": 500, "message": "database_error", "data": None}
-TOP_ROW = (1, "https://img/top.jpg", "상의", "스웨트셔츠")
-BOTTOM_ROW = (2, "https://img/bottom.jpg", "하의", "슬림 팬츠")
+TOP_ROW = (1, "https://img/top.jpg", "상의", "스웨트셔츠", "상의 설명 요약")
+BOTTOM_ROW = (2, "https://img/bottom.jpg", "하의", "슬림 팬츠", "하의 설명 요약")
 
 
 class RowsCursor:
@@ -383,12 +387,14 @@ class RaisingFittingProvider:
 
 @pytest.fixture
 def real_assembly(monkeypatch):
-    """실제 open_virtual_fitting_service 를 쓰되 DB connection 과 VTON Provider 만 바꾼다."""
+    """실제 open_virtual_fitting_service 를 쓰되 DB connection 과 외부 Provider 만 바꾼다."""
     monkeypatch.setenv("RUNWARE_VTON_API_KEY", "test-vton-key")
+    monkeypatch.setenv("RUNWARE_LLM_API_KEY", "test-llm-key")
 
     def use(connection, provider=None):
         monkeypatch.setattr(router, "get_connection_pool", lambda: FakePool(connection))
         monkeypatch.setattr(router, "S3ImageStorage", FakeImageStorage)
+        monkeypatch.setattr(router, "RunwareCommentProvider", MockCommentProvider)
         if provider is not None:
             monkeypatch.setattr(router, "RunwarePrunaProvider", lambda: provider)
         return connection
@@ -494,6 +500,34 @@ def test_successful_lookup_runs_the_whole_flow_and_closes_the_connection(client,
     assert connection.closed is True
 
 
+class FailingCommentProvider:
+    def generate_comment(self, result_image_url, description_summaries):
+        raise FittingPostprocessError("Runware LLM HTTP 오류: 500")
+
+    def generate_title(self, comment):
+        raise AssertionError("comment 가 실패하면 title 을 부르지 않는다")
+
+
+def test_llm_failure_is_still_200_with_fallback_comment_and_title(
+    client, real_assembly, monkeypatch
+):
+    real_assembly(DbConnection(rows=[TOP_ROW, BOTTOM_ROW]), FakeFittingProvider())
+    monkeypatch.setattr(router, "RunwareCommentProvider", FailingCommentProvider)
+
+    response = _fitting_request(client, "1", "2")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "code": 200,
+        "message": "fitting_succeeded",
+        "data": {
+            "result_image_key": "virtual-fitting/results/fake.jpg",
+            "llm_title": FALLBACK_TITLE,
+            "llm_comment": FALLBACK_COMMENT,
+        },
+    }
+
+
 def test_missing_s3_bucket_is_s3_config_error_before_any_external_call(
     client, real_assembly, monkeypatch, caplog
 ):
@@ -549,12 +583,16 @@ def test_the_connection_is_closed_when_fitting_fails(
     ("rows", "status", "message"),
     [
         (
-            [TOP_ROW, (3, "https://img/top2.jpg", "상의", "후디")],
+            [TOP_ROW, (3, "https://img/top2.jpg", "상의", "후디", "후디 설명 요약")],
             422,
             "invalid_fitting_combination",
         ),
-        ([(1, None, "상의", "스웨트셔츠")], 422, "product_image_missing"),
-        ([(1, "https://img/x.jpg", "상의", "없는 카테고리")], 500, "unsupported_sub_category"),
+        ([(1, None, "상의", "스웨트셔츠", "설명 요약")], 422, "product_image_missing"),
+        (
+            [(1, "https://img/x.jpg", "상의", "없는 카테고리", "설명 요약")],
+            500,
+            "unsupported_sub_category",
+        ),
     ],
     ids=["combination", "image-missing", "unsupported-sub-category"],
 )

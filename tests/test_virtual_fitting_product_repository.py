@@ -69,10 +69,11 @@ TOP_ROW = (
     "https://img.29cm.co.kr/item/top.jpg",
     "상의",
     "스웨트셔츠",
+    "기모 안감의 오버핏 스웨트셔츠",
 )
 
 
-def test_find_by_codes_returns_products():
+def test_find_by_codes_returns_products_with_description_summary():
     product_repository = repository(FakeConnection([TOP_ROW]))
 
     products = product_repository.find_by_codes(["4120937"])
@@ -83,6 +84,7 @@ def test_find_by_codes_returns_products():
             image_url="https://img.29cm.co.kr/item/top.jpg",
             main_category="상의",
             sub_category="스웨트셔츠",
+            description_summary="기모 안감의 오버핏 스웨트셔츠",
         )
     ]
 
@@ -111,9 +113,10 @@ def test_find_by_codes_skips_query_for_empty_input():
 
 def test_select_only_needed_columns():
     sql = build_select_sql()
-    for column in ("product_code", "image_url", "main_category", "sub_category"):
-        assert column in sql
-    assert "description_summary" not in sql
+    assert sql.startswith(
+        "SELECT product_code, image_url, main_category, sub_category, description_summary "
+        "FROM products"
+    )
     assert "*" not in sql
 
 

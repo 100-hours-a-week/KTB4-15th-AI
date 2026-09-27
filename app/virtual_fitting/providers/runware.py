@@ -44,7 +44,7 @@ def get_runware_vton_api_key() -> str:
 
 
 def get_runware_llm_api_key() -> str:
-    """Runware LLM comment/title Provider 가 쓸 키. 지금은 startup 검증에만 쓴다."""
+    """RunwareCommentProvider 가 comment/title 생성에 쓰는 키. startup 에서도 검증한다."""
     return _read_api_key(LLM_API_KEY_ENV)
 
 
