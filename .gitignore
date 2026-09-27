@@ -31,3 +31,6 @@ htmlcov/
 
 # Logs
 *.log
+
+scripts/pipeline/
+scripts/db/load_products.sql

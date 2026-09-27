@@ -10,6 +10,10 @@ ERROR = "error"
 # Backend / Frontend와 합의가 필요하고, 모르는 이벤트는 무시하는 것이 전제다.
 STATUS = "status"
 
+# 검색 기반 추천 턴의 done content. 말풍선 없이 추천만 하고 끝나는 턴에 Backend 가
+# 저장할 문장이 필요해서 고정 문구로 합의했다 (2026-09-27).
+SEARCH_DONE_CONTENT = "조건에 맞는 옷을 검색해봤습니다."
+
 
 def format_event(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -33,14 +37,19 @@ def status(chat_id: int, label: str) -> str:
     return format_event(STATUS, {"chat_id": chat_id, "label": label})
 
 
-def done(chat_id: int, content: str = "") -> str:
+def done(chat_id: int, content: str = "", products: list[dict] | None = None) -> str:
     """현재 SSE 응답 종료.
 
     content 에는 이 턴에 흘려보낸 말풍선 전체 문장이 담긴다 (2026-09-17 결정).
     Backend 는 token 을 이어붙여 저장하되 이 값으로 대조할 수 있다.
-    추천만 하고 끝난 턴처럼 말풍선이 없었으면 빈 문자열이다.
+    말풍선이 없었으면 빈 문자열이고, 검색 기반 추천 턴은 SEARCH_DONE_CONTENT 다.
+
+    products 는 이 턴에 products 이벤트로 보낸 목록과 같다. 추천이 없는 턴에도 키는
+    항상 있고 빈 배열이다 (2026-09-27 Backend 합의). products 이벤트는 그대로 보낸다.
     """
-    return format_event(DONE, {"chat_id": chat_id, "content": content})
+    return format_event(
+        DONE, {"chat_id": chat_id, "content": content, "products": products or []}
+    )
 
 
 def error(chat_id: int, code: str, message: str) -> str:

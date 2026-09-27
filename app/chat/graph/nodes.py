@@ -34,14 +34,14 @@ def _merge_conditions(current: dict, metadata: dict | None, dislikes: list | Non
 def _recommendation_message(products: list[dict]) -> dict:
     """추천 목록을 대화 기록에 남긴다.
 
-    product_id와 상품명만 남기고 가격·이미지는 남기지 않는다. 가격은 배치로 갱신되므로
+    product_code와 상품명만 남기고 가격·이미지는 남기지 않는다. 가격은 배치로 갱신되므로
     대화 기록에 박아두면 낡은 값이 프롬프트로 들어간다.
 
     "두 번째 거"를 풀 수 있도록 번호를 붙인다.
     """
     if products:
         body = "\n".join(
-            f"{index}. {product['product_name']} ({product['product_id']})"
+            f"{index}. {product['product_name']} ({product['product_code']})"
             for index, product in enumerate(products, start=1)
         )
     else:
@@ -157,7 +157,8 @@ async def search(state: dict) -> dict:
     )
 
     # 0건이면 빈 배열 그대로 내보낸다. 문구는 프론트가 만든다.
-    writer({"event": sse.PRODUCTS, "products": products})
+    # done 의 content 는 말풍선이 없는 이 턴을 위해 합의한 고정 문구로 채운다.
+    writer({"event": sse.PRODUCTS, "products": products, "done_content": sse.SEARCH_DONE_CONTENT})
 
     return {
         "messages": [_recommendation_message(products)],

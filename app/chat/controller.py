@@ -52,6 +52,9 @@ async def stream_chat(graph, request: ChatRequest) -> AsyncIterator[str]:
     # done 에 실어 보낼 전체 문장. 체크포인트에서 다시 읽지 않고 실제로 내보낸 조각을
     # 모은다. 오류로 중간에 끊긴 턴에서는 그때까지 보낸 만큼만 담긴다.
     spoken: list[str] = []
+    # done 에 다시 실어 보낼 추천 목록과, 말풍선 대신 쓸 문장(검색 추천 턴의 고정 문구).
+    recommended: list[dict] = []
+    done_content: str | None = None
 
     try:
         async for chunk in graph.astream(state, thread_config(request), stream_mode="custom"):
@@ -59,6 +62,8 @@ async def stream_chat(graph, request: ChatRequest) -> AsyncIterator[str]:
                 spoken.append(chunk["content"])
                 yield sse.token(chat_id, chunk["content"])
             elif chunk["event"] == sse.PRODUCTS:
+                recommended = chunk["products"]
+                done_content = chunk.get("done_content")
                 yield sse.products(chat_id, chunk["products"])
             elif chunk["event"] == sse.STATUS:
                 yield sse.status(chat_id, chunk["label"])
@@ -75,7 +80,8 @@ async def stream_chat(graph, request: ChatRequest) -> AsyncIterator[str]:
             chat_id, "recommendation_search_failed", "상품 추천 처리 중 오류가 발생했습니다."
         )
 
-    yield sse.done(chat_id, "".join(spoken))
+    content = "".join(spoken) if done_content is None else done_content
+    yield sse.done(chat_id, content, recommended)
 
 
 # sabu: SSE 가 중간에 끊겨도 그래프는 끝까지 돌고 checkpoint 에 봇 응답이 저장된다.

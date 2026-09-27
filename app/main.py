@@ -15,7 +15,7 @@ from app.chat import router as chat_router
 from app.chat.graph import build_graph
 from app.config import settings
 from app.config.checkpointer import checkpointer_scope
-from app.config.database import close_connection_pool
+from app.config.database import close_async_pool, close_connection_pool, open_async_pool
 from app.errors import register_error_handlers
 from app.virtual_fitting import router as virtual_fitting_router
 from app.virtual_fitting.providers.runware import (
@@ -31,6 +31,7 @@ async def lifespan(app: FastAPI):
     get_runware_llm_api_key()
     runtime_manager.start()
     try:
+        await open_async_pool()
         async with checkpointer_scope() as checkpointer:
             app.state.checkpointer = checkpointer
             app.state.graph = build_graph(checkpointer)
@@ -38,6 +39,7 @@ async def lifespan(app: FastAPI):
     finally:
         runtime_manager.close()
         close_connection_pool()
+        await close_async_pool()
 
 
 app = FastAPI(title="KTB4-15th AI Server", lifespan=lifespan)
