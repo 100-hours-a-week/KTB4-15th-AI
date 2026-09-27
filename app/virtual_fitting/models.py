@@ -14,6 +14,7 @@ class FittingProduct:
     image_url: str | None
     main_category: str
     sub_category: str
+    description_summary: str | None
 
 
 @dataclass(frozen=True)

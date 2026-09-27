@@ -1,23 +1,21 @@
 """Runware LLM 으로 llm_comment / llm_title 을 만드는 Provider.
 
-Runware 의 OpenAI 호환 endpoint(/chat/completions)는 이미지 입력을 지원하지 않는다.
-그래서 native API 의 textInference task 를 쓴다.
+Runware 의 OpenAI 호환 endpoint 를 non-streaming 으로 쓴다. OpenAI API 를 직접 부르지 않으며
+Runware 키로 Runware 계정에 과금된다.
 
-POST https://api.runware.ai/v1
+POST https://api.runware.ai/v1/chat/completions
   헤더: Authorization: Bearer <RUNWARE_LLM_API_KEY>
-  본문: [{"taskType": "textInference", "model": "google-gemini-3-5-flash",
-          "inputs": {"images": [<결과 이미지 URL>]},
-          "messages": [{"role": "user", "content": ...}],
-          "settings": {"systemPrompt", "temperature", "maxTokens", "thinkingLevel"},
-          "deliveryMethod": "sync"}]
-  성공: {"data": [{"text": "...", "finishReason": "stop"}]}
+  본문: {"model": "openai:gpt@5.6-luna",
+         "messages": [{"role": "system", ...}, {"role": "user", "content": ...}],
+         "max_completion_tokens": ..., "stream": false}
+  성공: {"choices": [{"message": {"content": "..."}, "finish_reason": "stop"}]}
 
 comment 는 결과 이미지 + 상품 설명 요약으로, title 은 comment 만으로 만든다(호출 2회).
-결과 이미지는 접근 가능한 URL 이면 된다. Runware 원본인지 S3 인지 구분하지 않는다.
+이미지는 OpenAI 표준 image_url content part 로 보낸다. Runware 문서는 이 endpoint 의 요청
+형식이 OpenAI Chat Completions 와 같다고만 하고 이미지 입력을 따로 명시하지 않는다.
 """
 
 import json
-import uuid
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 from urllib.request import Request, urlopen
@@ -28,10 +26,11 @@ from app.virtual_fitting.exceptions import (
     FittingTimeoutError,
 )
 from app.virtual_fitting.providers.http import send_request
-from app.virtual_fitting.providers.runware import RUNWARE_ENDPOINT, get_runware_llm_api_key
+from app.virtual_fitting.providers.runware import get_runware_llm_api_key
 
-# 이미지 입력을 받는 멀티모달 모델. 바꿀 때는 여기 한 곳만 고친다.
-LLM_MODEL = "google-gemini-3-5-flash"
+LLM_ENDPOINT = "https://api.runware.ai/v1/chat/completions"
+# 모델은 여기 한 곳에서만 바꾼다. Runware AIR 형식이다.
+LLM_MODEL = "openai:gpt@5.6-luna"
 DEFAULT_TIMEOUT = 30.0
 _ERROR_DETAIL_LIMIT = 200
 _TRUNCATED_FINISH_REASONS = ("length", "content_filter")
@@ -55,47 +54,42 @@ TITLE_SYSTEM_PROMPT = (
 )
 
 
-def build_comment_task(
-    result_image_url: str, description_summaries: Sequence[str], task_uuid: str
-) -> dict:
+def build_comment_request(result_image_url: str, description_summaries: Sequence[str]) -> dict:
     summaries = "\n".join(
         f"{number}. {summary}" for number, summary in enumerate(description_summaries, start=1)
     )
     return {
-        "taskType": "textInference",
-        "taskUUID": task_uuid,
         "model": LLM_MODEL,
-        "inputs": {"images": [result_image_url]},
-        "messages": [{"role": "user", "content": f"상품 설명 요약:\n{summaries}"}],
-        "settings": {
-            "systemPrompt": COMMENT_SYSTEM_PROMPT,
-            "temperature": 0.5,
-            "maxTokens": 512,
-            "thinkingLevel": "off",
-        },
-        "deliveryMethod": "sync",
+        "messages": [
+            {"role": "system", "content": COMMENT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"상품 설명 요약:\n{summaries}"},
+                    {"type": "image_url", "image_url": {"url": result_image_url}},
+                ],
+            },
+        ],
+        "max_completion_tokens": 512,
+        "stream": False,
     }
 
 
-def build_title_task(comment: str, task_uuid: str) -> dict:
-    """title 은 comment 만 입력으로 받는다. 이미지(inputs)와 상품 정보는 넣지 않는다."""
+def build_title_request(comment: str) -> dict:
+    """title 은 comment 만 입력으로 받는다. 이미지와 상품 정보는 넣지 않는다."""
     return {
-        "taskType": "textInference",
-        "taskUUID": task_uuid,
         "model": LLM_MODEL,
-        "messages": [{"role": "user", "content": f"코디 설명: {comment}"}],
-        "settings": {
-            "systemPrompt": TITLE_SYSTEM_PROMPT,
-            "temperature": 0.7,
-            "maxTokens": 128,
-            "thinkingLevel": "off",
-        },
-        "deliveryMethod": "sync",
+        "messages": [
+            {"role": "system", "content": TITLE_SYSTEM_PROMPT},
+            {"role": "user", "content": f"코디 설명: {comment}"},
+        ],
+        "max_completion_tokens": 128,
+        "stream": False,
     }
 
 
 def parse_text(body: bytes) -> str:
-    """Runware 원본 응답에서 생성된 문장만 꺼낸다."""
+    """OpenAI Chat Completions 응답에서 choices[0].message.content 만 꺼낸다."""
     try:
         data = json.loads(body)
     except (ValueError, UnicodeDecodeError) as error:
@@ -103,42 +97,38 @@ def parse_text(body: bytes) -> str:
     if not isinstance(data, dict):
         raise FittingPostprocessError("Runware LLM 응답이 JSON 객체가 아닙니다.")
 
-    errors = data.get("errors") or data.get("error")
+    errors = data.get("error") or data.get("errors")
     if errors:
         raise FittingPostprocessError(
             f"Runware LLM 이 실패했습니다: {str(errors)[:_ERROR_DETAIL_LIMIT]}"
         )
 
-    items = data.get("data")
-    item = items[0] if isinstance(items, list) and items else None
-    if not isinstance(item, dict):
-        raise FittingPostprocessError("Runware LLM 응답에 data 가 없습니다.")
+    choices = data.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    if not isinstance(choice, dict):
+        raise FittingPostprocessError("Runware LLM 응답에 choices 가 없습니다.")
 
-    finish_reason = item.get("finishReason")
+    finish_reason = choice.get("finish_reason")
     if finish_reason in _TRUNCATED_FINISH_REASONS:
         raise FittingPostprocessError(
-            f"Runware LLM 응답이 완성되지 않았습니다: finishReason={finish_reason!r}"
+            f"Runware LLM 응답이 완성되지 않았습니다: finish_reason={finish_reason!r}"
         )
 
-    text = item.get("text")
+    message = choice.get("message")
+    text = message.get("content") if isinstance(message, dict) else None
     if not isinstance(text, str) or not text.strip():
-        raise FittingPostprocessError("Runware LLM 응답에 text 가 없습니다.")
+        raise FittingPostprocessError("Runware LLM 응답에 message.content 가 없습니다.")
     return text.strip()
 
 
 class RunwareCommentProvider:
-    """Runware LLM 기반 comment / title Provider.
-
-    generate_comment 는 결과 이미지 URL 과 상품 설명 요약을 직접 받는다. 그래서 아직
-    CommentProvider(comment.py)를 만족하지 않고, production 에도 연결하지 않았다.
-    description_summary 가 DB 에서 오면 그때 Service 와 함께 맞춘다.
-    """
+    """Runware LLM 기반 comment / title Provider. production(router)에서 쓴다."""
 
     def __init__(
         self,
         api_key: str | None = None,
         *,
-        endpoint: str = RUNWARE_ENDPOINT,
+        endpoint: str = LLM_ENDPOINT,
         timeout: float = DEFAULT_TIMEOUT,
         opener: Callable[..., Any] | None = None,
     ) -> None:
@@ -155,18 +145,18 @@ class RunwareCommentProvider:
         ):
             raise ValueError("description_summaries 는 비어 있지 않은 문자열이어야 합니다.")
 
-        return self._run(build_comment_task(result_image_url, description_summaries, _task_uuid()))
+        return self._run(build_comment_request(result_image_url, description_summaries))
 
     def generate_title(self, comment: str) -> str:
         if not comment.strip():
             raise ValueError("comment 는 비어 있지 않아야 합니다.")
 
-        return self._run(build_title_task(comment, _task_uuid()))
+        return self._run(build_title_request(comment))
 
-    def _run(self, task: dict) -> str:
+    def _run(self, payload: dict) -> str:
         request = Request(
             self.endpoint,
-            data=json.dumps([task]).encode("utf-8"),
+            data=json.dumps(payload).encode("utf-8"),
             headers=self._headers(),
             method="POST",
         )
@@ -184,7 +174,3 @@ class RunwareCommentProvider:
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
-
-
-def _task_uuid() -> str:
-    return str(uuid.uuid4())

@@ -6,12 +6,14 @@ def make_product(
     main_category: str = TOP_CATEGORY,
     sub_category: str = "스웨트셔츠",
     image_url: str | None = "https://img.29cm.co.kr/item/example.jpg",
+    description_summary: str | None = "부드러운 소재의 기본 스웨트셔츠",
 ) -> FittingProduct:
     return FittingProduct(
         product_code=code,
         image_url=image_url,
         main_category=main_category,
         sub_category=sub_category,
+        description_summary=description_summary,
     )
 
 
