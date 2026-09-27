@@ -21,8 +21,8 @@ from app.virtual_fitting.exceptions import (
     FittingImageStorageError,
     VirtualFittingError,
 )
-from app.virtual_fitting.providers.comment import MockCommentProvider
 from app.virtual_fitting.providers.runware import RunwarePrunaProvider
+from app.virtual_fitting.providers.runware_comment import RunwareCommentProvider
 from app.virtual_fitting.repositories.product_repository import ProductRepository
 from app.virtual_fitting.schemas import SyncFittingRequest, SyncFittingResponse
 from app.virtual_fitting.service import VirtualFittingService
@@ -58,7 +58,7 @@ def open_virtual_fitting_service() -> Iterator[VirtualFittingService]:
     yield VirtualFittingService(
         repository=ProductRepository(connection_pool),
         fitting_provider=RunwarePrunaProvider(),
-        comment_provider=MockCommentProvider(),
+        comment_provider=RunwareCommentProvider(),
         image_storage=S3ImageStorage(),
     )
 

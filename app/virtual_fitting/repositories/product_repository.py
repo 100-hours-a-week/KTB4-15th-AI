@@ -11,6 +11,7 @@ _SELECT_COLUMNS = (
     "image_url",
     "main_category",
     "sub_category",
+    "description_summary",
 )
 
 
@@ -20,12 +21,13 @@ def build_select_sql() -> str:
 
 
 def _row_to_product(row: Sequence[Any]) -> FittingProduct:
-    product_code, image_url, main_category, sub_category = row
+    product_code, image_url, main_category, sub_category, description_summary = row
     return FittingProduct(
         product_code=str(product_code),
         image_url=image_url,
         main_category=main_category,
         sub_category=sub_category,
+        description_summary=description_summary,
     )
 
 
