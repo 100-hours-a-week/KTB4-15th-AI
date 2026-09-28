@@ -33,7 +33,11 @@ USER_REASONS = {
     "IMAGE_EMPTY": "이미지 파일을 첨부해주세요.",
     "IMAGE_FORMAT_UNSUPPORTED": "JPG, JPEG 또는 PNG 이미지만 업로드해주세요.",
     "IMAGE_TOO_LARGE": "이미지 크기는 10MB 이하여야 합니다.",
-    "IMAGE_DECODE_FAILED": "이미지 파일을 읽을 수 없습니다. 다른 이미지를 선택해주세요.",
+    "INVALID_IMAGE": "이미지 파일을 확인할 수 없습니다. 다른 사진을 업로드해주세요.",
+    "IMAGE_DECODE_FAILED": "이미지가 손상되어 처리할 수 없습니다. 다른 사진을 업로드해주세요.",
+    "IMAGE_RESOLUTION_TOO_LARGE": (
+        "이미지 해상도가 너무 높습니다. 더 작은 해상도의 사진을 업로드해주세요."
+    ),
     "IMAGE_RESOLUTION_TOO_SMALL": "짧은 변이 480px 이상인 이미지를 업로드해주세요.",
     "PERSON_NOT_FOUND": "사진에서 사람을 찾을 수 없습니다.",
     "MULTIPLE_PERSONS": "한 명만 나온 사진을 업로드해주세요.",
@@ -50,6 +54,7 @@ def user_error(reason_code: str) -> UserImageValidationError:
     error_type = {
         "IMAGE_EMPTY": InvalidImageError,
         "IMAGE_FORMAT_UNSUPPORTED": InvalidImageError,
+        "INVALID_IMAGE": InvalidImageError,
         "IMAGE_DECODE_FAILED": InvalidImageError,
         "IMAGE_TOO_LARGE": ImageTooLargeError,
     }.get(reason_code, UserImageValidationError)
