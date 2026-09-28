@@ -13,6 +13,9 @@ POSE_LANDMARKER_MODEL = Path(
 REMBG_MODEL = Path(os.getenv("REMBG_MODEL", str(MODEL_DIR / "u2netp.onnx")))
 
 MAX_IMAGE_BYTES = int(os.getenv("BODY_IMAGE_MAX_BYTES", str(10 * 1024 * 1024)))
+# 파일 크기와 별개로 decode 메모리를 막는다. 고압축 초고해상도 이미지는 10MB 미만이어도
+# RGB decode 만으로 수백 MB 를 쓴다(150MP ≈ 450MB, 25MP ≈ 75MB).
+MAX_IMAGE_PIXELS = int(os.getenv("BODY_IMAGE_MAX_PIXELS", str(25_000_000)))
 MIN_SHORT_SIDE = int(os.getenv("BODY_IMAGE_MIN_SHORT_SIDE", "480"))
 
 PERSON_SCORE_THRESHOLD = float(os.getenv("PERSON_SCORE_THRESHOLD", "0.40"))
