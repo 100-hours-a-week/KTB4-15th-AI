@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.errors import ApiResponse
+
 
 class ChatRequest(BaseModel):
     """POST /api/v1/chat/stream 요청 (단계1 §7)."""
@@ -21,9 +23,9 @@ class ChatRequest(BaseModel):
     )
 
 
-class ChatDeleteResponse(BaseModel):
-    """DELETE /api/v1/chat/{chat_id} 응답."""
+class ChatDeleteResponse(ApiResponse):
+    """DELETE /api/v1/chat/{chat_id} 응답. 돌려줄 데이터가 없으므로 data 는 null 이다."""
 
-    code: int = 200
-    message: str = "chat_deleted"
-    data: dict | None = None
+    code: str = "CHAT_DELETE_SUCCESS"
+    data: None = None
+    message: str = "대화가 삭제되었습니다."

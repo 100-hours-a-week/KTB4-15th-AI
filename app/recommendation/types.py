@@ -4,13 +4,13 @@ from typing import TypedDict
 
 
 class RecommendationError(RuntimeError):
-    """검색 실패. 스트림 안에서는 recommendation_search_failed로 나간다."""
+    """검색 실패. 스트림 안에서는 RECOMMENDATION_SEARCH_FAILED로 나간다."""
 
 
 class WishlistCommentError(RecommendationError):
     """찜 추천의 개인화 comment를 하나도 만들지 못한 경우.
 
-    기존 REST 명세의 502 wishlist_comment_generation_failed에 대응한다.
+    기존 REST 명세의 502 WISHLIST_COMMENT_GENERATION_FAILED에 대응한다.
     상품 일부만 실패한 경우에는 이 예외를 던지지 않는다. 실패한 상품은
     llm_comment를 빈 문자열로 채워 추천 결과에 포함한다 (2026-09-17 결정).
     """
