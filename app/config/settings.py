@@ -1,6 +1,7 @@
 """설정값 한 곳 모음. 모델명·상한·DB 접속 정보는 여기만 본다."""
 
 import os
+from decimal import Decimal
 
 # 로컬 실행(`python -m app.main`)에서만 쓴다. 컨테이너는 Dockerfile 의 CMD 가
 # uvicorn 을 직접 부르므로 이 값들을 보지 않는다.
@@ -59,3 +60,10 @@ DATABASE_POOL_MAX_SIZE = int(os.getenv("DATABASE_POOL_MAX_SIZE", "10"))
 # 기다리는 동안에는 connection 을 잡지 않는다. 검색이 실제로 많아지면 값만 올린다.
 SEARCH_DB_POOL_MIN_SIZE = int(os.getenv("SEARCH_DB_POOL_MIN_SIZE", "1"))
 SEARCH_DB_POOL_MAX_SIZE = int(os.getenv("SEARCH_DB_POOL_MAX_SIZE", "5"))
+
+# 2026-09-28 결정 — 가상피팅 Runware 하루 사용액 상한(USD). 코드에 고정한다.
+# "하루"는 UTC 날짜라 KST 09:00 에 초기화된다 (scripts/db/schema.sql 의 usage_amount).
+FITTING_DAILY_BUDGET_USD = Decimal(5)
+# 우리 합계를 Runware 집계(getUsageActivity)로 보정하는 간격. 스케줄러 없이, 이 시간이 지난 뒤
+# 들어온 첫 피팅 요청이 보정한다.
+FITTING_USAGE_RECONCILE_SECONDS = 600

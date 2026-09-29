@@ -153,6 +153,8 @@ class RunwareCommentProvider:
 
         return self._run(build_title_request(comment))
 
+    # sabu: LLM 잔액 부족 — send_request 가 402 를 FittingBalanceExhaustedError 로 던지면 아래 except 는
+    #       그걸 잡는가? 이미 돈을 내고 만든 피팅 이미지를 사용자는 받아야 하나, 402 로 잃어야 하나?
     def _run(self, payload: dict) -> str:
         request = Request(
             self.endpoint,
