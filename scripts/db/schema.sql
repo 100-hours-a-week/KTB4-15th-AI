@@ -40,3 +40,13 @@ ALTER TABLE products
 -- 필터는 colors 한 컬럼으로 건다: WHERE colors && ARRAY['화이트']
 -- sabu: 같은 사실이 두 컬럼에 있다 — color 가 colors 안에 없는 행이 생기면 무엇이 맞는 값인가? 적재할 때 그걸 막는가, 읽을 때 알아채는가?
 CREATE INDEX IF NOT EXISTS products_colors_gin ON products USING gin (colors);
+
+-- 가상피팅 Runware 하루 사용액 (2026-09-28 결정). 하루 한 줄.
+--   usage_date    : UTC 날짜. getUsageActivity 기본 timezone(UTC)과 같은 "오늘" — KST 09:00 에 바뀐다.
+--   amount        : includeCost 로 받은 금액을 누적한 값(USD). 보정 때 Runware 합계와 큰 쪽을 남긴다.
+--   reconciled_at : 마지막으로 Runware 합계와 맞춘 시각. NULL 이면 오늘 아직 맞추지 않았다.
+CREATE TABLE IF NOT EXISTS usage_amount (
+    usage_date    date         PRIMARY KEY,
+    amount        numeric      NOT NULL DEFAULT 0,
+    reconciled_at timestamptz
+);

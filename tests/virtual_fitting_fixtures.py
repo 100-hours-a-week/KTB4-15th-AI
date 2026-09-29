@@ -24,3 +24,17 @@ def make_top(code: str = "1", **kwargs) -> FittingProduct:
 def make_bottom(code: str = "2", **kwargs) -> FittingProduct:
     kwargs.setdefault("sub_category", "데님 팬츠")
     return make_product(code, BOTTOM_CATEGORY, **kwargs)
+
+
+class AllowAllBudget:
+    """FittingBudget 대역. 막지 않고, 기록된 금액만 모은다."""
+
+    def __init__(self):
+        self.checks = 0
+        self.recorded = []
+
+    def ensure_available(self):
+        self.checks += 1
+
+    def record(self, cost):
+        self.recorded.append(cost)
