@@ -4,7 +4,7 @@ from io import BytesIO
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from app.body_image_validation.exceptions import BodyImageSystemError, user_error
+from app.body_image_validation.exceptions import user_error
 from app.config import body_image_validation as config
 
 SUPPORTED_FORMATS = {"JPEG", "PNG"}
@@ -35,8 +35,6 @@ def decode_image(body: bytes) -> Image.Image:
         raise user_error("IMAGE_RESOLUTION_TOO_LARGE") from error
     except (UnidentifiedImageError, OSError, ValueError, UserWarning) as error:
         raise user_error("INVALID_IMAGE") from error
-    except Exception as error:
-        raise BodyImageSystemError("IMAGE_PROCESSING_FAILED") from error
 
     with source:
         if source.format not in SUPPORTED_FORMATS:
@@ -54,8 +52,6 @@ def decode_image(body: bytes) -> Image.Image:
             image.load()
         except (OSError, ValueError, UserWarning) as error:
             raise user_error("IMAGE_DECODE_FAILED") from error
-        except Exception as error:
-            raise BodyImageSystemError("IMAGE_PROCESSING_FAILED") from error
 
     # 입력 검증(최소 480px / 최대 25MP)은 원본 크기로 끝냈다. 이후 모델·rembg 는 줄인 이미지로
     # 돌려 메모리를 아낀다.

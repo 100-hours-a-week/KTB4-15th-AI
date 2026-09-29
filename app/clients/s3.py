@@ -29,7 +29,7 @@ _IMAGE_TYPES = {
 class S3ConfigError(RuntimeError):
     """필수 S3 설정이 없을 때 발생한다."""
 
-    reason_code = "S3_CONFIG_ERROR"
+    code = "S3_CONFIG_ERROR"
 
 
 class ImageStorageError(RuntimeError):

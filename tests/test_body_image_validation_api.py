@@ -62,9 +62,9 @@ def test_success_contract_and_multipart_fields(client, monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {
-        "code": 200,
-        "message": "body_image_validation_success",
+        "code": "BODY_IMAGE_UPLOAD_SUCCESS",
         "data": {"s3_key": "body-images/example.png"},
+        "message": "전신 사진 검증에 성공했습니다.",
     }
     assert service.calls == [b"image-body"]
 
@@ -80,12 +80,9 @@ def test_user_failure_returns_first_reason(client, monkeypatch):
 
     assert response.status_code == 422
     assert response.json() == {
-        "code": 422,
-        "message": "body_image_validation_failed",
-        "data": {
-            "reason_code": "FULL_BODY_NOT_VISIBLE",
-            "reason": "머리부터 발끝까지 모두 나오도록 전신을 촬영해주세요.",
-        },
+        "code": "FULL_BODY_NOT_VISIBLE",
+        "data": None,
+        "message": "머리부터 발끝까지 모두 나오도록 전신을 촬영해주세요.",
     }
 
 
@@ -100,12 +97,9 @@ def test_too_dark_image_is_user_failure(client, monkeypatch):
 
     assert response.status_code == 422
     assert response.json() == {
-        "code": 422,
-        "message": "body_image_validation_failed",
-        "data": {
-            "reason_code": "IMAGE_TOO_DARK",
-            "reason": "사진이 너무 어둡습니다. 밝은 곳에서 다시 촬영해주세요.",
-        },
+        "code": "IMAGE_TOO_DARK",
+        "data": None,
+        "message": "사진이 너무 어둡습니다. 밝은 곳에서 다시 촬영해주세요.",
     }
 
 
@@ -123,9 +117,9 @@ def test_system_failure_is_distinct_from_user_validation(client, monkeypatch):
 
     assert response.status_code == 500
     assert response.json() == {
-        "code": 500,
-        "message": "body_image_validation_system_failed",
-        "data": {"reason_code": "PERSON_DETECTION_FAILED"},
+        "code": "PERSON_DETECTION_FAILED",
+        "data": None,
+        "message": "전신 사진 처리 중 서버 오류가 발생했습니다.",
     }
 
 
@@ -159,9 +153,9 @@ def test_missing_s3_bucket_is_s3_config_error_before_any_processing(client, monk
 
     assert response.status_code == 500
     assert response.json() == {
-        "code": 500,
-        "message": "body_image_validation_system_failed",
-        "data": {"reason_code": "S3_CONFIG_ERROR"},
+        "code": "S3_CONFIG_ERROR",
+        "data": None,
+        "message": "전신 사진 처리 중 서버 오류가 발생했습니다.",
     }
 
 
@@ -179,9 +173,9 @@ def test_unavailable_runtime_is_a_system_failure_not_a_success(client, monkeypat
 
     assert response.status_code == 500
     assert response.json() == {
-        "code": 500,
-        "message": "body_image_validation_system_failed",
-        "data": {"reason_code": "BODY_IMAGE_RUNTIME_UNAVAILABLE"},
+        "code": "BODY_IMAGE_RUNTIME_UNAVAILABLE",
+        "data": None,
+        "message": "전신 사진 처리 중 서버 오류가 발생했습니다.",
     }
 
 
@@ -220,26 +214,23 @@ def test_huge_resolution_upload_is_422_before_any_model_or_s3(client, monkeypatc
 
     assert response.status_code == 422
     assert response.json() == {
-        "code": 422,
-        "message": "body_image_validation_failed",
-        "data": {
-            "reason_code": "IMAGE_RESOLUTION_TOO_LARGE",
-            "reason": "이미지 해상도가 너무 높습니다. 더 작은 해상도의 사진을 업로드해주세요.",
-        },
+        "code": "IMAGE_RESOLUTION_TOO_LARGE",
+        "data": None,
+        "message": "이미지 해상도가 너무 높습니다. 더 작은 해상도의 사진을 업로드해주세요.",
     }
     assert calls == []
 
 
 @pytest.mark.parametrize(
-    ("body", "status", "message", "reason_code"),
+    ("body", "status", "code"),
     [
-        (b"not-an-image", 400, "body_image_validation_failed", "INVALID_IMAGE"),
-        (png_header_only(480, 640), 400, "body_image_validation_failed", "IMAGE_DECODE_FAILED"),
+        (b"not-an-image", 400, "INVALID_IMAGE"),
+        (png_header_only(480, 640), 400, "IMAGE_DECODE_FAILED"),
     ],
     ids=["not-an-image", "damaged-body"],
 )
 def test_user_file_problems_are_user_failures_before_any_model(
-    client, monkeypatch, body, status, message, reason_code
+    client, monkeypatch, body, status, code
 ):
     calls = []
     use_service(
@@ -257,12 +248,13 @@ def test_user_file_problems_are_user_failures_before_any_model(
     )
 
     assert response.status_code == status
-    assert response.json()["message"] == message
-    assert response.json()["data"]["reason_code"] == reason_code
+    assert response.json()["code"] == code
+    assert response.json()["data"] is None
+    assert isinstance(response.json()["message"], str)
     assert calls == []
 
 
-def test_internal_decode_error_is_a_500_processing_failure_not_a_user_error(
+def test_internal_decode_error_is_a_500_internal_server_error_not_a_user_error(
     client, monkeypatch
 ):
     def broken_exif_transpose(image):
@@ -289,14 +281,14 @@ def test_internal_decode_error_is_a_500_processing_failure_not_a_user_error(
 
     assert response.status_code == 500
     assert response.json() == {
-        "code": 500,
-        "message": "body_image_validation_system_failed",
-        "data": {"reason_code": "IMAGE_PROCESSING_FAILED"},
+        "code": "INTERNAL_SERVER_ERROR",
+        "data": None,
+        "message": "서버 내부 오류가 발생했습니다.",
     }
     assert calls == []
 
 
-def test_unexpected_image_open_error_is_a_500_processing_failure(client, monkeypatch):
+def test_unexpected_image_open_error_is_a_500_internal_server_error(client, monkeypatch):
     def broken_open(*args, **kwargs):
         raise RuntimeError("internal bug in Image.open")
 
@@ -318,9 +310,9 @@ def test_unexpected_image_open_error_is_a_500_processing_failure(client, monkeyp
 
     assert response.status_code == 500
     assert response.json() == {
-        "code": 500,
-        "message": "body_image_validation_system_failed",
-        "data": {"reason_code": "IMAGE_PROCESSING_FAILED"},
+        "code": "INTERNAL_SERVER_ERROR",
+        "data": None,
+        "message": "서버 내부 오류가 발생했습니다.",
     }
     assert calls == []
 
@@ -342,7 +334,11 @@ def test_missing_multipart_field_is_invalid_request(client):
     response = client.post(URL, headers=AUTH)
 
     assert response.status_code == 400
-    assert response.json() == {"code": 400, "message": "invalid_request", "data": None}
+    assert response.json() == {
+        "code": "INVALID_REQUEST",
+        "data": None,
+        "message": "입력값이 올바르지 않습니다.",
+    }
 
 
 # --- 긴급 안정화: 2MB 제한과 동시 실행 제한(실행 1 + 대기 1, 초과 시 429) ---
@@ -368,12 +364,9 @@ def test_upload_over_2mb_is_413_image_too_large(client, monkeypatch):
 
     assert response.status_code == 413
     assert response.json() == {
-        "code": 413,
-        "message": "body_image_validation_failed",
-        "data": {
-            "reason_code": "IMAGE_TOO_LARGE",
-            "reason": "이미지 크기는 2MB 이하여야 합니다.",
-        },
+        "code": "IMAGE_TOO_LARGE",
+        "data": None,
+        "message": "이미지 크기는 2MB 이하여야 합니다.",
     }
     assert calls == []
 
@@ -434,12 +427,9 @@ def test_third_request_is_429_server_busy_while_one_runs_and_one_waits(client, m
 
     assert response.status_code == 429
     assert response.json() == {
-        "code": 429,
-        "message": "server_busy",
-        "data": {
-            "reason_code": "SERVER_BUSY",
-            "reason": "현재 이미지 처리 요청이 많습니다. 잠시 후 다시 시도해주세요.",
-        },
+        "code": "SERVER_BUSY",
+        "data": None,
+        "message": "현재 이미지 처리 요청이 많습니다. 잠시 후 다시 시도해주세요.",
     }
     assert calls == []
     assert (limiter.running, limiter.waiting) == (0, 0)
@@ -466,4 +456,4 @@ def test_invalid_image_gets_its_own_error_even_when_the_queue_is_full(client, mo
         finish()
 
     assert response.status_code == 400
-    assert response.json()["data"]["reason_code"] == "IMAGE_EMPTY"
+    assert response.json()["code"] == "IMAGE_EMPTY"
