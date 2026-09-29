@@ -10,6 +10,16 @@ from app.config import body_image_validation as config
 SUPPORTED_FORMATS = {"JPEG", "PNG"}
 
 
+def processing_size(size: tuple[int, int], max_side: int) -> tuple[int, int]:
+    """긴 변이 max_side 를 넘으면 비율을 유지해 max_side 로 줄인 크기. 확대는 하지 않는다."""
+    width, height = size
+    long_side = max(width, height)
+    if long_side <= max_side:
+        return size
+    scale = max_side / long_side
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
 def decode_image(body: bytes) -> Image.Image:
     if not body:
         raise user_error("IMAGE_EMPTY")
@@ -46,4 +56,10 @@ def decode_image(body: bytes) -> Image.Image:
             raise user_error("IMAGE_DECODE_FAILED") from error
         except Exception as error:
             raise BodyImageSystemError("IMAGE_PROCESSING_FAILED") from error
+
+    # 입력 검증(최소 480px / 최대 25MP)은 원본 크기로 끝냈다. 이후 모델·rembg 는 줄인 이미지로
+    # 돌려 메모리를 아낀다.
+    target_size = processing_size(image.size, config.MAX_PROCESSING_IMAGE_SIDE)
+    if target_size != image.size:
+        image = image.resize(target_size, Image.Resampling.LANCZOS)
     return image

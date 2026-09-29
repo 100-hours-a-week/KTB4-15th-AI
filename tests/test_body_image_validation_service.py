@@ -6,12 +6,14 @@ from PIL import Image
 from app.body_image_validation.brightness import BrightnessCheckError
 from app.body_image_validation.exceptions import (
     BodyImageSystemError,
+    ServerBusyError,
     UserImageValidationError,
     user_error,
 )
 from app.body_image_validation.models import BoundingBox, Landmark, PersonDetection
 from app.body_image_validation.service import BodyImageValidationService
 from app.clients.s3 import ImageStorageError
+from app.config import body_image_validation as config
 
 
 def image_bytes():
@@ -173,3 +175,110 @@ def test_system_failures_have_specific_reason_codes(kwargs, reason_code):
         service(**kwargs).validate(image_bytes())
 
     assert exc_info.value.reason_code == reason_code
+
+
+# --- 긴급 안정화: 처리용 resize 와 동시 실행 제한 ---
+
+
+class SizeRecordingPerson(FakePersonDetector):
+    def __init__(self, sizes):
+        super().__init__()
+        self.sizes = sizes
+
+    def detect(self, image):
+        self.sizes.append(("person", image.size))
+        return super().detect(image)
+
+
+class SizeRecordingPose(FakePoseDetector):
+    def __init__(self, sizes):
+        super().__init__()
+        self.sizes = sizes
+
+    def detect(self, image):
+        self.sizes.append(("pose", image.size))
+        return super().detect(image)
+
+
+class SizeRecordingRemover(FakeBackgroundRemover):
+    def __init__(self, sizes):
+        super().__init__()
+        self.sizes = sizes
+
+    def remove(self, image):
+        self.sizes.append(("rembg", image.size))
+        return super().remove(image)
+
+
+def test_resized_image_is_what_person_pose_rembg_and_storage_receive(monkeypatch):
+    # 600x800 입력을 긴 변 700 으로 줄이면 525x700 이 된다(실제 1600 은 테스트 이미지가 너무 크다).
+    monkeypatch.setattr(config, "MAX_PROCESSING_IMAGE_SIDE", 700)
+    sizes = []
+    storage = FakeStorage()
+
+    BodyImageValidationService(
+        SizeRecordingPerson(sizes),
+        SizeRecordingPose(sizes),
+        SizeRecordingRemover(sizes),
+        storage,
+    ).validate(image_bytes())
+
+    assert sizes == [("person", (525, 700)), ("pose", (525, 700)), ("rembg", (525, 700))]
+    [(body, _, _)] = storage.uploads
+    assert Image.open(BytesIO(body)).size == (525, 700)
+
+
+class FullLimiter:
+    """실행 1 + 대기 1 이 모두 찬 상태를 흉내 낸다."""
+
+    def __init__(self):
+        self.entered = 0
+
+    def slot(self):
+        self.entered += 1
+        raise ServerBusyError()
+
+
+def test_busy_limiter_rejects_before_any_heavy_stage():
+    sizes = []
+    storage = FakeStorage()
+    limiter = FullLimiter()
+
+    with pytest.raises(ServerBusyError):
+        BodyImageValidationService(
+            SizeRecordingPerson(sizes),
+            SizeRecordingPose(sizes),
+            SizeRecordingRemover(sizes),
+            storage,
+            limiter=limiter,
+        ).validate(image_bytes())
+
+    assert limiter.entered == 1
+    assert sizes == []
+    assert storage.uploads == []
+
+
+def test_invalid_image_is_rejected_before_taking_a_limiter_slot():
+    limiter = FullLimiter()
+
+    with pytest.raises(UserImageValidationError) as exc_info:
+        service_with_limiter = BodyImageValidationService(
+            FakePersonDetector(),
+            FakePoseDetector(),
+            FakeBackgroundRemover(),
+            FakeStorage(),
+            limiter=limiter,
+        )
+        service_with_limiter.validate(b"")
+
+    assert exc_info.value.reason_code == "IMAGE_EMPTY"
+    assert limiter.entered == 0  # 잘못된 이미지는 대기열 자리를 쓰지 않는다
+
+
+def test_slot_is_released_when_a_heavy_stage_fails():
+    service_instance = service(person=FakePersonDetector(RuntimeError("detector crashed")))
+
+    with pytest.raises(BodyImageSystemError):
+        service_instance.validate(image_bytes())
+
+    assert (service_instance.limiter.running, service_instance.limiter.waiting) == (0, 0)

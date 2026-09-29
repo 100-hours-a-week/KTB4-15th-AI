@@ -8,7 +8,7 @@ import pytest
 from PIL import Image, ImageFile, ImageOps
 
 from app.body_image_validation.exceptions import BodyImageSystemError, UserImageValidationError
-from app.body_image_validation.image_io import decode_image
+from app.body_image_validation.image_io import decode_image, processing_size
 from app.config import body_image_validation as config
 
 
@@ -249,3 +249,69 @@ def test_unexpected_error_on_a_valid_image_is_a_processing_system_error(monkeypa
     assert system_error.reason_code == "IMAGE_PROCESSING_FAILED"
     assert system_error.status_code == 500
     assert system_error.__cause__ is error
+
+
+# --- 긴급 안정화: 파일 크기 2MB, 처리용 resize 긴 변 1600px ---
+
+
+def test_default_limits_follow_the_stabilization_policy():
+    assert config.MAX_IMAGE_SIZE_MB == 2
+    assert config.MAX_IMAGE_BYTES == 2 * 1024 * 1024
+    assert config.MAX_PROCESSING_IMAGE_SIDE == 1600
+
+
+def test_file_over_2mb_is_image_too_large_with_a_2mb_message():
+    with pytest.raises(UserImageValidationError) as exc_info:
+        decode_image(b"\x00" * (2 * 1024 * 1024 + 1))
+
+    error = exc_info.value
+    assert (error.status_code, error.reason_code) == (413, "IMAGE_TOO_LARGE")
+    assert error.reason == "이미지 크기는 2MB 이하여야 합니다."
+
+
+def test_file_of_exactly_2mb_is_not_rejected_for_size():
+    # 크기 검사는 통과하고 다음 단계(헤더 판독)에서 판단된다.
+    with pytest.raises(UserImageValidationError) as exc_info:
+        decode_image(b"\x00" * (2 * 1024 * 1024))
+
+    assert exc_info.value.reason_code == "INVALID_IMAGE"
+
+
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [
+        ((6000, 4000), (1600, 1067)),
+        ((4000, 6000), (1067, 1600)),
+        ((3200, 1600), (1600, 800)),
+        ((1600, 1200), (1600, 1200)),  # 긴 변이 정확히 1600 이면 그대로
+        ((480, 640), (480, 640)),  # 작은 이미지는 확대하지 않는다
+    ],
+    ids=["landscape-24MP", "portrait-24MP", "2x1", "exactly-1600", "small"],
+)
+def test_processing_size_caps_the_long_side_and_keeps_the_aspect_ratio(size, expected):
+    result = processing_size(size, 1600)
+
+    assert result == expected
+    assert max(result) <= 1600
+    assert abs(result[0] / result[1] - size[0] / size[1]) < 0.01
+
+
+def test_decoded_image_is_resized_when_the_long_side_is_over_the_limit(monkeypatch):
+    # 실제 1600px 넘는 이미지를 만들지 않도록 한도를 줄여서 본다.
+    monkeypatch.setattr(config, "MAX_PROCESSING_IMAGE_SIDE", 320)
+
+    image = decode_image(image_bytes(size=(480, 640)))
+
+    assert image.size == (240, 320)
+    assert image.mode == "RGB"
+
+
+def test_decoded_image_is_not_resized_within_the_limit():
+    assert decode_image(image_bytes(size=(480, 640))).size == (480, 640)
+
+
+def test_minimum_resolution_is_checked_on_the_original_size_before_resize(monkeypatch):
+    # 원본 짧은 변 480 은 통과하고, 줄인 뒤 480 보다 작아지는 것은 거절 사유가 아니다.
+    monkeypatch.setattr(config, "MAX_PROCESSING_IMAGE_SIDE", 320)
+
+    assert decode_image(image_bytes(size=(480, 640))).size == (240, 320)
