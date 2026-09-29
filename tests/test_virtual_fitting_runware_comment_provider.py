@@ -331,7 +331,7 @@ def test_http_errors_are_postprocess_errors(code):
     error = _fails(FakeOpener(error=_http_error(code)))
 
     assert error.status_code == 500
-    assert error.code == "FITTING_POSTPROCESS_FAILED"
+    assert error.message == "fitting_postprocess_failed"
 
 
 @pytest.mark.parametrize(
@@ -339,14 +339,14 @@ def test_http_errors_are_postprocess_errors(code):
     [TimeoutError("timed out"), TimeoutError(), URLError(TimeoutError("timed out"))],
 )
 def test_timeout_is_a_postprocess_error(error):
-    assert _fails(FakeOpener(error=error)).code == "FITTING_POSTPROCESS_FAILED"
+    assert _fails(FakeOpener(error=error)).message == "fitting_postprocess_failed"
 
 
 @pytest.mark.parametrize(
     "error", [URLError("name resolution failed"), ConnectionResetError("reset")]
 )
 def test_network_failure_is_a_postprocess_error(error):
-    assert _fails(FakeOpener(error=error)).code == "FITTING_POSTPROCESS_FAILED"
+    assert _fails(FakeOpener(error=error)).message == "fitting_postprocess_failed"
 
 
 def test_llm_failures_are_distinguishable_from_vton_failures():

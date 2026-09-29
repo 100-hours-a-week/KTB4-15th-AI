@@ -77,9 +77,9 @@ def test_rejects_missing_image_url(image_url):
 
 def test_error_codes_follow_api_spec():
     assert InvalidFittingCombinationError.status_code == 422
-    assert InvalidFittingCombinationError.code == "INVALID_FITTING_COMBINATION"
+    assert InvalidFittingCombinationError.message == "invalid_fitting_combination"
     assert ProductNotFoundError.status_code == 404
-    assert ProductNotFoundError.code == "PRODUCT_NOT_FOUND"
+    assert ProductNotFoundError.message == "product_not_found"
 
 
 # --- select_fitting_products ---

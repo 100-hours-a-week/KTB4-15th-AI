@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 from PIL import Image, ImageFile, ImageOps
 
-from app.body_image_validation.exceptions import UserImageValidationError
+from app.body_image_validation.exceptions import BodyImageSystemError, UserImageValidationError
 from app.body_image_validation.image_io import decode_image
 from app.config import body_image_validation as config
 
@@ -36,7 +36,7 @@ def test_exif_orientation_is_applied_before_validation():
 
 
 @pytest.mark.parametrize(
-    ("body", "code"),
+    ("body", "reason_code"),
     [
         (b"", "IMAGE_EMPTY"),
         (b"not-an-image", "INVALID_IMAGE"),
@@ -46,11 +46,11 @@ def test_exif_orientation_is_applied_before_validation():
         (image_bytes(size=(479, 640)), "IMAGE_RESOLUTION_TOO_SMALL"),
     ],
 )
-def test_invalid_images_have_stable_codes(body, code):
+def test_invalid_images_have_stable_reason_codes(body, reason_code):
     with pytest.raises(UserImageValidationError) as exc_info:
         decode_image(body)
 
-    assert exc_info.value.code == code
+    assert exc_info.value.reason_code == reason_code
 
 
 def test_size_limit_is_inclusive(monkeypatch):
@@ -61,7 +61,7 @@ def test_size_limit_is_inclusive(monkeypatch):
     monkeypatch.setattr(config, "MAX_IMAGE_BYTES", len(body) - 1)
     with pytest.raises(UserImageValidationError) as exc_info:
         decode_image(body)
-    assert exc_info.value.code == "IMAGE_TOO_LARGE"
+    assert exc_info.value.reason_code == "IMAGE_TOO_LARGE"
 
 
 # --- 최대 픽셀 수: 픽셀 데이터 없이 IHDR 로 크기만 선언한 PNG 를 쓴다 ---
@@ -117,7 +117,7 @@ def test_images_up_to_the_pixel_limit_go_on_to_full_decode(decode_spies, size):
     with pytest.raises(UserImageValidationError) as exc_info:
         decode_image(png_header_only(*size))
 
-    assert exc_info.value.code == "IMAGE_DECODE_FAILED"
+    assert exc_info.value.reason_code == "IMAGE_DECODE_FAILED"
     decode_spies.exif_transpose.assert_called_once()
     assert decode_spies.exif_transpose.call_args.args[0].size == size
 
@@ -132,8 +132,8 @@ def test_too_many_pixels_is_rejected_before_full_decode(decode_spies, size):
         decode_image(png_header_only(*size))
 
     error = exc_info.value
-    assert error.code == "IMAGE_RESOLUTION_TOO_LARGE"
-    assert error.status_code == 422
+    assert error.reason_code == "IMAGE_RESOLUTION_TOO_LARGE"
+    assert (error.status_code, error.message) == (422, "body_image_validation_failed")
     assert_full_decode_not_called(decode_spies)
 
 
@@ -145,7 +145,7 @@ def test_pixel_limit_is_inclusive_for_a_real_image(monkeypatch):
     monkeypatch.setattr(config, "MAX_IMAGE_PIXELS", 480 * 640 - 1)
     with pytest.raises(UserImageValidationError) as exc_info:
         decode_image(body)
-    assert exc_info.value.code == "IMAGE_RESOLUTION_TOO_LARGE"
+    assert exc_info.value.reason_code == "IMAGE_RESOLUTION_TOO_LARGE"
 
 
 def test_pillow_decompression_bomb_error_is_a_validation_failure(decode_spies):
@@ -153,7 +153,7 @@ def test_pillow_decompression_bomb_error_is_a_validation_failure(decode_spies):
     with pytest.raises(UserImageValidationError) as exc_info:
         decode_image(png_header_only(20000, 10000))
 
-    assert exc_info.value.code == "IMAGE_RESOLUTION_TOO_LARGE"
+    assert exc_info.value.reason_code == "IMAGE_RESOLUTION_TOO_LARGE"
     assert isinstance(exc_info.value.__cause__, Image.DecompressionBombError)
     assert_full_decode_not_called(decode_spies)
 
@@ -163,7 +163,7 @@ def test_pillow_decompression_bomb_warning_as_error_is_a_validation_failure(deco
     with pytest.raises(UserImageValidationError) as exc_info:
         decode_image(png_header_only(15055, 10000))
 
-    assert exc_info.value.code == "IMAGE_RESOLUTION_TOO_LARGE"
+    assert exc_info.value.reason_code == "IMAGE_RESOLUTION_TOO_LARGE"
     assert isinstance(exc_info.value.__cause__, Image.DecompressionBombWarning)
     assert_full_decode_not_called(decode_spies)
 
@@ -181,7 +181,7 @@ def test_small_file_with_huge_resolution_is_422_not_the_413_file_size_error():
     with pytest.raises(UserImageValidationError) as exc_info:
         decode_image(body)
 
-    assert exc_info.value.code == "IMAGE_RESOLUTION_TOO_LARGE"
+    assert exc_info.value.reason_code == "IMAGE_RESOLUTION_TOO_LARGE"
     assert exc_info.value.status_code == 422
 
 
@@ -193,7 +193,7 @@ def test_short_side_below_minimum_is_rejected_before_full_decode(decode_spies, s
     with pytest.raises(UserImageValidationError) as exc_info:
         decode_image(png_header_only(*size))
 
-    assert exc_info.value.code == "IMAGE_RESOLUTION_TOO_SMALL"
+    assert exc_info.value.reason_code == "IMAGE_RESOLUTION_TOO_SMALL"
     assert_full_decode_not_called(decode_spies)
 
 
@@ -221,9 +221,9 @@ def test_valid_header_with_damaged_body_is_decode_failed(body):
         decode_image(body)
 
     error = exc_info.value
-    assert error.code == "IMAGE_DECODE_FAILED"
+    assert error.reason_code == "IMAGE_DECODE_FAILED"
     assert error.status_code == 400
-    assert error.message == "이미지가 손상되어 처리할 수 없습니다. 다른 사진을 업로드해주세요."
+    assert error.reason == "이미지가 손상되어 처리할 수 없습니다. 다른 사진을 업로드해주세요."
 
 
 def test_invalid_image_and_decode_failed_have_different_messages():
@@ -231,18 +231,21 @@ def test_invalid_image_and_decode_failed_have_different_messages():
         decode_image(b"not-an-image")
 
     assert exc_info.value.status_code == 400
-    assert exc_info.value.message == "이미지 파일을 확인할 수 없습니다. 다른 사진을 업로드해주세요."
+    assert exc_info.value.reason == "이미지 파일을 확인할 수 없습니다. 다른 사진을 업로드해주세요."
 
 
 @pytest.mark.parametrize("error", [RuntimeError("bug"), TypeError("bad arg"), KeyError("x")])
-def test_unexpected_error_on_a_valid_image_is_not_turned_into_a_user_error(monkeypatch, error):
-    # 분류되지 않은 예외는 그대로 올라가 전역 핸들러가 500 INTERNAL_SERVER_ERROR 로 응답한다.
+def test_unexpected_error_on_a_valid_image_is_a_processing_system_error(monkeypatch, error):
     def broken_exif_transpose(image):
         raise error
 
     monkeypatch.setattr(ImageOps, "exif_transpose", broken_exif_transpose)
 
-    with pytest.raises(type(error)) as exc_info:
+    with pytest.raises(BodyImageSystemError) as exc_info:
         decode_image(image_bytes())
 
-    assert exc_info.value is error
+    system_error = exc_info.value
+    assert not isinstance(system_error, UserImageValidationError)
+    assert system_error.reason_code == "IMAGE_PROCESSING_FAILED"
+    assert system_error.status_code == 500
+    assert system_error.__cause__ is error

@@ -1,40 +1,35 @@
-"""전신 이미지 검증의 사용자 실패와 시스템 실패를 분리한다.
-
-code / message 가 그대로 API 응답의 code / message 가 된다. 시스템 실패는 공통 문구를 쓴다.
-"""
-
-from fastapi import status
-
-SYSTEM_FAILURE_MESSAGE = "전신 사진 처리 중 서버 오류가 발생했습니다."
+"""전신 이미지 검증의 사용자 실패와 시스템 실패를 분리한다."""
 
 
 class BodyImageValidationError(Exception):
-    status_code: int = status.HTTP_500_INTERNAL_SERVER_ERROR
-    code: str
+    status_code: int = 500
+    message: str = "body_image_validation_system_failed"
+    reason_code: str
 
-    def __init__(self, code: str, message: str | None = None) -> None:
-        self.code = code
-        self.message = message
-        super().__init__(message or code)
+    def __init__(self, reason_code: str, reason: str | None = None) -> None:
+        self.reason_code = reason_code
+        self.reason = reason
+        super().__init__(reason or reason_code)
 
 
 class UserImageValidationError(BodyImageValidationError):
-    status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+    status_code = 422
+    message = "body_image_validation_failed"
 
 
 class InvalidImageError(UserImageValidationError):
-    status_code = status.HTTP_400_BAD_REQUEST
+    status_code = 400
 
 
 class ImageTooLargeError(UserImageValidationError):
-    status_code = status.HTTP_413_CONTENT_TOO_LARGE
+    status_code = 413
 
 
 class BodyImageSystemError(BodyImageValidationError):
-    status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+    status_code = 500
 
 
-USER_MESSAGES = {
+USER_REASONS = {
     "IMAGE_EMPTY": "이미지 파일을 첨부해주세요.",
     "IMAGE_FORMAT_UNSUPPORTED": "JPG, JPEG 또는 PNG 이미지만 업로드해주세요.",
     "IMAGE_TOO_LARGE": "이미지 크기는 10MB 이하여야 합니다.",
@@ -55,12 +50,12 @@ USER_MESSAGES = {
 }
 
 
-def user_error(code: str) -> UserImageValidationError:
+def user_error(reason_code: str) -> UserImageValidationError:
     error_type = {
         "IMAGE_EMPTY": InvalidImageError,
         "IMAGE_FORMAT_UNSUPPORTED": InvalidImageError,
         "INVALID_IMAGE": InvalidImageError,
         "IMAGE_DECODE_FAILED": InvalidImageError,
         "IMAGE_TOO_LARGE": ImageTooLargeError,
-    }.get(code, UserImageValidationError)
-    return error_type(code, USER_MESSAGES[code])
+    }.get(reason_code, UserImageValidationError)
+    return error_type(reason_code, USER_REASONS[reason_code])

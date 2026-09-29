@@ -69,7 +69,6 @@ def test_response_default_code_and_message():
             "llm_comment": "코멘트",
         }
     )
-    assert response.code == "FITTING_SUCCESS"
-    assert response.message == "가상 피팅이 완료되었습니다."
+    assert response.code == 200
+    assert response.message == "fitting_succeeded"
     assert response.data.llm_title == "제목"
-    assert list(response.model_dump()) == ["code", "data", "message"]

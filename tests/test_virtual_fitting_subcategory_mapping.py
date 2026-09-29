@@ -101,5 +101,5 @@ def test_unknown_sub_category_raises_instead_of_falling_back(sub_category):
     with pytest.raises(UnsupportedSubCategoryError) as exc_info:
         get_english_sub_category(sub_category)
     assert exc_info.value.sub_category == sub_category
-    assert exc_info.value.code == "UNSUPPORTED_SUB_CATEGORY"
+    assert exc_info.value.message == "unsupported_sub_category"
     assert exc_info.value.status_code == 500
