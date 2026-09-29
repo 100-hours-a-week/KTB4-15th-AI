@@ -51,6 +51,20 @@ class FittingTimeoutError(VirtualFittingError):
     message = "가상 피팅 시간이 초과되었습니다."
 
 
+class FittingDailyBudgetExceededError(VirtualFittingError):
+    """오늘(UTC) 사용액이 settings.FITTING_DAILY_BUDGET_USD 에 닿았을 때. 다음 날 자동으로 풀린다."""
+
+    status_code = 402
+    message = "fitting_daily_budget_exceeded"
+
+
+class FittingBalanceExhaustedError(VirtualFittingError):
+    """Runware 가 402 로 잔액 부족을 알렸을 때. 누군가 충전하기 전까지 풀리지 않는다."""
+
+    status_code = 402
+    message = "fitting_balance_exhausted"
+
+
 class UnsupportedSubCategoryError(VirtualFittingError):
     """DB 의 sub_category 가 영어 garment 명칭 매핑에 없을 때. 요청이 아니라 데이터/매핑 문제다."""
 

@@ -12,6 +12,7 @@ import json
 import os
 import uuid
 from collections.abc import Callable, Mapping
+from decimal import Decimal
 from typing import Any
 from urllib.request import Request, urlopen
 
@@ -63,8 +64,19 @@ def build_payload(fitting_input: FittingInput, task_uuid: str) -> list:
             "positivePrompt": fitting_input.prompt,
             "deliveryMethod": "sync",
             "outputType": "URL",
+            # 응답에 이 호출의 차감액(cost)을 싣게 한다. 하루 사용액 합계가 이 값을 더한다.
+            "includeCost": True,
         }
     ]
+
+
+# sabu: 비용 누락 — 응답에 cost 가 없거나 숫자가 아닌 문자열이면 이 함수는 무엇을 돌려주거나 던지나?
+#       그때 이미지는 이미 만들어졌는데, 사용자 요청과 오늘 합계는 각각 어떻게 되나?
+def _parse_cost(item: dict) -> Decimal | None:
+    cost = item.get("cost")
+    if cost is None:
+        return None
+    return Decimal(str(cost))
 
 
 def parse_result(body: bytes) -> FittingResult:
@@ -89,7 +101,7 @@ def parse_result(body: bytes) -> FittingResult:
         raise FittingModelError("Runware 응답에 결과 이미지 URL(imageURL)이 없습니다.")
     # imageURL 은 Runware CDN URL 이라 장기 보관용이 아니다. VirtualFittingService 가 이 URL 의
     # 이미지를 내려받아 S3 에 저장하고, Backend 에는 URL 이 아니라 result_image_key 만 돌려준다.
-    return FittingResult(result_image_url=url)
+    return FittingResult(result_image_url=url, cost=_parse_cost(item))
 
 
 class RunwarePrunaProvider:

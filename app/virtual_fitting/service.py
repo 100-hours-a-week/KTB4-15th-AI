@@ -1,6 +1,7 @@
 import logging
 
 from app.clients.s3 import ImageStorage, ImageStorageError
+from app.virtual_fitting.budget import FittingBudget
 from app.virtual_fitting.exceptions import FittingImageStorageError, FittingPostprocessError
 from app.virtual_fitting.models import VirtualFittingResult
 from app.virtual_fitting.product_selection import select_fitting_products
@@ -26,11 +27,13 @@ class VirtualFittingService:
         fitting_provider: FittingProvider,
         comment_provider: CommentProvider,
         image_storage: ImageStorage,
+        budget: FittingBudget,
     ):
         self.repository = repository
         self.fitting_provider = fitting_provider
         self.comment_provider = comment_provider
         self.image_storage = image_storage
+        self.budget = budget
 
     def fit(self, request: SyncFittingRequest) -> VirtualFittingResult:
         # 상의 → 하의 순서. garment_image_urls 와 prompt 의 N번째 garment image 가 같은 순서를 쓴다.
@@ -38,6 +41,7 @@ class VirtualFittingService:
             [product.product_code for product in request.products], self.repository
         )
 
+        self.budget.ensure_available()
         fitting_result = self.fitting_provider.try_on(
             FittingInput(
                 person_image_url=request.user_image_url,
@@ -45,6 +49,10 @@ class VirtualFittingService:
                 prompt=build_fitting_prompt(products),
             )
         )
+        # 뒤의 LLM 후처리·S3 저장보다 먼저 더한다. 이 줄에 닿은 순간 Runware 비용은 이미 나갔다.
+        if fitting_result.cost is not None:
+            self.budget.record(fitting_result.cost)
+
         # comment 는 S3 key 가 아니라 VTON 이 돌려준 원본 결과 이미지 URL 로 만든다.
         # comment/title 은 한 세트다. 하나라도 실패하면 둘 다 fallback 으로 바꾸고 계속 진행한다.
         try:

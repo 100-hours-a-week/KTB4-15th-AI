@@ -37,7 +37,7 @@ from app.virtual_fitting.service import (
     FALLBACK_TITLE,
     VirtualFittingService,
 )
-from tests.virtual_fitting_fixtures import make_bottom, make_top
+from tests.virtual_fitting_fixtures import AllowAllBudget, make_bottom, make_top
 
 KEY = "test-internal-key"
 AUTH = {"Authorization": f"Bearer {KEY}"}
@@ -209,7 +209,11 @@ def test_full_flow_with_real_service_and_fake_externals(client, use_service):
     provider = FakeFittingProvider()
     use_service(
         VirtualFittingService(
-            FakeRepository(top, bottom), provider, MockCommentProvider(), FakeImageStorage()
+            FakeRepository(top, bottom),
+            provider,
+            MockCommentProvider(),
+            FakeImageStorage(),
+            AllowAllBudget(),
         )
     )
 
@@ -415,7 +419,10 @@ class RaisingFittingProvider:
 
 @pytest.fixture
 def real_assembly(monkeypatch):
-    """실제 open_virtual_fitting_service 를 쓰되 DB connection 과 외부 Provider 만 바꾼다."""
+    """실제 open_virtual_fitting_service 를 쓰되 DB connection 과 VTON Provider 만 바꾼다.
+
+    하루 사용액 상한은 test_virtual_fitting_budget.py 가 따로 본다. 여기서는 막지 않는 대역으로 둔다.
+    """
     monkeypatch.setenv("RUNWARE_VTON_API_KEY", "test-vton-key")
     monkeypatch.setenv("RUNWARE_LLM_API_KEY", "test-llm-key")
 
@@ -423,6 +430,7 @@ def real_assembly(monkeypatch):
         monkeypatch.setattr(router, "get_connection_pool", lambda: FakePool(connection))
         monkeypatch.setattr(router, "S3ImageStorage", FakeImageStorage)
         monkeypatch.setattr(router, "RunwareCommentProvider", MockCommentProvider)
+        monkeypatch.setattr(router, "FittingBudget", lambda *_, **__: AllowAllBudget())
         if provider is not None:
             monkeypatch.setattr(router, "RunwarePrunaProvider", lambda: provider)
         return connection
