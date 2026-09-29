@@ -7,7 +7,11 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
-from app.virtual_fitting.exceptions import FittingModelError, FittingTimeoutError
+from app.virtual_fitting.exceptions import (
+    FittingBalanceExhaustedError,
+    FittingModelError,
+    FittingTimeoutError,
+)
 
 _ERROR_BODY_LIMIT = 200
 
@@ -19,6 +23,9 @@ def _is_timeout(error: BaseException) -> bool:
 def _http_error(error: HTTPError, service: str) -> Exception:
     if error.code == 504:
         return FittingTimeoutError(f"{service} 동기 요청이 시간 내에 완료되지 않았습니다.")
+    if error.code == 402:
+        # 재시도해도 풀리지 않는다. 502 fitting_model_failed 와 섞이지 않게 따로 낸다.
+        return FittingBalanceExhaustedError(f"{service} 잔액이 부족합니다.")
     try:
         detail = error.read()[:_ERROR_BODY_LIMIT].decode("utf-8", "replace")
     except (OSError, HTTPException):

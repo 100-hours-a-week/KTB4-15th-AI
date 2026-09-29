@@ -2,6 +2,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Protocol, runtime_checkable
 
 
@@ -17,6 +18,8 @@ class FittingInput:
 @dataclass(frozen=True)
 class FittingResult:
     result_image_url: str
+    # 이 호출로 차감된 금액(USD). 비용을 알려주지 않는 Provider 는 None 이다.
+    cost: Decimal | None = None
 
 
 @runtime_checkable

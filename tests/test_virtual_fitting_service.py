@@ -28,7 +28,7 @@ from app.virtual_fitting.service import (
     FALLBACK_TITLE,
     VirtualFittingService,
 )
-from tests.virtual_fitting_fixtures import make_bottom, make_top
+from tests.virtual_fitting_fixtures import AllowAllBudget, make_bottom, make_top
 
 USER_IMAGE_URL = "https://example.com/users/15/body.png"
 RESULT_URL = "https://example.com/result.jpg"
@@ -106,12 +106,15 @@ def _request(*codes):
     )
 
 
-def _service(repository, fitting_provider=None, comment_provider=None, image_storage=None):
+def _service(
+    repository, fitting_provider=None, comment_provider=None, image_storage=None, budget=None
+):
     return VirtualFittingService(
         repository,
         fitting_provider or FakeFittingProvider(),
         comment_provider or MockCommentProvider(),
         image_storage or FakeImageStorage(),
+        budget or AllowAllBudget(),
     )
 
 
