@@ -11,7 +11,7 @@ from app.body_image_validation.brightness import BrightnessCheckError, validate_
 from app.body_image_validation.concurrency import BodyValidationLimiter
 from app.body_image_validation.detectors import PersonDetector, PoseDetector
 from app.body_image_validation.exceptions import BodyImageSystemError
-from app.body_image_validation.image_io import decode_image
+from app.body_image_validation.image_io import load_image, open_image
 from app.body_image_validation.models import BodyImageValidationResult
 from app.clients.s3 import ImageStorage, ImageStorageError
 from app.config import body_image_validation as config
@@ -39,13 +39,23 @@ class BodyImageValidationService:
         )
 
     def validate(self, image_body: bytes) -> BodyImageValidationResult:
-        # 가벼운 입력 검증과 decode·resize 는 슬롯 밖에서 한다. 잘못된 이미지가 대기열을 차지하지
-        # 않게 하기 위해서다. 무거운 모델 추론·rembg 부터만 동시 실행 수를 제한한다.
-        image = decode_image(image_body)
-        with self.limiter.slot():
-            return self._validate_decoded(image)
+        # 헤더만 읽는 입력 검증은 슬롯 밖에서 한다. 잘못된 이미지가 대기열을 차지하지 않게 하기
+        # 위해서다. 픽셀 decode·resize 부터는 메모리를 크게 쓰므로 슬롯 안에서만 한다.
+        # PIL 의 `with image:` 는 픽셀 메모리를 놓지 않으므로 close() 를 직접 부른다.
+        source = open_image(image_body)
+        try:
+            with self.limiter.slot():
+                image = load_image(source)
+                source.close()  # decode 에 쓴 원본 픽셀과 입력 버퍼를 먼저 놓는다.
+                try:
+                    return self._validate_decoded(image)
+                finally:
+                    image.close()
+        finally:
+            source.close()
 
     def _validate_decoded(self, image: Image.Image) -> BodyImageValidationResult:
+        """image 는 호출자가 닫는다. 여기서 만든 배경 제거 결과는 여기서 닫는다."""
         try:
             detections = self.person_detector.detect(image)
         except Exception as error:
@@ -75,10 +85,13 @@ class BodyImageValidationService:
             result = self.background_remover.remove(image)
         except Exception as error:
             raise BodyImageSystemError("BACKGROUND_REMOVAL_FAILED") from error
+        # RGBA 결과는 PNG 로 인코딩한 직후 닫는다. 업로드 동안에는 PNG bytes 만 남긴다.
         try:
             png = encode_png(result)
         except (OSError, ValueError) as error:
             raise BodyImageSystemError("IMAGE_ENCODING_FAILED") from error
+        finally:
+            result.close()
         key = f"body-images/{uuid.uuid4()}.png"
         try:
             self.image_storage.upload_bytes(png, key, "image/png")
