@@ -42,6 +42,30 @@ from tests.virtual_fitting_fixtures import make_bottom, make_top
 KEY = "test-internal-key"
 AUTH = {"Authorization": f"Bearer {KEY}"}
 URL = "/api/v1/sync-fitting"
+
+
+# code 별 사용자용 설명 문구. 도메인 예외에 정의된 값과 같아야 한다.
+ERROR_MESSAGES = {
+    cls.code: cls.message
+    for cls in (
+        ProductNotFoundError,
+        InvalidFittingCombinationError,
+        ProductImageMissingError,
+        UnsupportedSubCategoryError,
+        FittingModelError,
+        FittingTimeoutError,
+        FittingPostprocessError,
+        FittingDatabaseError,
+        FittingImageStorageError,
+    )
+} | {
+    "INVALID_REQUEST": "입력값이 올바르지 않습니다.",
+    "INTERNAL_SERVER_ERROR": "서버 내부 오류가 발생했습니다.",
+}
+
+
+def error_body(code):
+    return {"code": code, "data": None, "message": ERROR_MESSAGES[code]}
 BODY = {
     "user_image_url": "https://example.com/person.jpg",
     "products": [{"product_code": "123"}, {"product_code": "456"}],
@@ -158,8 +182,8 @@ def test_success_returns_the_common_shape(client, use_service):
 
     assert response.status_code == 200
     assert response.json() == {
-        "code": 200,
-        "message": "fitting_succeeded",
+        "code": "FITTING_SUCCESS",
+        "message": "가상 피팅이 완료되었습니다.",
         "data": {
             "result_image_key": "virtual-fitting/results/result.jpg",
             "llm_title": "테스트 제목",
@@ -199,8 +223,8 @@ def test_full_flow_with_real_service_and_fake_externals(client, use_service):
     )
 
     assert response.json() == {
-        "code": 200,
-        "message": "fitting_succeeded",
+        "code": "FITTING_SUCCESS",
+        "message": "가상 피팅이 완료되었습니다.",
         "data": {
             "result_image_key": "virtual-fitting/results/fake.jpg",
             "llm_title": MOCK_TITLE,
@@ -218,7 +242,11 @@ def test_missing_credentials_is_401_and_service_is_not_opened(client, use_servic
     response = client.post(URL, json=BODY)
 
     assert response.status_code == 401
-    assert response.json() == {"code": 401, "message": "unauthorized", "data": None}
+    assert response.json() == {
+        "code": "UNAUTHORIZED",
+        "data": None,
+        "message": "인증에 실패했습니다.",
+    }
     assert opened == []
 
 
@@ -253,32 +281,32 @@ def test_invalid_request_is_400_and_service_is_not_opened(client, use_service, b
     response = client.post(URL, json=body, headers=AUTH)
 
     assert response.status_code == 400
-    assert response.json() == {"code": 400, "message": "invalid_request", "data": None}
+    assert response.json() == error_body("INVALID_REQUEST")
     assert opened == []
     assert service.requests == []
 
 
 @pytest.mark.parametrize(
-    ("error", "status", "message"),
+    ("error", "status", "code"),
     [
-        (ProductNotFoundError(["999"]), 404, "product_not_found"),
-        (InvalidFittingCombinationError("같은 카테고리"), 422, "invalid_fitting_combination"),
-        (ProductImageMissingError("1"), 422, "product_image_missing"),
-        (UnsupportedSubCategoryError("없는 카테고리"), 500, "unsupported_sub_category"),
-        (FittingModelError("boom"), 502, "fitting_model_failed"),
-        (FittingTimeoutError("slow"), 504, "fitting_timeout"),
-        (FittingPostprocessError("llm failed"), 500, "fitting_postprocess_failed"),
-        (FittingDatabaseError("db failed"), 500, "database_error"),
-        (FittingImageStorageError("s3 failed"), 500, "fitting_image_storage_failed"),
+        (ProductNotFoundError(["999"]), 404, "PRODUCT_NOT_FOUND"),
+        (InvalidFittingCombinationError("같은 카테고리"), 422, "INVALID_FITTING_COMBINATION"),
+        (ProductImageMissingError("1"), 422, "PRODUCT_IMAGE_MISSING"),
+        (UnsupportedSubCategoryError("없는 카테고리"), 500, "UNSUPPORTED_SUB_CATEGORY"),
+        (FittingModelError("boom"), 502, "FITTING_MODEL_FAILED"),
+        (FittingTimeoutError("slow"), 504, "FITTING_TIMEOUT"),
+        (FittingPostprocessError("llm failed"), 500, "FITTING_POSTPROCESS_FAILED"),
+        (FittingDatabaseError("db failed"), 500, "DATABASE_ERROR"),
+        (FittingImageStorageError("s3 failed"), 500, "FITTING_IMAGE_STORAGE_FAILED"),
     ],
 )
-def test_domain_error_becomes_the_common_error_shape(client, use_service, error, status, message):
+def test_domain_error_becomes_the_common_error_shape(client, use_service, error, status, code):
     use_service(StubService(error=error))
 
     response = client.post(URL, json=BODY, headers=AUTH)
 
     assert response.status_code == status
-    assert response.json() == {"code": status, "message": message, "data": None}
+    assert response.json() == error_body(code)
 
 
 def test_unexpected_error_is_500_internal_server_error(client, use_service):
@@ -287,7 +315,7 @@ def test_unexpected_error_is_500_internal_server_error(client, use_service):
     response = client.post(URL, json=BODY, headers=AUTH)
 
     assert response.status_code == 500
-    assert response.json() == {"code": 500, "message": "internal_server_error", "data": None}
+    assert response.json() == error_body("INTERNAL_SERVER_ERROR")
 
 
 def test_endpoint_is_in_the_openapi_surface():
@@ -341,7 +369,7 @@ def test_connection_is_not_acquired_when_assembly_fails(connection, monkeypatch)
 
 SECRET_URL = "postgresql://user:secret-password@db-host:5432/db"
 LIBPQ_MESSAGE = 'connection to server at "db-host" (10.0.0.5), port 5432 failed: Connection refused'
-DB_ERROR_BODY = {"code": 500, "message": "database_error", "data": None}
+DB_ERROR_BODY = error_body("DATABASE_ERROR")
 TOP_ROW = (1, "https://img/top.jpg", "상의", "스웨트셔츠", "상의 설명 요약")
 BOTTOM_ROW = (2, "https://img/bottom.jpg", "하의", "슬림 팬츠", "하의 설명 요약")
 
@@ -437,7 +465,7 @@ def test_connection_failure_is_500_database_error_without_details(client, monkey
         assert leaked not in response.text
     assert len(attempts) == 1  # 재시도 없음
     # 서버 로그에는 원인이 남되(traceback 체인), DATABASE_URL 과 비밀번호는 없다.
-    assert "database_error" in caplog.text
+    assert "DATABASE_ERROR" in caplog.text
     assert "OperationalError" in caplog.text
     assert "secret-password" not in caplog.text
     assert SECRET_URL not in caplog.text
@@ -479,7 +507,7 @@ def test_query_that_succeeds_with_no_rows_is_404_not_a_database_error(client, re
     response = _fitting_request(client, "999")
 
     assert response.status_code == 404
-    assert response.json() == {"code": 404, "message": "product_not_found", "data": None}
+    assert response.json() == error_body("PRODUCT_NOT_FOUND")
     assert connection.closed is True
 
 
@@ -518,8 +546,8 @@ def test_llm_failure_is_still_200_with_fallback_comment_and_title(
 
     assert response.status_code == 200
     assert response.json() == {
-        "code": 200,
-        "message": "fitting_succeeded",
+        "code": "FITTING_SUCCESS",
+        "message": "가상 피팅이 완료되었습니다.",
         "data": {
             "result_image_key": "virtual-fitting/results/fake.jpg",
             "llm_title": FALLBACK_TITLE,
@@ -547,9 +575,9 @@ def test_missing_s3_bucket_is_s3_config_error_before_any_external_call(
 
     assert response.status_code == 500
     assert response.json() == {
-        "code": 500,
-        "message": "fitting_image_storage_failed",
-        "data": {"reason_code": "S3_CONFIG_ERROR"},
+        "code": "S3_CONFIG_ERROR",
+        "data": None,
+        "message": "가상 피팅 결과 이미지를 저장하지 못했습니다.",
     }
     assert provider.inputs == []  # 외부 가상피팅 API 는 부르지 않았다
     assert connection.closed is False  # 상품 조회(DB)까지도 가지 않았다
@@ -557,16 +585,16 @@ def test_missing_s3_bucket_is_s3_config_error_before_any_external_call(
 
 
 @pytest.mark.parametrize(
-    ("error", "status", "message"),
+    ("error", "status", "code"),
     [
-        (FittingModelError("boom"), 502, "fitting_model_failed"),
-        (FittingTimeoutError("slow"), 504, "fitting_timeout"),
-        (RuntimeError("어딘가 터짐"), 500, "internal_server_error"),
+        (FittingModelError("boom"), 502, "FITTING_MODEL_FAILED"),
+        (FittingTimeoutError("slow"), 504, "FITTING_TIMEOUT"),
+        (RuntimeError("어딘가 터짐"), 500, "INTERNAL_SERVER_ERROR"),
     ],
     ids=["vton-error", "vton-timeout", "unexpected"],
 )
 def test_the_connection_is_closed_when_fitting_fails(
-    client, real_assembly, error, status, message
+    client, real_assembly, error, status, code
 ):
     connection = real_assembly(
         DbConnection(rows=[TOP_ROW, BOTTOM_ROW]), RaisingFittingProvider(error)
@@ -575,32 +603,32 @@ def test_the_connection_is_closed_when_fitting_fails(
     response = _fitting_request(client, "1", "2")
 
     assert response.status_code == status
-    assert response.json() == {"code": status, "message": message, "data": None}
+    assert response.json() == error_body(code)
     assert connection.closed is True
 
 
 @pytest.mark.parametrize(
-    ("rows", "status", "message"),
+    ("rows", "status", "code"),
     [
         (
             [TOP_ROW, (3, "https://img/top2.jpg", "상의", "후디", "후디 설명 요약")],
             422,
-            "invalid_fitting_combination",
+            "INVALID_FITTING_COMBINATION",
         ),
-        ([(1, None, "상의", "스웨트셔츠", "설명 요약")], 422, "product_image_missing"),
+        ([(1, None, "상의", "스웨트셔츠", "설명 요약")], 422, "PRODUCT_IMAGE_MISSING"),
         (
             [(1, "https://img/x.jpg", "상의", "없는 카테고리", "설명 요약")],
             500,
-            "unsupported_sub_category",
+            "UNSUPPORTED_SUB_CATEGORY",
         ),
     ],
     ids=["combination", "image-missing", "unsupported-sub-category"],
 )
-def test_existing_domain_errors_keep_their_meaning(client, real_assembly, rows, status, message):
+def test_existing_domain_errors_keep_their_meaning(client, real_assembly, rows, status, code):
     real_assembly(DbConnection(rows=rows), FakeFittingProvider())
     codes = [str(row[0]) for row in rows]
 
     response = _fitting_request(client, *codes)
 
     assert response.status_code == status
-    assert response.json() == {"code": status, "message": message, "data": None}
+    assert response.json() == error_body(code)

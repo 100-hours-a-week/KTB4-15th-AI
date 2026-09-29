@@ -136,7 +136,7 @@ def test_brightness_check_failure_is_system_failure(monkeypatch):
     with pytest.raises(BodyImageSystemError) as exc_info:
         service(storage=storage).validate(image_bytes())
 
-    assert exc_info.value.reason_code == "BRIGHTNESS_CHECK_FAILED"
+    assert exc_info.value.code == "BRIGHTNESS_CHECK_FAILED"
     assert storage.uploads == []
 
 
@@ -152,12 +152,12 @@ def test_too_dark_image_fails_before_background_removal(monkeypatch):
     with pytest.raises(UserImageValidationError) as exc_info:
         service(remover=remover, storage=storage).validate(image_bytes())
 
-    assert exc_info.value.reason_code == "IMAGE_TOO_DARK"
+    assert exc_info.value.code == "IMAGE_TOO_DARK"
     assert storage.uploads == []
 
 
 @pytest.mark.parametrize(
-    ("kwargs", "reason_code"),
+    ("kwargs", "code"),
     [
         ({"person": FakePersonDetector(RuntimeError("detector"))}, "PERSON_DETECTION_FAILED"),
         ({"pose": FakePoseDetector(RuntimeError("pose"))}, "POSE_ESTIMATION_FAILED"),
@@ -168,8 +168,8 @@ def test_too_dark_image_fails_before_background_removal(monkeypatch):
         ({"storage": FakeStorage(ImageStorageError("s3"))}, "IMAGE_UPLOAD_FAILED"),
     ],
 )
-def test_system_failures_have_specific_reason_codes(kwargs, reason_code):
+def test_system_failures_have_specific_codes(kwargs, code):
     with pytest.raises(BodyImageSystemError) as exc_info:
         service(**kwargs).validate(image_bytes())
 
-    assert exc_info.value.reason_code == reason_code
+    assert exc_info.value.code == code

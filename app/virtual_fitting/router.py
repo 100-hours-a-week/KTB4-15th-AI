@@ -9,11 +9,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 import psycopg
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, status
 
 from app.clients.s3 import S3ConfigError, S3ImageStorage
 from app.config.database import DatabaseConfigError, get_connection_pool
-from app.errors import ErrorResponse, error_response
+from app.errors import ApiResponse, error_response
 from app.security import verify_internal_key
 from app.virtual_fitting import controller
 from app.virtual_fitting.exceptions import (
@@ -33,13 +33,13 @@ router = APIRouter(
     tags=["virtual-fitting"],
     dependencies=[Depends(verify_internal_key)],
     responses={
-        400: {"model": ErrorResponse},
-        401: {"model": ErrorResponse},
-        404: {"model": ErrorResponse},
-        422: {"model": ErrorResponse},
-        500: {"model": ErrorResponse},
-        502: {"model": ErrorResponse},
-        504: {"model": ErrorResponse},
+        status.HTTP_400_BAD_REQUEST: {"model": ApiResponse},
+        status.HTTP_401_UNAUTHORIZED: {"model": ApiResponse},
+        status.HTTP_404_NOT_FOUND: {"model": ApiResponse},
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ApiResponse},
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": ApiResponse},
+        status.HTTP_502_BAD_GATEWAY: {"model": ApiResponse},
+        status.HTTP_504_GATEWAY_TIMEOUT: {"model": ApiResponse},
     },
 )
 
@@ -71,15 +71,15 @@ def sync_fitting(request: SyncFittingRequest):
         with open_virtual_fitting_service() as service:
             return controller.sync_fit(service, request)
     except VirtualFittingError as error:
-        if error.status_code >= 500:
-            logger.exception("sync-fitting failed: %s", error.message)
-        return error_response(error.status_code, error.message)
+        if error.status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
+            logger.exception("sync-fitting failed: %s", error.code)
+        return error_response(error.status_code, error.code, error.message)
     except S3ConfigError:
         # S3ImageStorage() 는 Service 조립 단계에서 만들어지므로 외부 가상피팅 API 를 부르기 전에
-        # 여기서 멈춘다. 일반 internal_server_error 와 구분하도록 reason_code 를 싣는다.
+        # 여기서 멈춘다. 일반 INTERNAL_SERVER_ERROR 와 구분하도록 전용 code 를 쓴다.
         logger.exception("sync-fitting S3 configuration error")
         return error_response(
             FittingImageStorageError.status_code,
+            S3ConfigError.code,
             FittingImageStorageError.message,
-            {"reason_code": S3ConfigError.reason_code},
         )
