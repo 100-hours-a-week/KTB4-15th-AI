@@ -1,3 +1,5 @@
+import threading
+import time
 from io import BytesIO
 
 import pytest
@@ -5,6 +7,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from app.body_image_validation import router
+from app.body_image_validation.concurrency import BodyValidationLimiter
 from app.body_image_validation.exceptions import BodyImageSystemError, user_error
 from app.body_image_validation.models import BodyImageValidationResult
 from app.body_image_validation.runtime import BodyImageRuntimeError
@@ -340,3 +343,127 @@ def test_missing_multipart_field_is_invalid_request(client):
 
     assert response.status_code == 400
     assert response.json() == {"code": 400, "message": "invalid_request", "data": None}
+
+
+# --- 긴급 안정화: 2MB 제한과 동시 실행 제한(실행 1 + 대기 1, 초과 시 429) ---
+
+
+def test_upload_over_2mb_is_413_image_too_large(client, monkeypatch):
+    calls = []
+    use_service(
+        monkeypatch,
+        BodyImageValidationService(
+            RecordingStage(calls, "person_detector"),
+            RecordingStage(calls, "pose_detector"),
+            RecordingStage(calls, "rembg"),
+            RecordingStage(calls, "s3"),
+        ),
+    )
+
+    response = client.post(
+        URL,
+        files={"image": ("big.png", b"\x00" * (2 * 1024 * 1024 + 1), "image/png")},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 413
+    assert response.json() == {
+        "code": 413,
+        "message": "body_image_validation_failed",
+        "data": {
+            "reason_code": "IMAGE_TOO_LARGE",
+            "reason": "이미지 크기는 2MB 이하여야 합니다.",
+        },
+    }
+    assert calls == []
+
+
+def _occupy(limiter):
+    """실행 1 + 대기 1 을 채운다. 돌려준 release() 를 부르면 둘 다 끝난다."""
+    release = threading.Event()
+    running = threading.Event()
+
+    def hold():
+        with limiter.slot():
+            running.set()
+            release.wait(5)
+
+    threads = [threading.Thread(target=hold, daemon=True) for _ in range(2)]
+    threads[0].start()
+    assert running.wait(5)
+    threads[1].start()
+    deadline = time.monotonic() + 5
+    while limiter.waiting != 1:
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
+
+    def finish():
+        release.set()
+        for thread in threads:
+            thread.join(5)
+
+    return finish
+
+
+def _valid_png():
+    output = BytesIO()
+    Image.new("RGB", (480, 640), "white").save(output, format="PNG")
+    return output.getvalue()
+
+
+def test_third_request_is_429_server_busy_while_one_runs_and_one_waits(client, monkeypatch):
+    calls = []
+    limiter = BodyValidationLimiter(1, 1)
+    use_service(
+        monkeypatch,
+        BodyImageValidationService(
+            RecordingStage(calls, "person_detector"),
+            RecordingStage(calls, "pose_detector"),
+            RecordingStage(calls, "rembg"),
+            RecordingStage(calls, "s3"),
+            limiter=limiter,
+        ),
+    )
+    finish = _occupy(limiter)
+    try:
+        response = client.post(
+            URL, files={"image": ("body.png", _valid_png(), "image/png")}, headers=AUTH
+        )
+    finally:
+        finish()
+
+    assert response.status_code == 429
+    assert response.json() == {
+        "code": 429,
+        "message": "server_busy",
+        "data": {
+            "reason_code": "SERVER_BUSY",
+            "reason": "현재 이미지 처리 요청이 많습니다. 잠시 후 다시 시도해주세요.",
+        },
+    }
+    assert calls == []
+    assert (limiter.running, limiter.waiting) == (0, 0)
+
+
+def test_invalid_image_gets_its_own_error_even_when_the_queue_is_full(client, monkeypatch):
+    limiter = BodyValidationLimiter(1, 1)
+    use_service(
+        monkeypatch,
+        BodyImageValidationService(
+            RecordingStage([], "person_detector"),
+            RecordingStage([], "pose_detector"),
+            RecordingStage([], "rembg"),
+            RecordingStage([], "s3"),
+            limiter=limiter,
+        ),
+    )
+    finish = _occupy(limiter)
+    try:
+        response = client.post(
+            URL, files={"image": ("body.png", b"", "image/png")}, headers=AUTH
+        )
+    finally:
+        finish()
+
+    assert response.status_code == 400
+    assert response.json()["data"]["reason_code"] == "IMAGE_EMPTY"

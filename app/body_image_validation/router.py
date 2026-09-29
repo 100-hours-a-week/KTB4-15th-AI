@@ -27,6 +27,7 @@ router = APIRouter(
         401: {"model": ErrorResponse},
         413: {"model": ErrorResponse},
         422: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
         500: {"model": ErrorResponse},
     },
 )
@@ -47,6 +48,8 @@ def validate_body_image(image: ImageFile):
     except BodyImageValidationError as error:
         if error.status_code >= 500:
             logger.exception("body image validation failed: %s", error.reason_code)
+        elif error.status_code == 429:
+            logger.warning("body image validation rejected: %s", error.reason_code)
         data = {"reason_code": error.reason_code}
         if error.reason is not None:
             data["reason"] = error.reason

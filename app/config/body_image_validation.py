@@ -12,11 +12,17 @@ POSE_LANDMARKER_MODEL = Path(
 )
 REMBG_MODEL = Path(os.getenv("REMBG_MODEL", str(MODEL_DIR / "u2netp.onnx")))
 
-MAX_IMAGE_BYTES = int(os.getenv("BODY_IMAGE_MAX_BYTES", str(10 * 1024 * 1024)))
-# 파일 크기와 별개로 decode 메모리를 막는다. 고압축 초고해상도 이미지는 10MB 미만이어도
+MAX_IMAGE_SIZE_MB = int(os.getenv("MAX_IMAGE_SIZE_MB", "2"))
+MAX_IMAGE_BYTES = MAX_IMAGE_SIZE_MB * 1024 * 1024
+# 파일 크기와 별개로 decode 메모리를 막는다. 고압축 초고해상도 이미지는 파일이 작아도
 # RGB decode 만으로 수백 MB 를 쓴다(150MP ≈ 450MB, 25MP ≈ 75MB).
 MAX_IMAGE_PIXELS = int(os.getenv("BODY_IMAGE_MAX_PIXELS", str(25_000_000)))
 MIN_SHORT_SIDE = int(os.getenv("BODY_IMAGE_MIN_SHORT_SIDE", "480"))
+# 입력 검증을 통과한 이미지는 긴 변을 이 값 이하로 줄인 뒤 모델/rembg 에 넣는다(확대는 안 함).
+MAX_PROCESSING_IMAGE_SIDE = int(os.getenv("MAX_PROCESSING_IMAGE_SIDE", "1600"))
+# 무거운 검증(모델 추론·rembg)의 프로세스 내 동시 실행 수와 대기 수. 넘치면 즉시 429.
+MAX_CONCURRENT_BODY_VALIDATIONS = int(os.getenv("MAX_CONCURRENT_BODY_VALIDATIONS", "1"))
+MAX_WAITING_BODY_VALIDATIONS = int(os.getenv("MAX_WAITING_BODY_VALIDATIONS", "1"))
 
 PERSON_SCORE_THRESHOLD = float(os.getenv("PERSON_SCORE_THRESHOLD", "0.40"))
 PERSON_HEIGHT_RATIO_THRESHOLD = float(os.getenv("PERSON_HEIGHT_RATIO_THRESHOLD", "0.55"))

@@ -1,5 +1,9 @@
 """전신 이미지 검증의 사용자 실패와 시스템 실패를 분리한다."""
 
+from app.config import body_image_validation as config
+
+SERVER_BUSY_REASON = "현재 이미지 처리 요청이 많습니다. 잠시 후 다시 시도해주세요."
+
 
 class BodyImageValidationError(Exception):
     status_code: int = 500
@@ -29,10 +33,20 @@ class BodyImageSystemError(BodyImageValidationError):
     status_code = 500
 
 
+class ServerBusyError(BodyImageValidationError):
+    """실행 슬롯과 대기 슬롯이 모두 찼을 때. 기다리게 하지 않고 바로 거절한다."""
+
+    status_code = 429
+    message = "server_busy"
+
+    def __init__(self) -> None:
+        super().__init__("SERVER_BUSY", SERVER_BUSY_REASON)
+
+
 USER_REASONS = {
     "IMAGE_EMPTY": "이미지 파일을 첨부해주세요.",
     "IMAGE_FORMAT_UNSUPPORTED": "JPG, JPEG 또는 PNG 이미지만 업로드해주세요.",
-    "IMAGE_TOO_LARGE": "이미지 크기는 10MB 이하여야 합니다.",
+    "IMAGE_TOO_LARGE": f"이미지 크기는 {config.MAX_IMAGE_SIZE_MB}MB 이하여야 합니다.",
     "INVALID_IMAGE": "이미지 파일을 확인할 수 없습니다. 다른 사진을 업로드해주세요.",
     "IMAGE_DECODE_FAILED": "이미지가 손상되어 처리할 수 없습니다. 다른 사진을 업로드해주세요.",
     "IMAGE_RESOLUTION_TOO_LARGE": (
