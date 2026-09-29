@@ -3,9 +3,9 @@
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, UploadFile, status
 
-from app.body_image_validation.exceptions import BodyImageValidationError
+from app.body_image_validation.exceptions import SYSTEM_FAILURE_MESSAGE, BodyImageValidationError
 from app.body_image_validation.runtime import BodyImageRuntimeError, runtime_manager
 from app.body_image_validation.schemas import (
     BodyImageValidationData,
@@ -14,7 +14,7 @@ from app.body_image_validation.schemas import (
 from app.body_image_validation.service import BodyImageValidationService
 from app.clients.s3 import S3ConfigError
 from app.config import body_image_validation as config
-from app.errors import ErrorResponse, error_response
+from app.errors import ApiResponse, error_response
 from app.security import verify_internal_key
 
 logger = logging.getLogger(__name__)
@@ -23,12 +23,12 @@ router = APIRouter(
     tags=["body-image-validation"],
     dependencies=[Depends(verify_internal_key)],
     responses={
-        400: {"model": ErrorResponse},
-        401: {"model": ErrorResponse},
-        413: {"model": ErrorResponse},
-        422: {"model": ErrorResponse},
-        429: {"model": ErrorResponse},
-        500: {"model": ErrorResponse},
+        status.HTTP_400_BAD_REQUEST: {"model": ApiResponse},
+        status.HTTP_401_UNAUTHORIZED: {"model": ApiResponse},
+        status.HTTP_413_CONTENT_TOO_LARGE: {"model": ApiResponse},
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ApiResponse},
+        status.HTTP_429_TOO_MANY_REQUESTS: {"model": ApiResponse},
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": ApiResponse},
     },
 )
 
@@ -46,25 +46,24 @@ def validate_body_image(image: ImageFile):
         result = service.validate(body)
         return BodyImageValidationResponse(data=BodyImageValidationData(s3_key=result.s3_key))
     except BodyImageValidationError as error:
-        if error.status_code >= 500:
-            logger.exception("body image validation failed: %s", error.reason_code)
-        elif error.status_code == 429:
-            logger.warning("body image validation rejected: %s", error.reason_code)
-        data = {"reason_code": error.reason_code}
-        if error.reason is not None:
-            data["reason"] = error.reason
-        return error_response(error.status_code, error.message, data)
+        if error.status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
+            logger.exception("body image validation failed: %s", error.code)
+        elif error.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            logger.warning("body image validation rejected: %s", error.code)
+        return error_response(
+            error.status_code, error.code, error.message or SYSTEM_FAILURE_MESSAGE
+        )
     except S3ConfigError:
         logger.exception("body image validation S3 configuration error")
         return error_response(
-            500,
-            "body_image_validation_system_failed",
-            {"reason_code": S3ConfigError.reason_code},
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            S3ConfigError.code,
+            SYSTEM_FAILURE_MESSAGE,
         )
     except BodyImageRuntimeError:
         logger.exception("body image validation runtime unavailable")
         return error_response(
-            500,
-            "body_image_validation_system_failed",
-            {"reason_code": "BODY_IMAGE_RUNTIME_UNAVAILABLE"},
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "BODY_IMAGE_RUNTIME_UNAVAILABLE",
+            SYSTEM_FAILURE_MESSAGE,
         )

@@ -140,7 +140,7 @@ def test_psycopg_error_becomes_a_database_error_without_details(failure):
         product_repository.find_by_codes(["4120937"])
 
     error = exc_info.value
-    assert (error.status_code, error.message) == (500, "database_error")
+    assert (error.status_code, error.code) == (500, "DATABASE_ERROR")
     assert "secret-password" not in str(error) + repr(error)
     assert "db-host" not in str(error) + repr(error)
     assert isinstance(error.__cause__, psycopg.Error)
@@ -165,4 +165,4 @@ def test_successful_query_with_no_rows_is_not_a_database_error():
     with pytest.raises(ProductNotFoundError) as exc_info:
         select_fitting_products(["999"], product_repository)
     assert not isinstance(exc_info.value, FittingDatabaseError)
-    assert (exc_info.value.status_code, exc_info.value.message) == (404, "product_not_found")
+    assert (exc_info.value.status_code, exc_info.value.code) == (404, "PRODUCT_NOT_FOUND")

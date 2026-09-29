@@ -102,9 +102,8 @@ def test_case_c_third_request_is_rejected_immediately_while_one_runs_and_one_wai
         order.append("third-start")
 
     busy = exc_info.value
-    assert (busy.status_code, busy.reason_code) == (429, "SERVER_BUSY")
-    assert busy.message == "server_busy"
-    assert busy.reason == "현재 이미지 처리 요청이 많습니다. 잠시 후 다시 시도해주세요."
+    assert (busy.status_code, busy.code) == (429, "SERVER_BUSY")
+    assert busy.message == "현재 이미지 처리 요청이 많습니다. 잠시 후 다시 시도해주세요."
     assert "third-start" not in order
     assert (limiter.running, limiter.waiting) == (1, 1)  # 거절은 상태를 바꾸지 않는다
 

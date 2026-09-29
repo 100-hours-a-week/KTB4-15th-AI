@@ -62,15 +62,18 @@ def valid_landmarks():
 def reason_from(call):
     with pytest.raises(UserImageValidationError) as exc_info:
         call()
-    return exc_info.value.reason_code
+    return exc_info.value.code
 
 
 @pytest.mark.parametrize(
-    ("detections", "reason_code"),
-    [([], "PERSON_NOT_FOUND"), ([PersonDetection(BoundingBox(0, 0, 100, 600), 0.9)] * 2, "MULTIPLE_PERSONS")],
+    ("detections", "code"),
+    [
+        ([], "PERSON_NOT_FOUND"),
+        ([PersonDetection(BoundingBox(0, 0, 100, 600), 0.9)] * 2, "MULTIPLE_PERSONS"),
+    ],
 )
-def test_person_count_failures(detections, reason_code):
-    assert reason_from(lambda: select_single_person(detections, 1000)) == reason_code
+def test_person_count_failures(detections, code):
+    assert reason_from(lambda: select_single_person(detections, 1000)) == code
 
 
 def test_person_height_ratio_boundary_054_055():

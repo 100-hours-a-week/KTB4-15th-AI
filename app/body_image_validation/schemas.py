@@ -2,12 +2,14 @@
 
 from pydantic import BaseModel
 
+from app.errors import ApiResponse
+
 
 class BodyImageValidationData(BaseModel):
     s3_key: str
 
 
-class BodyImageValidationResponse(BaseModel):
-    code: int = 200
-    message: str = "body_image_validation_success"
+class BodyImageValidationResponse(ApiResponse):
+    code: str = "BODY_IMAGE_UPLOAD_SUCCESS"
     data: BodyImageValidationData
+    message: str = "전신 사진 검증에 성공했습니다."
