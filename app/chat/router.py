@@ -6,22 +6,22 @@ HTTP 로, 연 뒤의 오류는 error 이벤트로 낸다.
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
 from app.chat import controller
 from app.chat.schemas import ChatDeleteResponse, ChatRequest
 from app.config.checkpointer import get_checkpointer, get_graph
-from app.errors import ApiResponse, error_response
+from app.errors import ErrorResponse, error_response
 from app.security import verify_internal_key
 
 router = APIRouter(
     tags=["chat"],
     dependencies=[Depends(verify_internal_key)],
     responses={
-        status.HTTP_400_BAD_REQUEST: {"model": ApiResponse},
-        status.HTTP_401_UNAUTHORIZED: {"model": ApiResponse},
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": ApiResponse},
+        400: {"model": ErrorResponse},
+        401: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
     },
 )
 

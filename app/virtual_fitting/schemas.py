@@ -1,7 +1,5 @@
 from pydantic import BaseModel, Field
 
-from app.errors import ApiResponse
-
 
 class FittingProductRequest(BaseModel):
     # DB의 product_code는 BIGINT 이므로 숫자 문자열만 허용한다.
@@ -19,7 +17,7 @@ class SyncFittingData(BaseModel):
     llm_comment: str
 
 
-class SyncFittingResponse(ApiResponse):
-    code: str = "FITTING_SUCCESS"
+class SyncFittingResponse(BaseModel):
+    code: int = 200
+    message: str = "fitting_succeeded"
     data: SyncFittingData
-    message: str = "가상 피팅이 완료되었습니다."

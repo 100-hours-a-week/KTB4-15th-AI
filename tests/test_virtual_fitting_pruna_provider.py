@@ -137,7 +137,7 @@ def test_http_error_becomes_model_error(code):
         _provider(FakeOpener(error=_http_error(code))).try_on(_input())
     assert str(code) in str(exc_info.value)
     assert exc_info.value.status_code == 502
-    assert exc_info.value.code == "FITTING_MODEL_FAILED"
+    assert exc_info.value.message == "fitting_model_failed"
 
 
 def test_http_504_becomes_timeout_error():
@@ -153,7 +153,7 @@ def test_timeout_becomes_timeout_error(error):
     with pytest.raises(FittingTimeoutError) as exc_info:
         _provider(FakeOpener(error=error)).try_on(_input())
     assert exc_info.value.status_code == 504
-    assert exc_info.value.code == "FITTING_TIMEOUT"
+    assert exc_info.value.message == "fitting_timeout"
 
 
 @pytest.mark.parametrize(

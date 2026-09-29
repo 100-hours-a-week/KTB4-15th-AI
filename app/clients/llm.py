@@ -13,7 +13,7 @@ from app.config import settings
 
 
 class LLMError(RuntimeError):
-    """LLM 호출 실패. 스트림 안에서는 LLM_GENERATION_FAILED로 나간다."""
+    """LLM 호출 실패. 스트림 안에서는 llm_generation_failed로 나간다."""
 
 
 class LLMClient:
@@ -80,7 +80,7 @@ class LLMClient:
                 input=[text],
             )
             return response.data[0].embedding
-        except Exception as exc:  # 상위에서 RECOMMENDATION_SEARCH_FAILED 로 변환한다
+        except Exception as exc:  # 상위에서 recommendation_search_failed 로 변환한다
             raise LLMError(str(exc)) from exc
 
 
