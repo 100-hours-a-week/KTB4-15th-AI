@@ -39,3 +39,13 @@ def test_new_price_range_overwrites_both_bounds():
     current = {"min_price": 50000, "max_price": 59999}
     merged = _merge_conditions(current, {"min_price": 0, "max_price": 30000}, None)
     assert merged == {"min_price": 0, "max_price": 30000}
+
+
+def test_price_comes_from_rule_not_llm():
+    from app.chat.graph.nodes import _apply_price_rule, _said_conditions
+
+    raw = {"answer": "yes", "metadata": {"color": None, "max_price": 30000}}
+    applied = _apply_price_rule(raw, "응, 근데 5만원 이하로")
+    assert applied["metadata"] == {"color": None, "min_price": 0, "max_price": 50000}
+    assert _said_conditions(applied)
+    assert raw["metadata"] == {"color": None, "max_price": 30000}  # 원본은 그대로

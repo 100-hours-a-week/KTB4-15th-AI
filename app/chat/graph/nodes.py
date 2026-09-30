@@ -54,6 +54,22 @@ def _recommendation_message(products: list[dict]) -> dict:
     }
 
 
+def _apply_price_rule(raw: dict, message: str) -> dict:
+    """가격은 LLM 이 아니라 규칙으로 뽑는다. 모델이 가격을 내더라도 쓰지 않는다.
+
+    기타/bench_analyze_route.py 도 이 함수를 불러 서비스와 같은 조건 판정을 잰다.
+    """
+    metadata = {
+        key: value
+        for key, value in (raw.get("metadata") or {}).items()
+        if key not in ("min_price", "max_price")
+    }
+    price_range = price.parse_price(message)
+    if price_range:
+        metadata["min_price"], metadata["max_price"] = price_range
+    return {**raw, "metadata": metadata}
+
+
 def _said_conditions(raw: dict) -> bool:
     """이번 턴 발화에서 조건이 하나라도 뽑혔는가. 갈 곳은 이 값과 answer 로 코드가 정한다."""
     metadata = raw.get("metadata") or {}
@@ -78,17 +94,7 @@ async def analyze(state: dict) -> dict:
         reasoning_effort=settings.ANALYZE_REASONING_EFFORT,
     )
 
-    # 가격은 LLM 이 아니라 규칙으로 뽑는다. 모델이 가격을 내더라도 쓰지 않는다.
-    metadata = {
-        key: value
-        for key, value in (raw.get("metadata") or {}).items()
-        if key not in ("min_price", "max_price")
-    }
-    price_range = price.parse_price(message)
-    if price_range:
-        metadata["min_price"], metadata["max_price"] = price_range
-    raw["metadata"] = metadata
-
+    raw = _apply_price_rule(raw, message)
     conditions = _merge_conditions(
         state.get("conditions", {}), raw.get("metadata"), raw.get("dislikes")
     )
