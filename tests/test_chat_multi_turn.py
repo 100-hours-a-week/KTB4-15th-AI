@@ -108,6 +108,7 @@ def test_three_turns_share_one_conversation(monkeypatch):
     assert state["conditions"] == {
         "category": "셔츠",
         "color": "블랙",
+        "min_price": 0,  # 가격은 LLM 값이 아니라 발화 "5만원 이하"에서 규칙으로 뽑는다
         "max_price": 50000,
         "dislikes": [{"field": "color", "value": "레드"}],
     }
@@ -120,6 +121,7 @@ def test_three_turns_share_one_conversation(monkeypatch):
     # 세 턴에 걸쳐 모인 조건이 그대로 검색에 넘어간다
     assert fake_search.called_with["category"] == "셔츠"
     assert fake_search.called_with["color"] == "블랙"
+    assert fake_search.called_with["min_price"] == 0
     assert fake_search.called_with["max_price"] == 50000
 
     state = _state(graph)

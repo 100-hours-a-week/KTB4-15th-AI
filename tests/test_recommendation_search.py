@@ -46,7 +46,7 @@ def test_no_color_condition_takes_top_k_by_distance():
 
 
 def _query(**overrides):
-    kwargs = {"color": None, "category": None, "max_price": None, "dislikes": [], "top_k": 3}
+    kwargs = {"color": None, "category": None, "min_price": None, "max_price": None, "dislikes": [], "top_k": 3}
     kwargs.update(overrides)
     return build_query(**kwargs)
 
@@ -100,3 +100,17 @@ def test_item_type_is_sent_as_top_or_bottom():
     # Backend 합의 (2026-09-27): DB 의 한글 대분류가 아니라 TOP / BOTTOM 으로 보낸다
     assert _to_product(_row("상의"))["item_type"] == "TOP"
     assert _to_product(_row("하의"))["item_type"] == "BOTTOM"
+
+
+def test_price_range_uses_both_bounds():
+    sql, params = _query(min_price=50000, max_price=59999)
+    assert "price >= %(min_price)s" in sql
+    assert "price <= %(max_price)s" in sql
+    assert params["min_price"] == 50000
+    assert params["max_price"] == 59999
+
+
+def test_zero_min_price_is_still_a_bound():
+    sql, params = _query(min_price=0, max_price=50000)
+    assert "price >= %(min_price)s" in sql
+    assert params["min_price"] == 0
