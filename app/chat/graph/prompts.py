@@ -5,7 +5,7 @@ analyze는 자유 텍스트를 받고 나중에 동의어로 맞추지 않는다
 """
 
 from app.chat import vocab
-from app.chat.graph.state import CONFIRM_INTENTS, OPEN_INTENTS
+from app.chat.graph.state import ANSWERS
 from app.config import settings
 
 # 추천 목록을 담은 assistant 메시지의 표시. 프롬프트로 나갈 때는 떼어낸다.
@@ -30,7 +30,7 @@ def history_for_prompt(messages: list[dict]) -> list[dict]:
 
 _ANALYZE_RULES = """너는 패션 쇼핑 대화의 한 턴을 해석한다.
 
-1. intent 를 아래 목록에서 정확히 하나 고른다: {intents}
+1. answer 는 봇이 물어 둔 질문에 대한 사용자의 답이다. 아래 목록에서 정확히 하나 고른다: {answers}
 2. 사용자가 이번 턴에 말한 조건만 뽑는다. 말하지 않은 조건은 만들어내지 않는다.
 3. color 는 다음 목록의 값만 쓴다: {colors}
    목록에 없는 색이면 null 로 둔다.
@@ -38,42 +38,60 @@ _ANALYZE_RULES = """너는 패션 쇼핑 대화의 한 턴을 해석한다.
    목록이 비어 있거나 해당하는 값이 없으면 null 로 둔다.
 5. 싫다고 말한 것은 dislikes 에 넣는다. field 는 color, category, max_price, style 중 하나다.
 6. semantic_query 는 색상·가격·카테고리를 빼고, 상황·분위기·핏 같은 말만 담은 한 문장이다.
+   사용자가 이번 턴에 상황·분위기·핏을 말하지 않았으면 빈 문자열로 둔다. 요청을 요약하거나 지어내지 않는다.
 
 JSON만 출력한다:
-{{"intent": "...", "metadata": {{"color": null, "category": null, "max_price": null}},
+{{"answer": "...", "metadata": {{"color": null, "category": null, "max_price": null}},
   "dislikes": [{{"field": "color", "value": "레드"}}], "semantic_query": "..."}}"""
 
-_INTENT_MEANING = """intent 의 뜻:
-- chat: 추천과 상관없는 일반 대화
-- recommend: 상품을 추천받고 싶다는 뜻
-- confirm: 직전에 봇이 요약한 조건으로 진행하겠다는 동의
-- reject_only: 거절만 했고 바꿀 조건은 말하지 않음
-- reject_with_conditions: 거절하면서 바꿀 조건도 함께 말함"""
+_ANSWER_MEANING = """answer 의 뜻:
+- yes: 봇의 질문에 동의한다 (요약한 조건으로 진행, 이전 조건 그대로 진행)
+- no: 거절한다. 또는 무엇을 바꿀지 묻는 질문에 바꿀 것을 말하지 못한다
+- none: 봇의 질문과 상관없는 말이다. 봇이 묻고 있는 것이 없으면 항상 none 이다
+조건을 말했는지는 answer 로 나타내지 않는다. 조건은 metadata·dislikes·semantic_query 에만 담는다."""
+
+# pending_question 별로 analyze 에게 알려줄 직전 상황
+_PENDING_CONTEXT = {
+    "confirm_summary": "봇이 지금까지의 조건을 요약하고, 이 조건으로 추천해도 될지 물었다.",
+    "ask_change": "봇이 추천 조건 중 무엇을 바꾸고 싶은지 물었다.",
+}
+_NO_PENDING_CONTEXT = "봇이 묻고 있는 것이 없다."
 
 
+# sabu: 배포 전 대화 — 운영 checkpointer 에는 pending_question 없이 awaiting_confirm=True 로 저장된
+#       대화가 남아 있다. 배포 직후 그 대화에 "응"이 오면 여기서는 무엇으로 읽히고, 어느 노드로 가지?
 def analyze_prompt(state: dict, message: str) -> list[dict]:
     # sabu: 재검색 — analyze 는 누적 조건과 현재 메시지만 보고 추천 기록은 보지 않는다.
     #       "다른 것도 보여줘"가 왔을 때 이미 보여준 상품을 빼고 다시 찾으려면
     #       무엇이 더 필요하지? 그 값은 어느 State 필드에 있어야 하지?
-    intents = CONFIRM_INTENTS if state.get("awaiting_confirm") else OPEN_INTENTS
     rules = _ANALYZE_RULES.format(
-        intents=", ".join(intents),
+        answers=", ".join(ANSWERS),
         colors=", ".join(vocab.ALLOWED_COLORS),
         categories=", ".join(vocab.ALLOWED_CATEGORIES) or "(아직 정해지지 않음)",
     )
     context = {
         "누적 조건": state.get("conditions", {}),
-        "직전 턴에 봇이 조건을 요약하고 확인을 물었는가": bool(state.get("awaiting_confirm")),
+        "봇이 물어 둔 질문": _PENDING_CONTEXT.get(state.get("pending_question"), _NO_PENDING_CONTEXT),
     }
     return [
-        {"role": "system", "content": f"{rules}\n\n{_INTENT_MEANING}"},
+        {"role": "system", "content": f"{rules}\n\n{_ANSWER_MEANING}"},
         {"role": "user", "content": f"[대화 상태]\n{context}\n\n[이번 사용자 입력]\n{message}"},
     ]
 
 
-CHAT_SYSTEM = """너는 패션 쇼핑을 돕는 상담원이다.
+# chat 노드는 검색 수단이 없고 다음 엣지도 END 다. 추천을 원하는 턴이 여기 오면
+# 다음 턴에 조건을 말해 summarize 로 가도록 말로 안내만 한다 (2026-09-28 QA "옷 미추천").
+# 종류 예시는 vocab 의 카테고리 안에서만 들게 한다. 카탈로그에 없는 신발·원피스를 예로 들면
+# 사용자가 그대로 말했을 때 검색이 0건이 된다.
+CHAT_SYSTEM = f"""너는 남성 패션 쇼핑을 돕는 상담원이다.
 사용자의 패션 관련 요청을 이해하고, 이전 대화의 조건을 고려하여 자연스럽게 답한다.
-추천 상품 목록을 네가 지어내지 않는다."""
+패션과 상관없는 요청(음식, 맛집, 날씨, 일반 상식 등)에는 답하지 않는다. 옷 쇼핑만 도울 수 있다고
+짧게 말하고, 찾는 옷이 있는지 묻는다. 인사나 감사처럼 가벼운 말에는 짧게 받아 준다.
+
+- 상품은 실제 판매 중인 상품을 검색해서만 보여준다. 옷이나 코디 조합을 글로 지어내 추천하지 않는다.
+- 이 답변에서는 검색하지 않는다. "추천해드릴게요"처럼 추천을 약속하지 않는다.
+- 사용자가 옷을 찾는 것 같으면, 종류·색·예산 중 하나라도 말해 주면 실제 상품에서 찾아 준다고 안내한다.
+- 옷 종류를 예로 들 때는 다음 목록 안에서만 든다: {", ".join(vocab.ALLOWED_CATEGORIES)}"""
 
 
 def chat_prompt(state: dict) -> list[dict]:

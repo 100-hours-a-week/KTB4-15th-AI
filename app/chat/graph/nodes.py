@@ -54,8 +54,23 @@ def _recommendation_message(products: list[dict]) -> dict:
     }
 
 
+def _said_conditions(raw: dict) -> bool:
+    """이번 턴 발화에서 조건이 하나라도 뽑혔는가. 갈 곳은 이 값과 answer 로 코드가 정한다."""
+    metadata = raw.get("metadata") or {}
+    return (
+        any(value is not None for value in metadata.values())
+        or bool(raw.get("dislikes"))
+        or bool((raw.get("semantic_query") or "").strip())
+    )
+
+
+# sabu: 조건의 기준 — 규칙 6 은 LLM 이 semantic_query 를 지어낼 확률만 낮춘다. 지어낸 값을 코드가 걸러내려면
+#       무엇과 무엇을 대조하면 되지? "MZ" 처럼 짧은 분위기 말은 그 대조를 어떻게 통과하지?
 async def analyze(state: dict) -> dict:
-    """이번 턴의 의도를 정하고, 말한 조건이 있으면 같이 뽑는다. LLM 1회."""
+    """봇이 물어 둔 질문에 대한 답(answer)과 이번 턴에 말한 조건을 뽑는다. LLM 1회.
+
+    갈 곳은 정하지 않는다. routing.route 가 answer 와 said_conditions 로 정한다.
+    """
     message = state["messages"][-1]["content"]
     raw = await llm.complete_json(
         prompts.analyze_prompt(state, message),
@@ -69,7 +84,8 @@ async def analyze(state: dict) -> dict:
     semantic_query = raw.get("semantic_query") or state.get("semantic_query", "")
 
     return {
-        "intent": raw.get("intent"),
+        "answer": raw.get("answer"),
+        "said_conditions": _said_conditions(raw),
         "conditions": conditions,
         "semantic_query": semantic_query,
     }
@@ -89,29 +105,33 @@ async def chat(state: dict) -> dict:
     text = await _stream_reply(prompts.chat_prompt(state), settings.CHAT_MAX_OUTPUT_TOKENS)
     return {
         "messages": [{"role": "assistant", "content": text}],
-        "awaiting_confirm": False,
+        "pending_question": None,
     }
 
 
 async def summarize(state: dict) -> dict:
-    """조건을 요약하고 추천해도 될지 묻는다. 여기서만 플래그를 켠다."""
+    """조건을 요약하고 추천해도 될지 묻는다."""
     text = await _stream_reply(
         prompts.summarize_prompt(state), settings.SUMMARY_MAX_OUTPUT_TOKENS
     )
     return {
         "messages": [{"role": "assistant", "content": text}],
-        "awaiting_confirm": True,
+        "pending_question": "confirm_summary",
     }
 
 
 async def ask_change(state: dict) -> dict:
-    """거절만 한 경우에만 무엇을 바꾸고 싶은지 묻는다."""
+    """거절만 한 경우에만 무엇을 바꾸고 싶은지 묻는다.
+
+    물은 것을 pending_question 에 남긴다. 남기지 않으면 다음 턴의 "가을 말고 여름"을 analyze 가
+    질문에 대한 답으로 읽지 못해 일반 대화로 빠진다 (2026-09-28 QA).
+    """
     text = await _stream_reply(
         prompts.ask_change_prompt(state), settings.SUMMARY_MAX_OUTPUT_TOKENS
     )
     return {
         "messages": [{"role": "assistant", "content": text}],
-        "awaiting_confirm": False,
+        "pending_question": "ask_change",
     }
 
 
@@ -162,7 +182,7 @@ async def search(state: dict) -> dict:
 
     return {
         "messages": [_recommendation_message(products)],
-        "awaiting_confirm": False,
+        "pending_question": None,
     }
 
 
@@ -184,5 +204,5 @@ async def wishlist(state: dict) -> dict:
     writer({"event": sse.PRODUCTS, "products": products})
     return {
         "messages": [_recommendation_message(products)],
-        "awaiting_confirm": False,
+        "pending_question": None,
     }

@@ -5,12 +5,14 @@ checkpointer가 thread_id(= chat_id)별로 이 값을 보관하고, 매 턴 STAR
 
 from typing import Annotated, Literal, TypedDict
 
-# 플래그가 꺼져 있을 때 analyze가 낼 수 있는 값
-OPEN_INTENTS = ("chat", "recommend")
-# 플래그가 켜져 있을 때(= 직전 턴이 요약 확인이었을 때) 낼 수 있는 값
-CONFIRM_INTENTS = ("confirm", "reject_only", "reject_with_conditions", "chat")
+# 직전 턴에 봇이 사용자에게 물어 둔 것. 없으면 None.
+#   confirm_summary  summarize 가 조건을 요약하고 이대로 추천할지 물었다
+#   ask_change       ask_change 가 무엇을 바꾸고 싶은지 물었다
+PendingQuestion = Literal["confirm_summary", "ask_change"]
 
-Intent = Literal["chat", "recommend", "confirm", "reject_only", "reject_with_conditions"]
+# 봇의 질문에 대한 사용자의 답. analyze(LLM)가 낸다. 봇이 묻고 있는 것이 없으면 none.
+ANSWERS = ("yes", "no", "none")
+Answer = Literal["yes", "no", "none"]
 
 # Backend 의 ChatSourceType enum 값을 그대로 쓴다. 칩 클릭이면 WISHLIST.
 SourceType = Literal["GENERAL", "WISHLIST"]
@@ -32,8 +34,10 @@ class ChatState(TypedDict):
     messages: Annotated[list[dict], append_messages]
     conditions: Conditions
     semantic_query: str
-    awaiting_confirm: bool  # 수명은 다음 사용자 턴 하나
-    intent: Intent  # 이번 턴에만 쓰는 값
+    # 수명은 다음 사용자 턴 하나. 매 턴 끝나는 노드가 새로 쓴다
+    pending_question: PendingQuestion | None
+    answer: Answer  # 이번 턴에만 쓰는 값
+    said_conditions: bool  # 이번 턴에만 쓰는 값. 이번 턴 발화에서 조건이 하나라도 뽑혔는가
     source_type: SourceType  # 이번 턴에만 쓰는 값. 매 턴 입력으로 덮어쓴다
     product_ids: list[str]  # source_type이 WISHLIST일 때만 채워진다
 

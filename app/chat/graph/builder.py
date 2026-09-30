@@ -1,7 +1,7 @@
 """그래프 조립.
 
 턴마다 START부터 다시 돈다. 턴을 넘기는 장치는 interrupt가 아니라
-State의 awaiting_confirm 플래그다.
+State의 pending_question 이다.
 
 입구에서 source_type으로 한 번 갈라진다. 찜 기반 추천은 그 턴에 추천만 하고 끝나며,
 다음 턴부터는 평소대로 analyze를 거친다.
