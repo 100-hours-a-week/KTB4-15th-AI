@@ -7,10 +7,15 @@ from PIL import Image
 
 
 class RembgBackgroundRemover:
-    def __init__(self, model_path: str) -> None:
+    def __init__(self, model_path: str, enable_cpu_mem_arena: bool = False) -> None:
+        import onnxruntime as ort
         from rembg import new_session
 
-        self._session = new_session("u2net_custom", model_path=model_path)
+        # rembg 가 sess_opts 없이 만드는 것과 같은 기본 SessionOptions 에서 arena 값만 바꾼다.
+        # mem_pattern·스레드 수·provider 는 건드리지 않는다.
+        sess_opts = ort.SessionOptions()
+        sess_opts.enable_cpu_mem_arena = enable_cpu_mem_arena
+        self._session = new_session("u2net_custom", model_path=model_path, sess_opts=sess_opts)
         self._lock = threading.Lock()
 
     def remove(self, image: Image.Image) -> Image.Image:

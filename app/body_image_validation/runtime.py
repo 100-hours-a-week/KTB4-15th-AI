@@ -33,7 +33,9 @@ class BodyImageRuntime:
             storage = S3ImageStorage()
             person_detector = MediaPipePersonDetector(str(config.PERSON_DETECTOR_MODEL))
             pose_detector = MediaPipePoseDetector(str(config.POSE_LANDMARKER_MODEL))
-            background_remover = RembgBackgroundRemover(str(config.REMBG_MODEL))
+            background_remover = RembgBackgroundRemover(
+                str(config.REMBG_MODEL), enable_cpu_mem_arena=config.REMBG_ENABLE_CPU_MEM_ARENA
+            )
         # MediaPipe, ONNX Runtime, boto3가 서로 다른 예외 계층을 사용하므로 초기화 경계에서
         # 하나의 BodyImageRuntimeError로 묶고 이미 열린 native resource를 정리한다.
         except Exception as error:

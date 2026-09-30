@@ -426,3 +426,34 @@ def test_images_are_closed_and_the_slot_is_released_in_every_outcome(
     if case in ("success", "encode-failure", "upload-failure"):
         assert len(remover.results) == 1
     assert (target.limiter.running, target.limiter.waiting) == (0, 0)
+
+
+def test_processing_image_stays_open_until_encoding_and_is_closed_by_validate(
+    monkeypatch, opened_images
+):
+    # rembg 직후 조기 close 는 측정상 효과가 없어 넣지 않았다. validate() 의 finally 가 닫는다.
+    assert not hasattr(config, "BODY_IMAGE_EARLY_CLOSE_RGB")
+    closed_at_encode = []
+    real_encode = service_module.encode_png
+
+    def encode_png(result):
+        closed_at_encode.append(is_closed(opened_images["decoded"][0]))
+        return real_encode(result)
+
+    monkeypatch.setattr(service_module, "encode_png", encode_png)
+    remover = RecordingRemover()
+    storage = FakeStorage()
+    target = BodyImageValidationService(
+        FakePersonDetector(), FakePoseDetector(), remover, storage
+    )
+
+    result = target.validate(image_bytes())
+
+    assert closed_at_encode == [False]
+    assert result.s3_key == storage.uploads[0][1]
+    [png] = [body for body, *_ in storage.uploads]
+    with Image.open(BytesIO(png)) as uploaded:  # 결과 품질은 그대로다
+        assert (uploaded.mode, uploaded.size) == ("RGBA", (600, 800))
+    assert is_closed(opened_images["decoded"][0])
+    assert all(is_closed(image) for image in remover.results)
+    assert (target.limiter.running, target.limiter.waiting) == (0, 0)
