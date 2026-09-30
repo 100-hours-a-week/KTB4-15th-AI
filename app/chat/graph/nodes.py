@@ -7,7 +7,7 @@ search 와 wishlist 는 LLM 을 직접 부르지 않고 recommendation 함수를
 from langgraph.config import get_stream_writer
 
 from app import recommendation
-from app.chat import sse, vocab
+from app.chat import price, sse, vocab
 from app.chat.graph import prompts
 from app.clients.llm import llm
 from app.config import settings
@@ -77,6 +77,17 @@ async def analyze(state: dict) -> dict:
         max_output_tokens=settings.ANALYZE_MAX_OUTPUT_TOKENS,
         reasoning_effort=settings.ANALYZE_REASONING_EFFORT,
     )
+
+    # 가격은 LLM 이 아니라 규칙으로 뽑는다. 모델이 가격을 내더라도 쓰지 않는다.
+    metadata = {
+        key: value
+        for key, value in (raw.get("metadata") or {}).items()
+        if key not in ("min_price", "max_price")
+    }
+    price_range = price.parse_price(message)
+    if price_range:
+        metadata["min_price"], metadata["max_price"] = price_range
+    raw["metadata"] = metadata
 
     conditions = _merge_conditions(
         state.get("conditions", {}), raw.get("metadata"), raw.get("dislikes")
@@ -170,6 +181,7 @@ async def search(state: dict) -> dict:
     products = await recommendation.search_products(
         color=conditions.get("color"),
         category=conditions.get("category"),
+        min_price=conditions.get("min_price"),
         max_price=conditions.get("max_price"),
         dislikes=dislikes,
         semantic_query=_search_query(state),

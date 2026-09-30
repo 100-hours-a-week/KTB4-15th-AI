@@ -33,3 +33,9 @@ def test_original_conditions_are_not_mutated():
     current = {"color": "블랙", "dislikes": [{"field": "color", "value": "레드"}]}
     _merge_conditions(current, {"color": "네이비"}, [{"field": "color", "value": "핑크"}])
     assert current == {"color": "블랙", "dislikes": [{"field": "color", "value": "레드"}]}
+
+
+def test_new_price_range_overwrites_both_bounds():
+    current = {"min_price": 50000, "max_price": 59999}
+    merged = _merge_conditions(current, {"min_price": 0, "max_price": 30000}, None)
+    assert merged == {"min_price": 0, "max_price": 30000}

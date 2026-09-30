@@ -65,6 +65,7 @@ def test_search_runs_without_conditions(live_search):
     products = _run(
         color=None,
         category=None,
+        min_price=None,
         max_price=None,
         dislikes=[],
         semantic_query="블랙 와이드 팬츠",
@@ -82,6 +83,7 @@ def test_search_runs_with_every_filter_clause(live_search):
     products = _run(
         color="블랙",
         category="팬츠",
+        min_price=50000,
         max_price=100000,
         dislikes=[
             {"field": "color", "value": "레드"},
