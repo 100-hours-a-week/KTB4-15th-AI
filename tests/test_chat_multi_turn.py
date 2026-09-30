@@ -1,7 +1,7 @@
 """여러 턴에 걸친 대화.
 
 checkpointer 가 thread_id(= chat_id) 별로 State 를 복원하는지, 조건이 턴을 넘어
-쌓이는지, 확인 플래그가 다음 턴에서 해석되는지를 실제 그래프 실행으로 확인한다.
+쌓이는지, 봇이 물어 둔 질문이 다음 턴에서 해석되는지를 실제 그래프 실행으로 확인한다.
 
 LLM 은 가짜로 바꾼다. 여기서 보려는 것은 모델의 판단이 아니라 턴 사이에 무엇이
 남고 무엇이 프롬프트로 들어가는지다.
@@ -65,20 +65,20 @@ def _state(graph):
 def test_three_turns_share_one_conversation(monkeypatch):
     fake = FakeLLM(
         [
-            # 1턴: 추천 의도 + 카테고리만 말함
+            # 1턴: 카테고리와 분위기를 말함
             {
-                "intent": "recommend",
+                "answer": "none",
                 "metadata": {"category": "셔츠"},
                 "semantic_query": "소개팅에 입기 좋은 단정한 분위기",
             },
             # 2턴: 거절하면서 조건을 더 말함
             {
-                "intent": "reject_with_conditions",
+                "answer": "no",
                 "metadata": {"color": "블랙", "max_price": 50000},
                 "dislikes": [{"field": "color", "value": "레드"}],
             },
             # 3턴: 동의
-            {"intent": "confirm", "metadata": {}},
+            {"answer": "yes", "metadata": {}},
         ]
     )
     monkeypatch.setattr(llm_module.llm, "complete_json", fake.complete_json)
@@ -95,13 +95,13 @@ def test_three_turns_share_one_conversation(monkeypatch):
     # --- 1턴
     _run(graph, "소개팅에 입을 셔츠 추천해줘")
     state = _state(graph)
-    assert state["awaiting_confirm"] is True
+    assert state["pending_question"] == "confirm_summary"
     assert state["conditions"]["category"] == "셔츠"
 
     # --- 2턴: 직전 턴이 요약 확인이었다는 사실이 프롬프트에 실려야 한다
     _run(graph, "아니, 검정색으로 5만원 이하")
     second_prompt = str(fake.prompts[1])
-    assert "'직전 턴에 봇이 조건을 요약하고 확인을 물었는가': True" in second_prompt
+    assert "봇이 지금까지의 조건을 요약하고, 이 조건으로 추천해도 될지 물었다." in second_prompt
     assert "셔츠" in second_prompt  # 1턴 조건이 복원되어 함께 들어갔다
 
     state = _state(graph)
@@ -111,7 +111,7 @@ def test_three_turns_share_one_conversation(monkeypatch):
         "max_price": 50000,
         "dislikes": [{"field": "color", "value": "레드"}],
     }
-    assert state["awaiting_confirm"] is True  # 재요약이라 다시 켜진다
+    assert state["pending_question"] == "confirm_summary"  # 거절했지만 조건을 말해서 재요약
 
     # --- 3턴: "응" 한 마디로 검색까지 간다
     events = _run(graph, "응")
@@ -123,14 +123,14 @@ def test_three_turns_share_one_conversation(monkeypatch):
     assert fake_search.called_with["max_price"] == 50000
 
     state = _state(graph)
-    assert state["awaiting_confirm"] is False
+    assert state["pending_question"] is None
     assert "오버핏 코튼 셔츠 (0000001)" in state["messages"][-1]["content"]
     # 사용자 3번 + 봇 3번(요약·요약·추천기록)
     assert len(state["messages"]) == 6
 
 
 def test_other_chat_room_does_not_see_this_conversation(monkeypatch):
-    fake = FakeLLM([{"intent": "chat", "metadata": {}}])
+    fake = FakeLLM([{"answer": "none", "metadata": {}}])
     monkeypatch.setattr(llm_module.llm, "complete_json", fake.complete_json)
     monkeypatch.setattr(llm_module.llm, "stream_text", fake.stream_text)
 
@@ -146,3 +146,35 @@ def test_other_chat_room_does_not_see_this_conversation(monkeypatch):
 
     other = asyncio.run(graph.aget_state({"configurable": {"thread_id": "room-b"}}))
     assert other.values == {}
+
+
+def test_condition_change_after_ask_change_goes_back_to_summary(monkeypatch):
+    """요약 → "ㄴㄴ" → 되묻기 → "가을 말고 여름" 이 일반 대화로 빠지지 않는다 (2026-09-28 QA)."""
+    fake = FakeLLM(
+        [
+            {"answer": "none", "metadata": {}, "semantic_query": "가을 데이트 룩"},
+            {"answer": "no", "metadata": {}},
+            {
+                "answer": "no",
+                "metadata": {},
+                "semantic_query": "여름 데이트 룩",
+            },
+        ]
+    )
+    monkeypatch.setattr(llm_module.llm, "complete_json", fake.complete_json)
+    monkeypatch.setattr(llm_module.llm, "stream_text", fake.stream_text)
+
+    graph = build_graph(InMemorySaver())
+
+    _run(graph, "가을에 데이트할 때 입을 옷")
+    _run(graph, "ㄴㄴ")
+    assert _state(graph)["pending_question"] == "ask_change"
+
+    _run(graph, "가을 말고 여름")
+    third_prompt = str(fake.prompts[2])
+    assert "봇이 추천 조건 중 무엇을 바꾸고 싶은지 물었다." in third_prompt
+
+    state = _state(graph)
+    assert state["said_conditions"] is True
+    assert state["semantic_query"] == "여름 데이트 룩"
+    assert state["pending_question"] == "confirm_summary"  # 재요약했다
