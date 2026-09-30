@@ -5,6 +5,8 @@
 
 from collections.abc import AsyncIterator
 
+from fastapi import status
+
 from app.chat import sse
 from app.chat.graph.state import initial_state
 from app.chat.schemas import ChatRequest
@@ -19,23 +21,35 @@ def thread_config(request: ChatRequest) -> dict:
     return {"configurable": {"thread_id": str(request.chat_id), "user_id": request.user_id}}
 
 
-async def find_pre_stream_error(graph, request: ChatRequest) -> tuple[int, str, dict] | None:
+async def find_pre_stream_error(
+    graph, request: ChatRequest
+) -> tuple[int, str, str, dict] | None:
     """스트림을 열기 전에 확인할 수 있는 오류만 여기서 찾는다.
 
-    찾으면 (status, message, data) 를 돌려주고, 없으면 None 을 돌려준다.
+    찾으면 (status, code, message, data) 를 돌려주고, 없으면 None 을 돌려준다.
     """
     if request.source_type != "WISHLIST":
         return None
 
     ids = request.product_ids
     if len(ids) != WISHLIST_PRODUCT_COUNT or len(set(ids)) != len(ids):
-        return 400, "invalid_wishlist_products", {"chat_id": request.chat_id}
+        return (
+            status.HTTP_400_BAD_REQUEST,
+            "INVALID_WISHLIST_PRODUCTS",
+            "찜 상품 목록이 올바르지 않습니다.",
+            {"chat_id": request.chat_id},
+        )
 
     # 찜 추천 칩은 대화를 시작할 때만 누를 수 있다. 진행 중인 대화에 오면 거절한다.
     snapshot = await graph.aget_state(thread_config(request))
     if snapshot.values.get("messages"):
-        # 이 message 코드는 Backend 와 합의가 필요하다.
-        return 400, "wishlist_not_at_chat_start", {"chat_id": request.chat_id}
+        # 이 code 는 Backend 와 합의가 필요하다.
+        return (
+            status.HTTP_400_BAD_REQUEST,
+            "WISHLIST_NOT_AT_CHAT_START",
+            "찜 추천은 대화를 시작할 때만 요청할 수 있습니다.",
+            {"chat_id": request.chat_id},
+        )
 
     return None
 
@@ -68,16 +82,16 @@ async def stream_chat(graph, request: ChatRequest) -> AsyncIterator[str]:
             elif chunk["event"] == sse.STATUS:
                 yield sse.status(chat_id, chunk["label"])
     except LLMError:
-        yield sse.error(chat_id, "llm_generation_failed", "응답 생성 중 오류가 발생했습니다.")
+        yield sse.error(chat_id, "LLM_GENERATION_FAILED", "응답 생성 중 오류가 발생했습니다.")
     except WishlistCommentError:
         yield sse.error(
             chat_id,
-            "wishlist_comment_generation_failed",
+            "WISHLIST_COMMENT_GENERATION_FAILED",
             "추천 이유를 만드는 중 오류가 발생했습니다.",
         )
     except RecommendationError:
         yield sse.error(
-            chat_id, "recommendation_search_failed", "상품 추천 처리 중 오류가 발생했습니다."
+            chat_id, "RECOMMENDATION_SEARCH_FAILED", "상품 추천 처리 중 오류가 발생했습니다."
         )
 
     content = "".join(spoken) if done_content is None else done_content
