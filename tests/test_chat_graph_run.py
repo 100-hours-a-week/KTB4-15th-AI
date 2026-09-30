@@ -73,4 +73,4 @@ def test_recommendation_is_left_in_the_conversation(monkeypatch):
 
     assert messages[0]["content"] == "내 찜 목록으로 추천받기"
     assert "오버핏 후드 집업 (0000011)" in messages[-1]["content"]
-    assert snapshot.values["awaiting_confirm"] is False
+    assert snapshot.values["pending_question"] is None
