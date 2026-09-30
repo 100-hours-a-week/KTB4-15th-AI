@@ -23,6 +23,10 @@ MAX_PROCESSING_IMAGE_SIDE = int(os.getenv("MAX_PROCESSING_IMAGE_SIDE", "1600"))
 # 무거운 검증(모델 추론·rembg)의 프로세스 내 동시 실행 수와 대기 수. 넘치면 즉시 429.
 MAX_CONCURRENT_BODY_VALIDATIONS = int(os.getenv("MAX_CONCURRENT_BODY_VALIDATIONS", "1"))
 MAX_WAITING_BODY_VALIDATIONS = int(os.getenv("MAX_WAITING_BODY_VALIDATIONS", "1"))
+# rembg ONNX session 의 CPU memory arena. arena 는 요청 때 잡은 버퍼를 프로세스가 끝날 때까지
+# 들고 있어 요청이 끝난 뒤 메모리가 높게 남는다(Docker 50회 측정: 끄면 idle −31%, latency 차이
+# 없음). 문제가 생기면 true 로 되돌린다(ONNX Runtime 기본값).
+REMBG_ENABLE_CPU_MEM_ARENA = os.getenv("REMBG_ENABLE_CPU_MEM_ARENA", "false").lower() == "true"
 
 PERSON_SCORE_THRESHOLD = float(os.getenv("PERSON_SCORE_THRESHOLD", "0.40"))
 PERSON_HEIGHT_RATIO_THRESHOLD = float(os.getenv("PERSON_HEIGHT_RATIO_THRESHOLD", "0.55"))
