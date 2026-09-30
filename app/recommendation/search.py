@@ -38,6 +38,7 @@ def build_query(
     *,
     color: str | None,
     category: str | None,
+    min_price: int | None,
     max_price: int | None,
     dislikes: list[dict],
     top_k: int,
@@ -56,6 +57,9 @@ def build_query(
     if category:
         where.append("sub_category = ANY(%(category_sources)s)")
         params["category_sources"] = vocab.CATEGORY_GROUPS.get(category, [])
+    if min_price is not None:
+        where.append("price >= %(min_price)s")
+        params["min_price"] = min_price
     if max_price is not None:
         where.append("price <= %(max_price)s")
         params["max_price"] = max_price
@@ -133,6 +137,7 @@ async def search_products(
     *,
     color: str | None,
     category: str | None,
+    min_price: int | None,
     max_price: int | None,
     dislikes: list[dict],
     semantic_query: str,
@@ -150,6 +155,7 @@ async def search_products(
     sql, params = build_query(
         color=color,
         category=category,
+        min_price=min_price,
         max_price=max_price,
         dislikes=dislikes,
         top_k=top_k,

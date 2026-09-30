@@ -26,6 +26,7 @@ def append_messages(left: list[dict], right: list[dict]) -> list[dict]:
 class Conditions(TypedDict, total=False):
     category: str | None
     color: str | None
+    min_price: int | None
     max_price: int | None
     dislikes: list[dict]  # [{"field": "color", "value": "레드"}]
 

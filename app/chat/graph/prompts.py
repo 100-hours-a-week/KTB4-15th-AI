@@ -41,7 +41,7 @@ _ANALYZE_RULES = """너는 패션 쇼핑 대화의 한 턴을 해석한다.
    사용자가 이번 턴에 상황·분위기·핏을 말하지 않았으면 빈 문자열로 둔다. 요청을 요약하거나 지어내지 않는다.
 
 JSON만 출력한다:
-{{"answer": "...", "metadata": {{"color": null, "category": null, "max_price": null}},
+{{"answer": "...", "metadata": {{"color": null, "category": null}},
   "dislikes": [{{"field": "color", "value": "레드"}}], "semantic_query": "..."}}"""
 
 _ANSWER_MEANING = """answer 의 뜻:
