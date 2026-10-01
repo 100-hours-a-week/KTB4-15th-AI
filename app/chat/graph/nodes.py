@@ -54,11 +54,27 @@ def _recommendation_message(products: list[dict]) -> dict:
     }
 
 
-def _apply_price_rule(raw: dict, message: str) -> dict:
-    """가격은 LLM 이 아니라 규칙으로 뽑는다. 모델이 가격을 내더라도 쓰지 않는다.
+def postprocess_analysis(raw: dict, message: str) -> dict:
+    """LLM 이 낸 analyze 결과를 코드 규칙으로 다듬는다. 조건 병합·판정 전에 반드시 거친다.
 
     기타/bench_analyze_route.py 도 이 함수를 불러 서비스와 같은 조건 판정을 잰다.
     """
+    return _drop_unknown_category(_apply_price_rule(raw, message))
+
+
+def _drop_unknown_category(raw: dict) -> dict:
+    """목록 밖 category 는 null 로 바꾼다. json_object 모드는 값이 허용 목록 안인지 보장하지 않는다.
+
+    null 은 병합에서 무시되므로 앞 턴의 category 가 그대로 남고, 조건을 말한 턴으로도 세지 않는다.
+    """
+    metadata = dict(raw.get("metadata") or {})
+    if metadata.get("category") not in (None, *vocab.ALLOWED_CATEGORIES):
+        metadata["category"] = None
+    return {**raw, "metadata": metadata}
+
+
+def _apply_price_rule(raw: dict, message: str) -> dict:
+    """가격은 LLM 이 아니라 규칙으로 뽑는다. 모델이 가격을 내더라도 쓰지 않는다."""
     metadata = {
         key: value
         for key, value in (raw.get("metadata") or {}).items()
@@ -94,7 +110,7 @@ async def analyze(state: dict) -> dict:
         reasoning_effort=settings.ANALYZE_REASONING_EFFORT,
     )
 
-    raw = _apply_price_rule(raw, message)
+    raw = postprocess_analysis(raw, message)
     conditions = _merge_conditions(
         state.get("conditions", {}), raw.get("metadata"), raw.get("dislikes")
     )

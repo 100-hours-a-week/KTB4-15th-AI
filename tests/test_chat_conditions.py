@@ -42,10 +42,28 @@ def test_new_price_range_overwrites_both_bounds():
 
 
 def test_price_comes_from_rule_not_llm():
-    from app.chat.graph.nodes import _apply_price_rule, _said_conditions
+    from app.chat.graph.nodes import _said_conditions, postprocess_analysis
 
     raw = {"answer": "yes", "metadata": {"color": None, "max_price": 30000}}
-    applied = _apply_price_rule(raw, "응, 근데 5만원 이하로")
+    applied = postprocess_analysis(raw, "응, 근데 5만원 이하로")
     assert applied["metadata"] == {"color": None, "min_price": 0, "max_price": 50000}
     assert _said_conditions(applied)
     assert raw["metadata"] == {"color": None, "max_price": 30000}  # 원본은 그대로
+
+
+def test_unknown_category_keeps_the_previous_one():
+    from app.chat.graph.nodes import _said_conditions, postprocess_analysis
+
+    raw = {"answer": "none", "metadata": {"category": "원피스"}}
+    cleaned = postprocess_analysis(raw, "원피스 보여줘")
+    assert cleaned["metadata"]["category"] is None
+    assert not _said_conditions(cleaned)  # 목록 밖 값만 말했으면 조건을 말한 턴이 아니다
+    merged = _merge_conditions({"category": "셔츠"}, cleaned["metadata"], None)
+    assert merged["category"] == "셔츠"
+
+
+def test_allowed_category_passes():
+    from app.chat.graph.nodes import postprocess_analysis
+
+    cleaned = postprocess_analysis({"metadata": {"category": "하의"}}, "하의 보여줘")
+    assert cleaned["metadata"]["category"] == "하의"
