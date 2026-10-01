@@ -24,7 +24,22 @@ def test_filter_values_are_ten():
     assert len(vocab.CATEGORY_GROUPS) == 10
     # '기타'는 상품 정리용이라 사용자 발화에서 고르게 하지 않는다
     assert "기타" not in vocab.ALLOWED_CATEGORIES
-    assert len(vocab.ALLOWED_CATEGORIES) == 9
+    # 세부 9종 + 넓은 값 "상의"/"하의"
+    assert len(vocab.ALLOWED_CATEGORIES) == 11
+
+
+def test_broad_categories_cover_every_non_outer_group_once():
+    grouped = [g for groups in vocab.BROAD_CATEGORIES.values() for g in groups]
+    assert len(set(grouped)) == len(grouped)
+    assert set(grouped) == set(vocab.CATEGORY_GROUPS) - {"아우터", "기타"}
+
+
+def test_category_sources_expands_broad_and_keeps_detail():
+    assert vocab.category_sources("셔츠") == vocab.CATEGORY_GROUPS["셔츠"]
+    assert set(vocab.category_sources("하의")) == {
+        *vocab.CATEGORY_GROUPS["팬츠"], *vocab.CATEGORY_GROUPS["데님"], *vocab.CATEGORY_GROUPS["쇼츠"]
+    }
+    assert vocab.category_sources("없는 값") == []
 
 
 @pytest.mark.parametrize(

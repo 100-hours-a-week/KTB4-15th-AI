@@ -143,7 +143,6 @@ def no_external_network(monkeypatch):
         raise AssertionError("외부 HTTP 요청이 시도되었다")
 
     monkeypatch.setattr("app.virtual_fitting.providers.runware.urlopen", forbidden)
-    monkeypatch.setattr("app.virtual_fitting.providers.pruna.urlopen", forbidden)
     monkeypatch.setattr("app.virtual_fitting.providers.runware_comment.urlopen", forbidden)
 
 
