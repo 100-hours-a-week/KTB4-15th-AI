@@ -88,6 +88,7 @@ recommendation.recommend_from_wishlist = fake_recommend_from_wishlist
 if __name__ == "__main__":
     import uvicorn
 
+    from app.config.logging_config import LOGGING_CONFIG
     from app.main import app
 
     search_mode = "실제 DB" if REAL_SEARCH else "가짜 데이터"
@@ -98,4 +99,4 @@ if __name__ == "__main__":
     if not os.environ.get("OPENAI_API_KEY"):
         print("[dev] OPENAI_API_KEY 가 없습니다. 찜 추천 경로만 끝까지 동작합니다.")
 
-    uvicorn.run(app, host=settings.HOST, port=settings.PORT)
+    uvicorn.run(app, host=settings.HOST, port=settings.PORT, log_config=LOGGING_CONFIG)
