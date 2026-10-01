@@ -16,12 +16,17 @@ from app.chat.graph import build_graph
 from app.config import settings
 from app.config.checkpointer import checkpointer_scope
 from app.config.database import close_async_pool, close_connection_pool, open_async_pool
+from app.config.logging_config import LOGGING_CONFIG, configure_logging
 from app.errors import register_error_handlers
 from app.virtual_fitting import router as virtual_fitting_router
 from app.virtual_fitting.providers.runware import (
     get_runware_llm_api_key,
     get_runware_vton_api_key,
 )
+
+# 컨테이너 CMD(`uvicorn app.main:app`)는 log_config 를 넘기지 않는다. uvicorn 은 이 모듈을
+# import 한 뒤에 "Started server process" 를 찍으므로, 여기서 적용하면 서버 로그부터 포맷이 맞는다.
+configure_logging()
 
 
 @asynccontextmanager
@@ -61,6 +66,7 @@ def run() -> None:
         host=settings.HOST,
         port=settings.PORT,
         reload=settings.RELOAD,
+        log_config=LOGGING_CONFIG,
     )
 
 
