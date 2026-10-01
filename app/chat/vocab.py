@@ -83,7 +83,28 @@ CATEGORY_GROUPS: dict[str, list[str]] = {
     "기타": [],
 }
 
-ALLOWED_CATEGORIES: list[str] = [name for name in CATEGORY_GROUPS if name != "기타"]
+# 사용자가 세부 종류 대신 "상의"/"하의"라고 말할 때 쓰는 넓은 값 (2026-09-30 QA "검정 상의").
+# DB 의 main_category 는 아우터까지 상의로 묶으므로 쓰지 않고, 세부 카테고리를 모아 거른다.
+# CATEGORY_GROUPS 에 넣지 않는 이유: 상품 → 필터값 역방향 표(normalize_category)가 겹쳐 깨진다.
+BROAD_CATEGORIES: dict[str, list[str]] = {
+    "상의": ["티셔츠", "셔츠", "스웨트/후디", "니트", "카디건"],
+    "하의": ["팬츠", "데님", "쇼츠"],
+}
+
+ALLOWED_CATEGORIES: list[str] = [
+    *(name for name in CATEGORY_GROUPS if name != "기타"),
+    *BROAD_CATEGORIES,
+]
+
+
+def category_sources(name: str) -> list[str]:
+    """필터값을 DB 의 sub_category 목록으로 펼친다. "상의" 는 묶인 종류들의 세부 카테고리 전부다.
+
+    모르는 이름은 [] 를 돌려준다. 그때 build_query 는 카테고리 조건을 빼고 검색한다.
+    """
+    # 넓은 값이 아니면("셔츠", "아우터") 자기 자신 하나짜리 묶음으로 본다
+    groups = BROAD_CATEGORIES.get(name, [name])
+    return [source for group in groups for source in CATEGORY_GROUPS.get(group, [])]
 
 # 가상피팅은 상의(TOP)와 하의(BOTTOM)만 받는다 (단계1 §6).
 #
@@ -99,6 +120,8 @@ FITTING_MAIN_CATEGORY: dict[str, str] = {
     "팬츠": "BOTTOM",
     "데님": "BOTTOM",
     "쇼츠": "BOTTOM",
+    "상의": "TOP",
+    "하의": "BOTTOM",
 }
 
 # 사용자가 분위기를 말하지 않아 semantic_query 가 비었을 때 대신 쓸 표현.
@@ -113,6 +136,8 @@ CATEGORY_QUERY_PHRASE: dict[str, str] = {
     "데님": "데님 팬츠",
     "쇼츠": "반바지",
     "아우터": "아우터",
+    "상의": "상의",
+    "하의": "하의",
 }
 
 # 필터로 거를 수 있는 필드. dislikes 중 이 목록 밖의 항목은 검색에 쓰이지 않는다((ㄱ) 결정).

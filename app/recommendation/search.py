@@ -25,9 +25,6 @@ from app.config.database import get_async_pool
 
 from .types import ITEM_TYPES, Product, RecommendationError
 
-# 색 조건이 있을 때 서브 일치(로고·배색으로만 겹침)에 내주는 자리 수.
-SUB_COLOR_SLOTS = 1
-
 _COLUMNS = (
     "product_code, product_name, image_url, detail_url, color, price, main_category, "
     "description_summary"
@@ -45,7 +42,7 @@ def build_query(
 ) -> tuple[str, dict]:
     """조건을 SQL 한 벌로 만든다. 값은 전부 파라미터로 넘기고 문자열에 끼워 넣지 않는다.
 
-    메인 일치와 서브 일치를 각각 거리순으로 top_k 개까지 가져온다. 몇 개씩 쓸지는
+    메인 일치와 서브 일치를 각각 거리순으로 top_k 개까지 가져온다. 무엇을 쓸지는
     apply_color_quota 가 정한다.
     """
     where = ["embedding IS NOT NULL"]
@@ -54,9 +51,11 @@ def build_query(
     if color:
         where.append("colors && ARRAY[%(color)s]::text[]")
         params["color"] = color
-    if category:
+    # 모르는 이름(운영 대화에 남은 옛 이름 등)은 카테고리 조건을 빼고 검색한다 (2026-10-01 결정)
+    category_sources = vocab.category_sources(category) if category else []
+    if category_sources:
         where.append("sub_category = ANY(%(category_sources)s)")
-        params["category_sources"] = vocab.CATEGORY_GROUPS.get(category, [])
+        params["category_sources"] = category_sources
     if min_price is not None:
         where.append("price >= %(min_price)s")
         params["min_price"] = min_price
@@ -75,7 +74,7 @@ def build_query(
         key = f"dislike_category_{index}"
         # sub_category 는 NOT NULL 이라 여기서는 unknown 이 생기지 않는다
         where.append(f"NOT (sub_category = ANY(%({key})s))")
-        params[key] = vocab.CATEGORY_GROUPS.get(value, [])
+        params[key] = vocab.category_sources(value)
 
     # 색 조건이 없으면 전부 한 무리(메인)로 본다
     is_main = "color IS NOT DISTINCT FROM %(color)s" if color else "TRUE"
@@ -99,18 +98,19 @@ SELECT {_COLUMNS}, is_main, distance
     return sql, params
 
 
-# sabu: 쿼터의 경계 — top_k 가 SUB_COLOR_SLOTS 이하(예: 1)이면 메인 자리는 몇 개가 되고,
-#       메인 일치가 충분히 있는데도 서브 일치 하나만 나가는 게 "메인 우선" 결정과 맞나?
-def apply_color_quota(rows: list[dict], *, top_k: int, color_given: bool) -> list[dict]:
-    """거리순으로 정렬된 후보에서 최종 top_k 를 고른다.
+def apply_color_quota(rows: list[dict], *, top_k: int) -> list[dict]:
+    """거리순으로 정렬된 후보에서 최종 top_k 를 고른다. 메인 일치를 먼저 채우고, 모자랄 때만 서브 일치로 채운다.
+
+    2026-09-30 결정: QA "검정 상의"에서 사용자는 메인 색이 그 색인 상품만 기대했다.
+    서브 일치(로고·배색으로만 겹침)는 메인 일치가 바닥났을 때 0건을 줄이는 용도다.
+    (이전 2026-09-23 결정은 메인 2 + 서브 1, 반대편에서 당겨 채우지 않음.)
 
     rows 는 메인 → 서브, 각 무리 안에서는 거리순이어야 한다 (build_query 의 ORDER BY).
+    색 조건이 없으면 전부 메인이다.
     """
-    if not color_given:
-        return rows[:top_k]
     main = [row for row in rows if row["is_main"]]
-    sub = [row for row in rows if not row["is_main"]][:SUB_COLOR_SLOTS]
-    return main[: top_k - len(sub)] + sub
+    sub = [row for row in rows if not row["is_main"]]
+    return (main + sub)[:top_k]
 
 
 # sabu: 목록 밖 대분류 — main_category 에 "상의"/"하의" 말고 다른 값(예: 나중에 분리할 "아우터")이
@@ -173,5 +173,5 @@ async def search_products(
     except (LLMError, psycopg.Error) as error:
         raise RecommendationError(f"상품 검색에 실패했습니다: {error}") from error
 
-    picked = apply_color_quota(rows, top_k=top_k, color_given=bool(color))
+    picked = apply_color_quota(rows, top_k=top_k)
     return [_to_product(row) for row in picked]
