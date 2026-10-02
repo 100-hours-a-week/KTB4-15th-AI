@@ -59,7 +59,9 @@ def postprocess_analysis(raw: dict, message: str) -> dict:
 
     기타/bench_analyze_route.py 도 이 함수를 불러 서비스와 같은 조건 판정을 잰다.
     """
-    return _drop_unknown_category(_apply_price_rule(raw, message))
+    raw = _drop_unknown_category(_apply_price_rule(raw, message))
+    # 목록 밖 필드의 제외 조건(가격 등)은 상태에 넣지 않고, 조건을 말한 턴으로도 세지 않는다
+    return {**raw, "dislikes": vocab.known_dislikes(raw.get("dislikes"))}
 
 
 def _drop_unknown_category(raw: dict) -> dict:
