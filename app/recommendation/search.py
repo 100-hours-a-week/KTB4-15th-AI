@@ -130,8 +130,6 @@ def _to_product(row: dict) -> Product:
 
 # sabu: 빈 질의 — nodes._search_query 는 조건도 분위기도 없는 턴에 "" 를 돌려준다(테스트가 그걸 지킨다).
 #       그 "" 가 여기 오면 임베딩 API 는 무엇을 하고, 사용자는 무엇을 보게 되나?
-# sabu: 가격 제외 — FILTERABLE_FIELDS 에 max_price 가 있어서 {"field": "max_price", ...} 인 dislike 가
-#       여기까지 넘어온다. 그런데 "가격이 싫다"는 무슨 조건인가? 지금 코드는 그걸 어떻게 처리하고 있나?
 # sabu: 품절 — 단계3 은 품절 상태를 metadata filter 로 적어 두었는데, 이 쿼리는 is_sold_out 을 보나?
 async def search_products(
     *,

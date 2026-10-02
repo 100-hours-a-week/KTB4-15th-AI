@@ -140,8 +140,19 @@ CATEGORY_QUERY_PHRASE: dict[str, str] = {
     "하의": "하의",
 }
 
+# 제외 조건으로 받는 필드 (analyze 규칙 5). 이 밖의 필드는 입구(postprocess_analysis)와
+# 출구(summarize_prompt)에서 지운다. style 은 받지만 필터로는 쓰지 않는다.
+DISLIKE_FIELDS = ("color", "category", "style")
+
+
+def known_dislikes(dislikes: list[dict] | None) -> list[dict]:
+    """DISLIKE_FIELDS 밖의 제외 조건을 뺀다. 운영에 저장된 옛 대화의 {"field": "max_price"} 등."""
+    return [item for item in dislikes or [] if item.get("field") in DISLIKE_FIELDS]
+
+
 # 필터로 거를 수 있는 필드. dislikes 중 이 목록 밖의 항목은 검색에 쓰이지 않는다((ㄱ) 결정).
-FILTERABLE_FIELDS = ("color", "category", "max_price")
+# 가격은 제외 조건으로 받지 않는다. 다른 가격대는 이하·이상·범위로 다시 말하면 price 규칙이 덮어쓴다 (2026-10-02).
+FILTERABLE_FIELDS = ("color", "category")
 
 _CATEGORY_BY_SOURCE = {
     source: name for name, sources in CATEGORY_GROUPS.items() for source in sources

@@ -67,3 +67,20 @@ def test_allowed_category_passes():
 
     cleaned = postprocess_analysis({"metadata": {"category": "하의"}}, "하의 보여줘")
     assert cleaned["metadata"]["category"] == "하의"
+
+
+def test_price_dislike_is_dropped_at_the_entrance():
+    from app.chat.graph.nodes import _said_conditions, postprocess_analysis
+
+    raw = {"answer": "yes", "metadata": {}, "dislikes": [{"field": "max_price", "value": 59999}]}
+    cleaned = postprocess_analysis(raw, "응")
+    assert cleaned["dislikes"] == []
+    assert not _said_conditions(cleaned)  # "응" 이 다시 요약으로 가지 않고 search 로 간다
+
+
+def test_allowed_dislikes_pass_the_entrance():
+    from app.chat.graph.nodes import postprocess_analysis
+
+    dislikes = [{"field": "color", "value": "레드"}, {"field": "style", "value": "오버핏"}]
+    cleaned = postprocess_analysis({"metadata": {}, "dislikes": dislikes}, "빨간색이랑 오버핏은 싫어")
+    assert cleaned["dislikes"] == dislikes
