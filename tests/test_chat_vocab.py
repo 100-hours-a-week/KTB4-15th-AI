@@ -89,3 +89,8 @@ def test_source_values_match_the_bench_vocabulary():
     bench = json.loads(path.read_text())
     ours = {s for values in vocab.CATEGORY_GROUPS.values() for s in values}
     assert ours == set(bench["카테고리"])
+
+
+def test_price_is_not_a_dislike_filter():
+    # 가격은 이하·이상·범위로 다시 말하면 덮어쓴다. "가격이 싫다"는 조건으로 받지 않는다
+    assert vocab.FILTERABLE_FIELDS == ("color", "category")

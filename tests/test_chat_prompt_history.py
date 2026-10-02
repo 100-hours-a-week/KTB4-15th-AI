@@ -39,3 +39,20 @@ def test_only_recent_recommendations_are_kept():
 def test_plain_conversation_is_never_dropped():
     messages = [{"role": "user", "content": f"{i}번째 말"} for i in range(20)]
     assert len(history_for_prompt(messages)) == 20
+
+
+def test_summary_hides_stored_price_dislike():
+    """운영에 저장된 옛 대화의 가격 제외 조건은 요약에 넘기지 않는다."""
+    from app.chat.graph.prompts import summarize_prompt
+
+    state = {
+        "conditions": {
+            "category": "상의",
+            "dislikes": [{"field": "max_price", "value": 59999}, {"field": "color", "value": "레드"}],
+        },
+        "semantic_query": "",
+    }
+    content = summarize_prompt(state)[1]["content"]
+    assert "59999" not in content
+    assert "레드" in content
+    assert state["conditions"]["dislikes"][0]["field"] == "max_price"  # 상태는 건드리지 않는다

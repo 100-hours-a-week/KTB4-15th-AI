@@ -36,7 +36,7 @@ _ANALYZE_RULES = """너는 패션 쇼핑 대화의 한 턴을 해석한다.
    목록에 없는 색이면 null 로 둔다.
 4. category 는 다음 목록의 값만 쓴다: {categories}
    목록이 비어 있거나 해당하는 값이 없으면 null 로 둔다.
-5. 싫다고 말한 것은 dislikes 에 넣는다. field 는 color, category, max_price, style 중 하나다.
+5. 싫다고 말한 것은 dislikes 에 넣는다. field 는 {dislike_fields} 중 하나다.
 6. semantic_query 는 색상·가격·카테고리를 빼고, 상황·분위기·핏 같은 말만 담은 한 문장이다.
    사용자가 이번 턴에 상황·분위기·핏을 말하지 않았으면 빈 문자열로 둔다. 요청을 요약하거나 지어내지 않는다.
 
@@ -68,6 +68,7 @@ def analyze_prompt(state: dict, message: str) -> list[dict]:
         answers=", ".join(ANSWERS),
         colors=", ".join(vocab.ALLOWED_COLORS),
         categories=", ".join(vocab.ALLOWED_CATEGORIES) or "(아직 정해지지 않음)",
+        dislike_fields=", ".join(vocab.DISLIKE_FIELDS),
     )
     context = {
         "누적 조건": state.get("conditions", {}),
@@ -104,6 +105,10 @@ def chat_prompt(state: dict) -> list[dict]:
 
 
 def summarize_prompt(state: dict) -> list[dict]:
+    # 출구: 운영에 저장된 옛 대화에 남은 목록 밖 제외 조건(가격 등)은 요약에 넘기지 않는다
+    conditions = dict(state.get("conditions", {}))
+    if "dislikes" in conditions:
+        conditions["dislikes"] = vocab.known_dislikes(conditions["dislikes"])
     return [
         {
             "role": "system",
@@ -115,7 +120,7 @@ def summarize_prompt(state: dict) -> list[dict]:
         },
         {
             "role": "user",
-            "content": f"조건: {state.get('conditions', {})}\n분위기: {state.get('semantic_query', '')}",
+            "content": f"조건: {conditions}\n분위기: {state.get('semantic_query', '')}",
         },
     ]
 
