@@ -5,12 +5,13 @@ Backend 는 user_image_url 과 product_code 만 보낸다. 카테고리와 이�
 """
 
 import logging
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import AbstractContextManager, asynccontextmanager, contextmanager
 from datetime import timedelta
 
 import psycopg
-from fastapi import APIRouter, Depends, status
+from anyio import to_thread
+from fastapi import APIRouter, Depends, Request, status
 
 from app.clients.s3 import S3ConfigError, S3ImageStorage
 from app.config import settings
@@ -43,6 +44,7 @@ router = APIRouter(
         status.HTTP_402_PAYMENT_REQUIRED: {"model": ApiResponse},
         status.HTTP_404_NOT_FOUND: {"model": ApiResponse},
         status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ApiResponse},
+        status.HTTP_429_TOO_MANY_REQUESTS: {"model": ApiResponse},
         status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": ApiResponse},
         status.HTTP_502_BAD_GATEWAY: {"model": ApiResponse},
         status.HTTP_504_GATEWAY_TIMEOUT: {"model": ApiResponse},
@@ -75,19 +77,39 @@ def open_virtual_fitting_service() -> Iterator[VirtualFittingService]:
     )
 
 
-# Service 가 동기 HTTP(urllib)와 동기 DB(psycopg)를 쓰므로 async def 가 아니라 def 로 둔다.
-# FastAPI 가 threadpool 에서 실행해 최대 60초 걸리는 호출이 이벤트 루프(chat SSE)를 막지 않는다.
-#
-# sabu: 관측 — fitting_balance_exhausted(402) 는 아래 분기에서 로그가 남는가? message 를 나눈 목적이
-#       "누가 대응해야 하는지 구분"이었다면, 잔액 소진을 사람이 알게 되는 경로는 어디인가?
-@router.post("/api/v1/sync-fitting", response_model=SyncFittingResponse)
-def sync_fitting(request: SyncFittingRequest):
+@asynccontextmanager
+async def _open_in_thread[T](context: AbstractContextManager[T]) -> AsyncIterator[T]:
+    """동기 context manager 의 진입·종료를 worker thread 에서 한다.
+
+    Service 조립은 DB pool 과 boto3 client 를 만들 수 있어 blocking 이다. 이벤트 루프에서 하지 않는다.
+    """
+    value = await to_thread.run_sync(context.__enter__)
     try:
-        with open_virtual_fitting_service() as service:
-            return controller.sync_fit(service, request)
+        yield value
+    except BaseException as error:
+        if not await to_thread.run_sync(
+            context.__exit__, type(error), error, error.__traceback__
+        ):
+            raise
+    else:
+        await to_thread.run_sync(context.__exit__, None, None, None)
+
+
+# async def 다. 동기 단계(DB·urllib·boto3)는 Service 가 하나씩 worker thread 로 넘기고, VTON / LLM
+# 슬롯 대기는 이벤트 루프에서 한다. 그래서 슬롯을 기다리는 요청은 worker thread 를 잡지 않는다.
+# Backend 입장에서는 이전과 같은 동기 API 다 — 연결을 유지한 채 최종 결과를 같은 응답으로 받는다.
+@router.post("/api/v1/sync-fitting", response_model=SyncFittingResponse)
+async def sync_fitting(request: SyncFittingRequest, http_request: Request):
+    try:
+        async with _open_in_thread(open_virtual_fitting_service()) as service:
+            return await controller.sync_fit(
+                service, request, http_request.app.state.fitting_limiters
+            )
     except VirtualFittingError as error:
         if error.status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
             logger.exception("sync-fitting failed: %s", error.code)
+        elif error.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            logger.warning("sync-fitting rejected: %s", error.code)
         return error_response(error.status_code, error.code, error.message)
     except S3ConfigError:
         # S3ImageStorage() 는 Service 조립 단계에서 만들어지므로 외부 가상피팅 API 를 부르기 전에

@@ -199,7 +199,8 @@ def test_comment_system_prompt_is_sent_as_the_system_message():
     assert payload["messages"][0] == {"role": "system", "content": COMMENT_SYSTEM_PROMPT}
     assert "이미지" in COMMENT_SYSTEM_PROMPT and "보조 근거" in COMMENT_SYSTEM_PROMPT
     assert "확인되지 않는" in COMMENT_SYSTEM_PROMPT and "과장" in COMMENT_SYSTEM_PROMPT
-    assert "1~2문장" in COMMENT_SYSTEM_PROMPT
+    assert "정확히 2개의 짧은 문장" in COMMENT_SYSTEM_PROMPT
+    assert "각 문장은 한 줄에 하나씩" in COMMENT_SYSTEM_PROMPT
 
 
 # --- title request ---

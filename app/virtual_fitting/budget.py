@@ -1,6 +1,6 @@
 """가상피팅 하루 사용액 상한 (2026-09-28 결정).
 
-  ① try_on 전 : 오늘 합계가 상한에 닿았으면 402 fitting_daily_budget_exceeded 로 막는다.
+  ① try_on 전 : 오늘 합계가 상한에 닿았으면 402 FITTING_DAILY_BUDGET_EXCEEDED 로 막는다.
                 마지막 보정이 FITTING_USAGE_RECONCILE_SECONDS 보다 오래됐으면 먼저 보정한다.
   ③ try_on 후 : Runware 가 알려준 이 호출의 금액(includeCost)을 오늘 합계에 더한다.
 

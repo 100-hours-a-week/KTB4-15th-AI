@@ -103,7 +103,10 @@ def test_reaching_the_limit_is_rejected_with_402():
         _budget(FakeUsageRepository("5")).ensure_available()
 
     assert caught.value.status_code == 402
-    assert caught.value.message == "fitting_daily_budget_exceeded"
+    assert caught.value.code == "FITTING_DAILY_BUDGET_EXCEEDED"
+    assert caught.value.message == (
+        "오늘 사용할 수 있는 가상 피팅 한도를 초과했습니다. 내일 다시 시도해주세요."
+    )
 
 
 @pytest.mark.parametrize(
@@ -280,7 +283,10 @@ def test_runware_402_is_balance_exhausted_not_a_model_failure():
         )
 
     assert caught.value.status_code == 402
-    assert caught.value.message == "fitting_balance_exhausted"
+    assert caught.value.code == "FITTING_BALANCE_EXHAUSTED"
+    assert caught.value.message == (
+        "현재 가상 피팅 서비스를 이용할 수 없습니다. 잠시 후 다시 시도해주세요."
+    )
 
 
 def test_usage_payload_is_one_utc_day_of_the_fitting_model_only():
