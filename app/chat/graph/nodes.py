@@ -25,6 +25,10 @@ def _merge_conditions(current: dict, metadata: dict | None, dislikes: list | Non
         for item in dislikes:
             if item not in existing:
                 existing.append(item)
+            # 앞 턴에 저장된 포함 조건과 같은 값을 이번 턴에 빼 달라고 하면 포함 조건을 지운다.
+            # 남겨 두면 "데님이면서 데님이 아닌 것"을 찾아 0건이 된다 (2026-10-02)
+            if merged.get(item.get("field")) == item.get("value"):
+                del merged[item["field"]]
         merged["dislikes"] = existing
 
     # sabu: 조건 병합 — 사용자가 "아 빨간색도 괜찮아"라고 번복하면 dislikes 에서 어떻게 빠지지?
@@ -61,7 +65,22 @@ def postprocess_analysis(raw: dict, message: str) -> dict:
     """
     raw = _drop_unknown_category(_apply_price_rule(raw, message))
     # 목록 밖 필드의 제외 조건(가격 등)은 상태에 넣지 않고, 조건을 말한 턴으로도 세지 않는다
-    return {**raw, "dislikes": vocab.known_dislikes(raw.get("dislikes"))}
+    raw = {**raw, "dislikes": vocab.known_dislikes(raw.get("dislikes"))}
+    return _drop_included_dislikes(raw)
+
+
+def _drop_included_dislikes(raw: dict) -> dict:
+    """같은 턴에 같은 값이 포함과 제외에 둘 다 있으면 제외를 믿고 포함 쪽을 null 로 바꾼다.
+
+    "데님은 빼고" 를 LLM 이 category=데님 + 제외 데님 으로 함께 내는 경우(2026-10-02 운영, 재현 2/4).
+    제외로 나왔다는 것은 부정 표현이 있었다는 뜻이다. null 은 병합에서 무시되므로 앞 턴 값이 남는다.
+    """
+    metadata = dict(raw.get("metadata") or {})
+    for item in raw.get("dislikes") or []:
+        field = item.get("field")
+        if field in ("color", "category") and metadata.get(field) == item.get("value"):
+            metadata[field] = None
+    return {**raw, "metadata": metadata}
 
 
 def _drop_unknown_category(raw: dict) -> dict:
