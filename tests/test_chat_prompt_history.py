@@ -50,9 +50,18 @@ def test_summary_hides_stored_price_dislike():
             "category": "상의",
             "dislikes": [{"field": "max_price", "value": 59999}, {"field": "color", "value": "레드"}],
         },
-        "semantic_query": "",
     }
     content = summarize_prompt(state)[1]["content"]
     assert "59999" not in content
     assert "레드" in content
     assert state["conditions"]["dislikes"][0]["field"] == "max_price"  # 상태는 건드리지 않는다
+
+
+def test_summary_labels_detail_and_mood_separately():
+    """세부 카테고리를 "분위기"라고 부르지 않는다 (QA 3번 "분위기는 상의입니다")."""
+    from app.chat.graph.prompts import summarize_prompt
+
+    state = {"conditions": {"category": "아우터"}, "detail_category": "자켓", "mood": "데이트"}
+    content = summarize_prompt(state)[1]["content"]
+    assert "세부 카테고리: 자켓" in content
+    assert "분위기: 데이트" in content

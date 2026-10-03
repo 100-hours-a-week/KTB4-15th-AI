@@ -37,18 +37,19 @@ _ANALYZE_RULES = """너는 패션 쇼핑 대화의 한 턴을 해석한다.
 4. category 는 다음 목록의 값만 쓴다: {categories}
    목록이 비어 있거나 해당하는 값이 없으면 null 로 둔다.
 5. 싫다고 말한 것은 dislikes 에 넣는다. field 는 {dislike_fields} 중 하나다.
-6. semantic_query 는 색상·가격·카테고리를 빼고, 상황·분위기·핏 같은 말만 담은 한 문장이다.
-   사용자가 이번 턴에 상황·분위기·핏을 말하지 않았으면 빈 문자열로 둔다. 요청을 요약하거나 지어내지 않는다.
+6. detail_category 는 옷의 세부 종류·핏·소재를 말한 표현이다(자켓, 슬랙스, 와이드, 데님 등). 색상·가격·분위기는 넣지 않는다.
+7. mood 는 상황·분위기·스타일을 말한 표현이다(데이트, 출근, 미니멀, 스트릿, MZ 등). 색상·가격·옷 종류는 넣지 않는다.
+   detail_category 와 mood 는 사용자가 이번 턴에 말하지 않았으면 빈 문자열로 둔다. 요청을 요약하거나 지어내지 않는다.
 
 JSON만 출력한다:
 {{"answer": "...", "metadata": {{"color": null, "category": null}},
-  "dislikes": [{{"field": "color", "value": "레드"}}], "semantic_query": "..."}}"""
+  "dislikes": [{{"field": "color", "value": "레드"}}], "detail_category": "...", "mood": "..."}}"""
 
 _ANSWER_MEANING = """answer 의 뜻:
 - yes: 봇의 질문에 동의한다 (요약한 조건으로 진행, 이전 조건 그대로 진행)
 - no: 거절한다. 또는 무엇을 바꿀지 묻는 질문에 바꿀 것을 말하지 못한다
 - none: 봇의 질문과 상관없는 말이다. 봇이 묻고 있는 것이 없으면 항상 none 이다
-조건을 말했는지는 answer 로 나타내지 않는다. 조건은 metadata·dislikes·semantic_query 에만 담는다."""
+조건을 말했는지는 answer 로 나타내지 않는다. 조건은 metadata·dislikes·detail_category·mood 에만 담는다."""
 
 # pending_question 별로 analyze 에게 알려줄 직전 상황
 _PENDING_CONTEXT = {
@@ -120,7 +121,11 @@ def summarize_prompt(state: dict) -> list[dict]:
         },
         {
             "role": "user",
-            "content": f"조건: {conditions}\n분위기: {state.get('semantic_query', '')}",
+            "content": (
+                f"조건: {conditions}\n"
+                f"세부 카테고리: {state.get('detail_category', '')}\n"
+                f"분위기: {state.get('mood', '')}"
+            ),
         },
     ]
 
