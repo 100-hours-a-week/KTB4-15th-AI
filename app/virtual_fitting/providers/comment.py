@@ -3,8 +3,8 @@
 from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
-MOCK_COMMENT = "Mock 코멘트: 선택한 상품이 자연스럽게 어우러지는 코디입니다."
-MOCK_TITLE = "Mock 제목"
+MOCK_COMMENT = "선택한 상품이 자연스럽게 어우러지는 코디입니다."
+MOCK_TITLE = "가상피팅 결과 코디"
 
 
 @runtime_checkable
