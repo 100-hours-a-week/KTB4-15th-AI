@@ -31,7 +31,7 @@ ALLOWED_COLORS: list[str] = list(COLOR_GROUPS)
 # 않고, 모델이 고르게 하면 정확도가 68% 였다. 사용자도 "셔츠" 까지만 말하지
 # "반소매 셔츠" 라고 말하지 않는다.
 #
-# 세부 구분(오버핏·와이드·데님 워싱 등)은 필터가 아니라 semantic_query 와 이미지 설명
+# 세부 구분(오버핏·와이드·데님 워싱 등)은 필터가 아니라 detail_category(검색 질의)와 이미지 설명
 # 임베딩이 맡는다. 필터는 완전일치라 값이 잘게 쪼개질수록 0건이 늘어난다(단계5 §5.1).
 CATEGORY_GROUPS: dict[str, list[str]] = {
     "티셔츠": ["반소매 티셔츠", "긴소매 티셔츠", "슬리브리스", "피케/카라 티셔츠"],
@@ -124,8 +124,26 @@ FITTING_MAIN_CATEGORY: dict[str, str] = {
     "하의": "BOTTOM",
 }
 
-# 사용자가 분위기를 말하지 않아 semantic_query 가 비었을 때 대신 쓸 표현.
-# 빈 문자열을 임베딩하면 의미 없는 벡터가 나와 유사도 순위가 아무 근거 없이 정해진다.
+# 세부 카테고리도 분위기도 말하지 않았을 때 검색 질의로 대신 쓸 카테고리 문구.
+# 사용자 표기 → 상품 설명 표기. 임베딩은 설명 문장으로 만들어서 표기가 다르면 잘 찾지 못한다.
+# 설명 3000개 기준(2026-10-03): 자켓 0 / 재킷 259, 후드티 4 / 후디 271, 가디건 3 / 카디건 60, 스웨터 7 / 니트 723.
+# 맨투맨(48)·청바지(41)·반바지(42)는 설명에도 꽤 있어 넣지 않았다.
+CATALOG_SPELLING: dict[str, str] = {
+    "자켓": "재킷",
+    "쟈켓": "재킷",
+    "후드티": "후디",
+    "가디건": "카디건",
+    "스웨터": "니트",
+}
+
+
+def to_catalog_spelling(text: str) -> str:
+    """검색 질의의 사용자 표기를 상품 설명 표기로 바꾼다. 긴 표기부터 바꾼다."""
+    for user_word in sorted(CATALOG_SPELLING, key=len, reverse=True):
+        text = text.replace(user_word, CATALOG_SPELLING[user_word])
+    return text
+
+
 CATEGORY_QUERY_PHRASE: dict[str, str] = {
     "티셔츠": "티셔츠",
     "셔츠": "셔츠",

@@ -25,6 +25,10 @@ def _merge_conditions(current: dict, metadata: dict | None, dislikes: list | Non
         for item in dislikes:
             if item not in existing:
                 existing.append(item)
+            # 앞 턴에 저장된 포함 조건과 같은 값을 이번 턴에 빼 달라고 하면 포함 조건을 지운다.
+            # 남겨 두면 "데님이면서 데님이 아닌 것"을 찾아 0건이 된다 (2026-10-02)
+            if merged.get(item.get("field")) == item.get("value"):
+                del merged[item["field"]]
         merged["dislikes"] = existing
 
     # sabu: 조건 병합 — 사용자가 "아 빨간색도 괜찮아"라고 번복하면 dislikes 에서 어떻게 빠지지?
@@ -61,7 +65,22 @@ def postprocess_analysis(raw: dict, message: str) -> dict:
     """
     raw = _drop_unknown_category(_apply_price_rule(raw, message))
     # 목록 밖 필드의 제외 조건(가격 등)은 상태에 넣지 않고, 조건을 말한 턴으로도 세지 않는다
-    return {**raw, "dislikes": vocab.known_dislikes(raw.get("dislikes"))}
+    raw = {**raw, "dislikes": vocab.known_dislikes(raw.get("dislikes"))}
+    return _drop_included_dislikes(raw)
+
+
+def _drop_included_dislikes(raw: dict) -> dict:
+    """같은 턴에 같은 값이 포함과 제외에 둘 다 있으면 제외를 믿고 포함 쪽을 null 로 바꾼다.
+
+    "데님은 빼고" 를 LLM 이 category=데님 + 제외 데님 으로 함께 내는 경우(2026-10-02 운영, 재현 2/4).
+    제외로 나왔다는 것은 부정 표현이 있었다는 뜻이다. null 은 병합에서 무시되므로 앞 턴 값이 남는다.
+    """
+    metadata = dict(raw.get("metadata") or {})
+    for item in raw.get("dislikes") or []:
+        field = item.get("field")
+        if field in ("color", "category") and metadata.get(field) == item.get("value"):
+            metadata[field] = None
+    return {**raw, "metadata": metadata}
 
 
 def _drop_unknown_category(raw: dict) -> dict:
@@ -94,11 +113,12 @@ def _said_conditions(raw: dict) -> bool:
     return (
         any(value is not None for value in metadata.values())
         or bool(raw.get("dislikes"))
-        or bool((raw.get("semantic_query") or "").strip())
+        or bool((raw.get("detail_category") or "").strip())
+        or bool((raw.get("mood") or "").strip())
     )
 
 
-# sabu: 조건의 기준 — 규칙 6 은 LLM 이 semantic_query 를 지어낼 확률만 낮춘다. 지어낸 값을 코드가 걸러내려면
+# sabu: 조건의 기준 — 규칙 7 은 LLM 이 detail_category·mood 를 지어낼 확률만 낮춘다. 지어낸 값을 코드가 걸러내려면
 #       무엇과 무엇을 대조하면 되지? "MZ" 처럼 짧은 분위기 말은 그 대조를 어떻게 통과하지?
 async def analyze(state: dict) -> dict:
     """봇이 물어 둔 질문에 대한 답(answer)과 이번 턴에 말한 조건을 뽑는다. LLM 1회.
@@ -116,14 +136,37 @@ async def analyze(state: dict) -> dict:
     conditions = _merge_conditions(
         state.get("conditions", {}), raw.get("metadata"), raw.get("dislikes")
     )
-    semantic_query = raw.get("semantic_query") or state.get("semantic_query", "")
+    detail_category, mood = _merge_query_words(state, raw, conditions)
 
     return {
         "answer": raw.get("answer"),
         "said_conditions": _said_conditions(raw),
         "conditions": conditions,
-        "semantic_query": semantic_query,
+        "detail_category": detail_category,
+        "mood": mood,
     }
+
+
+def _merge_query_words(state: dict, raw: dict, conditions: dict) -> tuple[str, str]:
+    """검색 질의 재료 두 칸을 이번 턴 값으로 갱신한다 (2026-10-03 결정).
+
+    - detail_category(세부 종류·핏·소재): 새로 말하면 덮어쓴다. category 가 바뀌면 지운다.
+      "와이드 팬츠" 를 보다가 "셔츠도" 라고 하면 와이드는 셔츠로 이어지지 않는다.
+    - mood(상황·분위기): 새로 말하면 덮어쓴다. category 가 바뀌어도 유지한다.
+    """
+    new_detail = (raw.get("detail_category") or "").strip()
+    new_mood = (raw.get("mood") or "").strip()
+    category_changed = conditions.get("category") != state.get("conditions", {}).get("category")
+
+    if new_detail:
+        detail_category = new_detail
+    elif category_changed:
+        detail_category = ""
+    else:
+        detail_category = state.get("detail_category", "")
+
+    mood = new_mood or state.get("mood", "")
+    return detail_category, mood
 
 
 async def _stream_reply(messages: list[dict], max_output_tokens: int) -> str:
@@ -171,21 +214,26 @@ async def ask_change(state: dict) -> dict:
 
 
 def _search_query(state: dict) -> str:
-    """검색에 넘길 의미 질의.
+    """검색에 넘길 의미 질의. 색 + 세부 카테고리 + 분위기를 이어 붙인다 (2026-10-03 측정으로 결정).
 
-    사용자가 분위기를 말하지 않으면 semantic_query 가 빈다("청바지 하나 보여줘").
-    빈 문자열을 임베딩하면 의미 없는 벡터가 나와 유사도 순위가 아무 근거 없이 정해지므로,
-    말한 조건에서 최소한의 문장을 만들어 넘긴다.
+    카테고리 문구("팬츠", "아우터")는 붙이지 않는다. 붙이면 세부 단어의 신호가 묻힌다
+    ("슬랙스 출근" 8/10 → "블랙 슬랙스 팬츠 출근" 0/10). 카테고리는 이미 필터가 거른다.
+    색은 붙인다. 빼면 "데님 데이트" 가 코디 문장 쪽으로 끌려간다(1/10 → 색을 붙이면 8/10).
+    세부 카테고리도 분위기도 없으면 색 + 카테고리 문구로 대신한다("청바지 하나 보여줘").
+    아무것도 없으면 빈 문자열이다(search.py "빈 질의" 마커).
 
-    State 에는 채워 넣지 않는다. State 는 사용자가 실제로 말한 것만 담는다.
+    사용자 표기는 상품 설명 표기로 바꾼다("자켓" → "재킷"). State 에는 채워 넣지 않는다.
+    State 와 요약은 사용자가 실제로 말한 것만 담는다.
     """
-    written = (state.get("semantic_query") or "").strip()
-    if written:
-        return written
-
     conditions = state.get("conditions", {})
-    words = [conditions.get("color"), vocab.CATEGORY_QUERY_PHRASE.get(conditions.get("category"))]
-    return " ".join(word for word in words if word)
+    detail = (state.get("detail_category") or "").strip()
+    mood = (state.get("mood") or "").strip()
+    if detail or mood:
+        words = [conditions.get("color"), detail, mood]
+    else:
+        words = [conditions.get("color"), vocab.CATEGORY_QUERY_PHRASE.get(conditions.get("category"))]
+    query = " ".join(word.strip() for word in words if word and word.strip())
+    return vocab.to_catalog_spelling(query)
 
 
 async def search(state: dict) -> dict:
