@@ -67,3 +67,21 @@ FITTING_DAILY_BUDGET_USD = Decimal(5)
 # 우리 합계를 Runware 집계(getUsageActivity)로 보정하는 간격. 스케줄러 없이, 이 시간이 지난 뒤
 # 들어온 첫 피팅 요청이 보정한다.
 FITTING_USAGE_RECONCILE_SECONDS = 600
+
+# 가상피팅 동시 실행 제한 (app/virtual_fitting/concurrency.py). 값 검증은 limiter 생성자가 하고,
+# limiter 는 lifespan 에서 만들므로 잘못된 값이면 서버가 뜨지 않는다.
+# 메모리 limiter 라 프로세스마다 따로 적용된다. uvicorn worker 나 인스턴스가 늘면 전체 한도도 그만큼 는다.
+# - VTON: 실제 Runware try-on 요청 동시 실행 수, 그 슬롯을 기다릴 수 있는 요청 수, 기다리는 최대 시간(초).
+#   실행과 대기가 모두 차면 즉시 429 FITTING_SERVER_BUSY, 대기 시간을 넘기면 429 FITTING_QUEUE_TIMEOUT.
+# - LLM: 실제 Runware LLM(comment / title) 요청 동시 실행 수와, 그 슬롯을 기다리는 최대 시간(초).
+#   대기 수는 제한하지 않는다. 대기 시간은 LLM HTTP timeout 과 별개이고, 넘기면 LLM 을 부르지 않고
+#   fallback comment / title 로 정상 응답한다. comment 와 title 의 슬롯 대기에 각각 적용된다.
+VIRTUAL_FITTING_VTON_CONCURRENCY = int(os.getenv("VIRTUAL_FITTING_VTON_CONCURRENCY", "4"))
+VIRTUAL_FITTING_VTON_QUEUE_SIZE = int(os.getenv("VIRTUAL_FITTING_VTON_QUEUE_SIZE", "4"))
+VIRTUAL_FITTING_VTON_QUEUE_TIMEOUT_SECONDS = float(
+    os.getenv("VIRTUAL_FITTING_VTON_QUEUE_TIMEOUT_SECONDS", "30")
+)
+VIRTUAL_FITTING_LLM_CONCURRENCY = int(os.getenv("VIRTUAL_FITTING_LLM_CONCURRENCY", "4"))
+VIRTUAL_FITTING_LLM_SLOT_WAIT_TIMEOUT_SECONDS = float(
+    os.getenv("VIRTUAL_FITTING_LLM_SLOT_WAIT_TIMEOUT_SECONDS", "15")
+)
