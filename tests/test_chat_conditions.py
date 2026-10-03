@@ -84,3 +84,41 @@ def test_allowed_dislikes_pass_the_entrance():
     dislikes = [{"field": "color", "value": "레드"}, {"field": "style", "value": "오버핏"}]
     cleaned = postprocess_analysis({"metadata": {}, "dislikes": dislikes}, "빨간색이랑 오버핏은 싫어")
     assert cleaned["dislikes"] == dislikes
+
+
+def test_same_turn_include_and_exclude_trusts_exclude():
+    from app.chat.graph.nodes import postprocess_analysis
+
+    raw = {
+        "answer": "none",
+        "metadata": {"color": None, "category": "데님"},
+        "dislikes": [{"field": "category", "value": "데님"}],
+    }
+    cleaned = postprocess_analysis(raw, "데님은 빼고.")
+    assert cleaned["metadata"]["category"] is None
+    assert cleaned["dislikes"] == [{"field": "category", "value": "데님"}]
+    merged = _merge_conditions({"category": "셔츠"}, cleaned["metadata"], cleaned["dislikes"])
+    assert merged["category"] == "셔츠"
+
+
+def test_different_include_and_exclude_both_stay():
+    from app.chat.graph.nodes import postprocess_analysis
+
+    raw = {"metadata": {"color": "블루"}, "dislikes": [{"field": "color", "value": "레드"}]}
+    cleaned = postprocess_analysis(raw, "파란색, 빨간색은 싫어")
+    assert cleaned["metadata"]["color"] == "블루"
+
+
+def test_dislike_removes_the_same_stored_condition():
+    # 앞 턴에 category=데님 이 저장된 뒤 "데님은 빼고"
+    merged = _merge_conditions(
+        {"category": "데님", "color": "블루"}, {}, [{"field": "category", "value": "데님"}]
+    )
+    assert "category" not in merged
+    assert merged["color"] == "블루"
+    assert merged["dislikes"] == [{"field": "category", "value": "데님"}]
+
+
+def test_dislike_of_other_value_keeps_stored_condition():
+    merged = _merge_conditions({"category": "셔츠"}, {}, [{"field": "category", "value": "데님"}])
+    assert merged["category"] == "셔츠"
