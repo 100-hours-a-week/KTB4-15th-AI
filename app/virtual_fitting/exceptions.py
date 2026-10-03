@@ -51,18 +51,39 @@ class FittingTimeoutError(VirtualFittingError):
     message = "가상 피팅 시간이 초과되었습니다."
 
 
+class FittingServerBusyError(VirtualFittingError):
+    """VTON 실행 슬롯과 대기 자리가 모두 찼을 때. 기다리게 하지 않고 바로 거절한다.
+
+    VTON 을 부르기 전에 나므로 Runware 비용도, 하루 사용액 기록도 없다.
+    """
+
+    status_code = status.HTTP_429_TOO_MANY_REQUESTS
+    code = "FITTING_SERVER_BUSY"
+    message = "현재 가상 피팅 요청이 많습니다. 잠시 후 다시 시도해주세요."
+
+
+class FittingQueueTimeoutError(VirtualFittingError):
+    """대기 자리에서 정해진 시간 안에 VTON 실행 슬롯을 얻지 못했을 때. VTON 은 부르지 않았다."""
+
+    status_code = status.HTTP_429_TOO_MANY_REQUESTS
+    code = "FITTING_QUEUE_TIMEOUT"
+    message = "가상 피팅 대기 시간이 초과되었습니다. 잠시 후 다시 시도해주세요."
+
+
 class FittingDailyBudgetExceededError(VirtualFittingError):
     """오늘(UTC) 사용액이 settings.FITTING_DAILY_BUDGET_USD 에 닿았을 때. 다음 날 자동으로 풀린다."""
 
-    status_code = 402
-    message = "fitting_daily_budget_exceeded"
+    status_code = status.HTTP_402_PAYMENT_REQUIRED
+    code = "FITTING_DAILY_BUDGET_EXCEEDED"
+    message = "오늘 사용할 수 있는 가상 피팅 한도를 초과했습니다. 내일 다시 시도해주세요."
 
 
 class FittingBalanceExhaustedError(VirtualFittingError):
     """Runware 가 402 로 잔액 부족을 알렸을 때. 누군가 충전하기 전까지 풀리지 않는다."""
 
-    status_code = 402
-    message = "fitting_balance_exhausted"
+    status_code = status.HTTP_402_PAYMENT_REQUIRED
+    code = "FITTING_BALANCE_EXHAUSTED"
+    message = "현재 가상 피팅 서비스를 이용할 수 없습니다. 잠시 후 다시 시도해주세요."
 
 
 class UnsupportedSubCategoryError(VirtualFittingError):

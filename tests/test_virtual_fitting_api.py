@@ -4,7 +4,9 @@ Service 와 외부 서비스를 fake 로 바꿔 API 계층만 본다. 실제 DB,
 """
 
 import logging
+import threading
 from contextlib import contextmanager, nullcontext
+from decimal import Decimal
 
 import psycopg
 import pytest
@@ -14,7 +16,14 @@ from app.clients.s3 import S3ImageStorage
 from app.config import settings
 from app.main import app
 from app.virtual_fitting import router
+from app.virtual_fitting.concurrency import (
+    ConcurrencyLimiter,
+    FittingLimiters,
+    create_fitting_limiters,
+)
 from app.virtual_fitting.exceptions import (
+    FittingBalanceExhaustedError,
+    FittingDailyBudgetExceededError,
     FittingDatabaseError,
     FittingImageStorageError,
     FittingModelError,
@@ -85,7 +94,7 @@ class StubService:
         self._error = error
         self.requests = []
 
-    def fit(self, request):
+    async def fit_with_limiters(self, request, limiters):
         self.requests.append(request)
         if self._error is not None:
             raise self._error
@@ -639,3 +648,209 @@ def test_existing_domain_errors_keep_their_meaning(client, real_assembly, rows, 
 
     assert response.status_code == status
     assert response.json() == error_body(code)
+
+
+# --- VTON 동시 실행 제한 (429) ---
+
+
+class BlockingFittingProvider:
+    """release 전까지 VTON 실행 중으로 머문다. 호출된 사용자 이미지 URL 을 기록한다."""
+
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.person_image_urls = []
+
+    def try_on(self, fitting_input):
+        self.person_image_urls.append(fitting_input.person_image_url)
+        self.started.set()
+        assert self.release.wait(5)
+        return FittingResult(result_image_url="https://im.runware.ai/fake.jpg", cost=Decimal("0.015"))
+
+
+@pytest.mark.parametrize(
+    ("max_waiting", "wait_timeout", "code", "message"),
+    [
+        (0, 30.0, "FITTING_SERVER_BUSY", "현재 가상 피팅 요청이 많습니다. 잠시 후 다시 시도해주세요."),
+        (1, 0.05, "FITTING_QUEUE_TIMEOUT", "가상 피팅 대기 시간이 초과되었습니다. 잠시 후 다시 시도해주세요."),
+    ],
+    ids=["queue-full", "queue-timeout"],
+)
+def test_vton_rejection_is_429_in_the_common_shape_without_runware_or_budget(
+    client, use_service, max_waiting, wait_timeout, code, message
+):
+    provider = BlockingFittingProvider()
+    budget = AllowAllBudget()
+    use_service(
+        VirtualFittingService(
+            FakeRepository(make_top("1"), make_bottom("2")),
+            provider,
+            MockCommentProvider(),
+            FakeImageStorage(),
+            budget,
+        )
+    )
+    app.state.fitting_limiters = FittingLimiters(
+        vton=ConcurrencyLimiter(1, max_waiting=max_waiting, wait_timeout=wait_timeout),
+        llm=ConcurrencyLimiter(1),
+    )
+    body = {"products": [{"product_code": "1"}, {"product_code": "2"}]}
+    first = {}
+    holder = threading.Thread(
+        target=lambda: first.update(
+            response=client.post(
+                URL, json=body | {"user_image_url": "https://example.com/first.jpg"}, headers=AUTH
+            )
+        )
+    )
+    holder.start()
+    try:
+        assert provider.started.wait(5)
+
+        response = client.post(
+            URL, json=body | {"user_image_url": "https://example.com/second.jpg"}, headers=AUTH
+        )
+    finally:
+        provider.release.set()
+        holder.join(5)
+
+    assert response.status_code == 429
+    assert response.json() == {"code": code, "data": None, "message": message}
+    # 거절된 요청은 사용액 확인도, Runware VTON 도 부르지 않았고 비용도 기록되지 않았다.
+    assert provider.person_image_urls == ["https://example.com/first.jpg"]
+    assert budget.checks == 1
+    assert budget.recorded == [Decimal("0.015")]
+    assert first["response"].status_code == 200
+
+
+def test_429_is_documented_with_the_common_response_model():
+    responses = app.openapi()["paths"][URL]["post"]["responses"]
+
+    assert responses["429"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ApiResponse"
+    }
+
+
+def test_limiters_are_created_on_startup(client):
+    limiters = app.state.fitting_limiters
+
+    assert isinstance(limiters, FittingLimiters)
+    assert limiters.vton is not limiters.llm
+
+
+class ExhaustedBudget(AllowAllBudget):
+    def ensure_available(self):
+        super().ensure_available()
+        raise FittingDailyBudgetExceededError("오늘 가상피팅 사용액이 상한에 닿았습니다.")
+
+
+def test_exhausted_budget_is_still_402_in_the_common_shape_and_frees_the_vton_slot(
+    client, use_service
+):
+    provider = FakeFittingProvider()
+    budget = ExhaustedBudget()
+    use_service(
+        VirtualFittingService(
+            FakeRepository(make_top("1"), make_bottom("2")),
+            provider,
+            MockCommentProvider(),
+            FakeImageStorage(),
+            budget,
+        )
+    )
+
+    response = client.post(URL, json=BODY | {"products": [{"product_code": "1"}]}, headers=AUTH)
+
+    # 429 FITTING_SERVER_BUSY / FITTING_QUEUE_TIMEOUT 과 같은 규칙: 대문자 code + 한국어 message.
+    assert response.status_code == 402
+    assert response.json() == {
+        "code": "FITTING_DAILY_BUDGET_EXCEEDED",
+        "data": None,
+        "message": "오늘 사용할 수 있는 가상 피팅 한도를 초과했습니다. 내일 다시 시도해주세요.",
+    }
+    assert budget.checks == 1
+    assert provider.inputs == []
+    assert budget.recorded == []
+    vton = app.state.fitting_limiters.vton
+    assert (vton.running, vton.waiting) == (0, 0)
+
+
+def test_runware_balance_exhausted_is_402_in_the_common_shape(client, real_assembly):
+    real_assembly(
+        DbConnection(rows=[TOP_ROW, BOTTOM_ROW]),
+        RaisingFittingProvider(FittingBalanceExhaustedError("Runware 잔액이 부족합니다.")),
+    )
+
+    response = _fitting_request(client, "1", "2")
+
+    assert response.status_code == 402
+    assert response.json() == {
+        "code": "FITTING_BALANCE_EXHAUSTED",
+        "data": None,
+        "message": "현재 가상 피팅 서비스를 이용할 수 없습니다. 잠시 후 다시 시도해주세요.",
+    }
+
+
+class BlockingCommentProvider:
+    """첫 comment 호출만 release 전까지 LLM 슬롯을 쥐고 머문다. 그 뒤 호출은 모두 기록한다."""
+
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = []
+
+    def generate_comment(self, result_image_url, description_summaries):
+        self.calls.append("comment")
+        if not self.started.is_set():
+            self.started.set()
+            assert self.release.wait(5)
+        return MOCK_COMMENT
+
+    def generate_title(self, comment):
+        self.calls.append("title")
+        return MOCK_TITLE
+
+
+def test_llm_slot_wait_timeout_is_200_with_the_fallback_pair(client, use_service, monkeypatch):
+    comment_provider = BlockingCommentProvider()
+    use_service(
+        VirtualFittingService(
+            FakeRepository(make_top("1"), make_bottom("2")),
+            FakeFittingProvider(),
+            comment_provider,
+            FakeImageStorage(),
+            AllowAllBudget(),
+        )
+    )
+    monkeypatch.setattr(settings, "VIRTUAL_FITTING_LLM_CONCURRENCY", 1)
+    monkeypatch.setattr(settings, "VIRTUAL_FITTING_LLM_SLOT_WAIT_TIMEOUT_SECONDS", 0.05)
+    app.state.fitting_limiters = create_fitting_limiters()
+    body = BODY | {"products": [{"product_code": "1"}, {"product_code": "2"}]}
+    first = {}
+    holder = threading.Thread(
+        target=lambda: first.update(response=client.post(URL, json=body, headers=AUTH))
+    )
+    holder.start()
+    try:
+        assert comment_provider.started.wait(5)  # 첫 요청이 LLM 슬롯 1/1 사용 중
+
+        response = client.post(URL, json=body, headers=AUTH)
+        calls_during_timeout = list(comment_provider.calls)
+    finally:
+        comment_provider.release.set()
+        holder.join(5)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "code": "FITTING_SUCCESS",
+        "message": "가상 피팅이 완료되었습니다.",
+        "data": {
+            "result_image_key": "virtual-fitting/results/fake.jpg",
+            "llm_title": FALLBACK_TITLE,
+            "llm_comment": FALLBACK_COMMENT,
+        },
+    }
+    assert calls_during_timeout == ["comment"]  # 두 번째 요청은 LLM 을 부르지 않았다
+    assert first["response"].json()["data"]["llm_title"] == MOCK_TITLE
+    llm = app.state.fitting_limiters.llm
+    assert (llm.running, llm.waiting) == (0, 0)

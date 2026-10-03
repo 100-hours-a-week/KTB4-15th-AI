@@ -19,6 +19,7 @@ from app.config.database import close_async_pool, close_connection_pool, open_as
 from app.config.logging_config import LOGGING_CONFIG, configure_logging
 from app.errors import register_error_handlers
 from app.virtual_fitting import router as virtual_fitting_router
+from app.virtual_fitting.concurrency import create_fitting_limiters
 from app.virtual_fitting.providers.runware import (
     get_runware_llm_api_key,
     get_runware_vton_api_key,
@@ -34,6 +35,8 @@ async def lifespan(app: FastAPI):
     # 가상피팅이 쓰는 Runware 키다. 빠진 채로 뜨면 첫 요청에서야 500 이 나므로 여기서 멈춘다.
     get_runware_vton_api_key()
     get_runware_llm_api_key()
+    # 가상피팅 VTON / LLM 동시 실행 제한. 앱마다 새로 만들어 요청이 앱 상태로 꺼내 쓴다.
+    app.state.fitting_limiters = create_fitting_limiters()
     runtime_manager.start()
     try:
         await open_async_pool()
