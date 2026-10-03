@@ -69,7 +69,7 @@ def test_three_turns_share_one_conversation(monkeypatch):
             {
                 "answer": "none",
                 "metadata": {"category": "셔츠"},
-                "semantic_query": "소개팅에 입기 좋은 단정한 분위기",
+                "mood": "소개팅에 입기 좋은 단정한 분위기",
             },
             # 2턴: 거절하면서 조건을 더 말함
             {
@@ -154,12 +154,12 @@ def test_condition_change_after_ask_change_goes_back_to_summary(monkeypatch):
     """요약 → "ㄴㄴ" → 되묻기 → "가을 말고 여름" 이 일반 대화로 빠지지 않는다 (2026-09-28 QA)."""
     fake = FakeLLM(
         [
-            {"answer": "none", "metadata": {}, "semantic_query": "가을 데이트 룩"},
+            {"answer": "none", "metadata": {}, "mood": "가을 데이트 룩"},
             {"answer": "no", "metadata": {}},
             {
                 "answer": "no",
                 "metadata": {},
-                "semantic_query": "여름 데이트 룩",
+                "mood": "여름 데이트 룩",
             },
         ]
     )
@@ -178,5 +178,5 @@ def test_condition_change_after_ask_change_goes_back_to_summary(monkeypatch):
 
     state = _state(graph)
     assert state["said_conditions"] is True
-    assert state["semantic_query"] == "여름 데이트 룩"
+    assert state["mood"] == "여름 데이트 룩"
     assert state["pending_question"] == "confirm_summary"  # 재요약했다

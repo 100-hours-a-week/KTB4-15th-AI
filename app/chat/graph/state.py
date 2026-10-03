@@ -34,7 +34,9 @@ class Conditions(TypedDict, total=False):
 class ChatState(TypedDict):
     messages: Annotated[list[dict], append_messages]
     conditions: Conditions
-    semantic_query: str
+    # 검색 질의 재료 두 칸 (2026-10-03, QA 10번). 사용자가 실제로 말한 표현만 담는다.
+    detail_category: str  # 세부 종류·핏·소재("자켓", "와이드", "데님"). 새로 말하면 덮어쓰고, category 가 바뀌면 지운다
+    mood: str  # 상황·분위기("데이트", "출근"). 새로 말하면 덮어쓰고, category 가 바뀌어도 유지한다
     # 수명은 다음 사용자 턴 하나. 매 턴 끝나는 노드가 새로 쓴다
     pending_question: PendingQuestion | None
     answer: Answer  # 이번 턴에만 쓰는 값
