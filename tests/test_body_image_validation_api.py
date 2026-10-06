@@ -341,10 +341,10 @@ def test_missing_multipart_field_is_invalid_request(client):
     }
 
 
-# --- 긴급 안정화: 2MB 제한과 동시 실행 제한(실행 1 + 대기 1, 초과 시 429) ---
+# --- 긴급 안정화: 10MB 제한과 동시 실행 제한(실행 1 + 대기 1, 초과 시 429) ---
 
 
-def test_upload_over_2mb_is_413_image_too_large(client, monkeypatch):
+def test_upload_over_10mb_is_413_image_too_large(client, monkeypatch):
     calls = []
     use_service(
         monkeypatch,
@@ -358,7 +358,7 @@ def test_upload_over_2mb_is_413_image_too_large(client, monkeypatch):
 
     response = client.post(
         URL,
-        files={"image": ("big.png", b"\x00" * (2 * 1024 * 1024 + 1), "image/png")},
+        files={"image": ("big.png", b"\x00" * (10 * 1024 * 1024 + 1), "image/png")},
         headers=AUTH,
     )
 
@@ -366,7 +366,7 @@ def test_upload_over_2mb_is_413_image_too_large(client, monkeypatch):
     assert response.json() == {
         "code": "IMAGE_TOO_LARGE",
         "data": None,
-        "message": "이미지 크기는 2MB 이하여야 합니다.",
+        "message": "이미지 크기는 10MB 이하여야 합니다.",
     }
     assert calls == []
 
