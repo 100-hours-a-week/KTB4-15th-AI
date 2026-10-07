@@ -14,8 +14,12 @@ RELOAD = os.getenv("RELOAD", "1") == "1"
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
 AUTH_DISABLED = os.getenv("AUTH_DISABLED", "") == "1"
 
-# 단계2 §4.2 — 8개 사용처 전부 gpt-5.6-luna
-MODEL = os.getenv("CHAT_MODEL", "gpt-5.6-luna")
+# 2026-10-07 결정 — 채팅 LLM 은 Runware 의 OpenAI 호환 API 로 부른다(키는 RUNWARE_LLM_API_KEY).
+# 모델명은 Runware AIR 형식이다. 임베딩은 Runware 가 제공하지 않아 OpenAI 그대로다.
+# gpt@6-luna 는 되묻기 직후 라우팅(103/114)과 첫 말풍선 지연(최댓값 5.19·6.26s)에서 합격선을
+# 넘지 못해 5.6 을 쓴다 (2026-10-07 로컬 측정).
+MODEL = os.getenv("CHAT_MODEL", "openai:gpt@5.6-luna")
+LLM_BASE_URL = "https://api.runware.ai/v1"
 
 # 단계2 §4.8 — 상한은 "보이는 출력"이 아니라 "추론 + 출력"으로 잡아야 한다.
 # analyze는 추론을 끄므로(effort=none) 출력 길이만 고려하면 된다.

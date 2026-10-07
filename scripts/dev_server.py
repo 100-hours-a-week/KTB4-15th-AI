@@ -96,7 +96,9 @@ if __name__ == "__main__":
           f"인증 {'꺼짐' if settings.AUTH_DISABLED else '켜짐'}")
     if REAL_SEARCH and not os.environ.get("DATABASE_URL"):
         print("[dev] DATABASE_URL 이 없습니다. 검색 추천이 실패합니다.")
+    if not os.environ.get("RUNWARE_LLM_API_KEY"):
+        print("[dev] RUNWARE_LLM_API_KEY 가 없습니다. 찜 추천 경로만 끝까지 동작합니다.")
     if not os.environ.get("OPENAI_API_KEY"):
-        print("[dev] OPENAI_API_KEY 가 없습니다. 찜 추천 경로만 끝까지 동작합니다.")
+        print("[dev] OPENAI_API_KEY 가 없습니다. 검색 추천의 질의 임베딩이 실패합니다.")
 
     uvicorn.run(app, host=settings.HOST, port=settings.PORT, log_config=LOGGING_CONFIG)
