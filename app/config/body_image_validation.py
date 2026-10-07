@@ -12,7 +12,9 @@ POSE_LANDMARKER_MODEL = Path(
 )
 REMBG_MODEL = Path(os.getenv("REMBG_MODEL", str(MODEL_DIR / "u2netp.onnx")))
 
-MAX_IMAGE_SIZE_MB = int(os.getenv("MAX_IMAGE_SIZE_MB", "2"))
+# 파일 크기는 decode 메모리를 거의 바꾸지 않는다(Docker 측정: 같은 25MP 에서 1.2MB 와 10MB 의 peak
+# 차이는 요청 간 편차 안). decode 메모리는 아래 MAX_IMAGE_PIXELS 가 막는다.
+MAX_IMAGE_SIZE_MB = int(os.getenv("MAX_IMAGE_SIZE_MB", "10"))
 MAX_IMAGE_BYTES = MAX_IMAGE_SIZE_MB * 1024 * 1024
 # 파일 크기와 별개로 decode 메모리를 막는다. 고압축 초고해상도 이미지는 파일이 작아도
 # RGB decode 만으로 수백 MB 를 쓴다(150MP ≈ 450MB, 25MP ≈ 75MB).
