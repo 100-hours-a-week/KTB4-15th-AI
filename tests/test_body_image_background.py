@@ -1,18 +1,20 @@
-"""RembgBackgroundRemover 의 session 설정과 PIL 입출력을 확인한다.
+"""RembgBackgroundRemover 의 session 설정과 PIL 입출력, encode_png 의 PNG 저장을 확인한다.
 
 실제 모델은 session 설정 확인 한 곳에서만 쓰고, 모델 파일이 없으면 그 테스트는 건너뛴다.
 """
 
 import importlib
 import sys
+from io import BytesIO
 from pathlib import Path
 from types import ModuleType
 
+import numpy as np
 import onnxruntime as ort
 import pytest
 from PIL import Image
 
-from app.body_image_validation.background import RembgBackgroundRemover
+from app.body_image_validation.background import RembgBackgroundRemover, encode_png
 from app.config import body_image_validation as config
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -156,3 +158,64 @@ def test_non_rgba_result_is_converted_and_the_intermediate_is_closed(fake_rembg)
     assert is_closed(fake_rembg.output)
     assert not is_closed(result)
     assert not is_closed(image)
+
+
+# --- encode_png: 압축 수준 4 로 저장하고 픽셀은 바꾸지 않는다 ---
+
+
+def rgba_with_varied_alpha(size=(64, 48)):
+    """색은 무작위, alpha 는 완전 투명·반투명·완전 불투명이 섞인 RGBA 이미지."""
+    width, height = size
+    rgb = np.random.default_rng(0).integers(0, 256, (height, width, 3), dtype=np.uint8)
+    alpha = np.tile(np.linspace(0, 255, width).astype(np.uint8), (height, 1))
+    alpha[: height // 3] = 0
+    alpha[-height // 3 :] = 255
+    return Image.fromarray(np.dstack([rgb, alpha]), "RGBA")
+
+
+def test_encode_png_saves_as_png_with_compress_level_4(monkeypatch):
+    calls = []
+    original_save = Image.Image.save
+
+    def spy(self, fp, *args, **kwargs):
+        calls.append(kwargs)
+        return original_save(self, fp, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "save", spy)
+
+    encode_png(rgba_with_varied_alpha())
+
+    [kwargs] = calls
+    assert kwargs["format"] == "PNG"
+    assert kwargs.get("compress_level") == 4  # Pillow 기본값 6 으로 되돌아가면 실패한다
+    assert kwargs.get("optimize", False) is False
+
+
+def test_encode_png_output_is_what_pillow_writes_at_level_4_not_the_default():
+    image = rgba_with_varied_alpha()
+
+    def pillow_png(**options):
+        output = BytesIO()
+        image.save(output, format="PNG", **options)
+        return output.getvalue()
+
+    level_4, default = pillow_png(compress_level=4), pillow_png()
+    assert level_4 != default  # 이 이미지에서 두 수준의 결과가 달라야 비교가 의미 있다
+
+    assert encode_png(image) == level_4
+
+
+def test_encode_png_round_trip_keeps_every_rgba_pixel():
+    image = rgba_with_varied_alpha()
+    original = np.asarray(image)
+    assert {0, 255} <= set(np.unique(original[:, :, 3]))
+    assert ((original[:, :, 3] > 0) & (original[:, :, 3] < 255)).any()  # 반투명 픽셀
+
+    with Image.open(BytesIO(encode_png(image))) as decoded:
+        assert decoded.format == "PNG"
+        assert decoded.mode == "RGBA"
+        assert decoded.size == image.size
+        restored = np.asarray(decoded)
+
+    assert np.array_equal(restored, original)
+    assert np.array_equal(restored[:, :, 3], original[:, :, 3])
