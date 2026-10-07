@@ -248,28 +248,29 @@ def test_unexpected_error_on_a_valid_image_is_not_turned_into_a_user_error(monke
     assert exc_info.value is error
 
 
-# --- 긴급 안정화: 파일 크기 2MB, 처리용 resize 긴 변 1600px ---
+# --- 긴급 안정화: 파일 크기 10MB, 처리용 resize 긴 변 1600px ---
 
 
 def test_default_limits_follow_the_stabilization_policy():
-    assert config.MAX_IMAGE_SIZE_MB == 2
-    assert config.MAX_IMAGE_BYTES == 2 * 1024 * 1024
+    assert config.MAX_IMAGE_SIZE_MB == 10
+    assert config.MAX_IMAGE_BYTES == 10 * 1024 * 1024
+    assert config.MAX_IMAGE_PIXELS == 25_000_000
     assert config.MAX_PROCESSING_IMAGE_SIDE == 1600
 
 
-def test_file_over_2mb_is_image_too_large_with_a_2mb_message():
+def test_file_over_10mb_is_image_too_large_with_a_10mb_message():
     with pytest.raises(UserImageValidationError) as exc_info:
-        decode_image(b"\x00" * (2 * 1024 * 1024 + 1))
+        decode_image(b"\x00" * (10 * 1024 * 1024 + 1))
 
     error = exc_info.value
     assert (error.status_code, error.code) == (413, "IMAGE_TOO_LARGE")
-    assert error.message == "이미지 크기는 2MB 이하여야 합니다."
+    assert error.message == "이미지 크기는 10MB 이하여야 합니다."
 
 
-def test_file_of_exactly_2mb_is_not_rejected_for_size():
+def test_file_of_exactly_10mb_is_not_rejected_for_size():
     # 크기 검사는 통과하고 다음 단계(헤더 판독)에서 판단된다.
     with pytest.raises(UserImageValidationError) as exc_info:
-        decode_image(b"\x00" * (2 * 1024 * 1024))
+        decode_image(b"\x00" * (10 * 1024 * 1024))
 
     assert exc_info.value.code == "INVALID_IMAGE"
 
