@@ -9,7 +9,7 @@ from app.body_image_validation import validation_rules
 from app.body_image_validation.background import encode_png
 from app.body_image_validation.brightness import BrightnessCheckError, validate_brightness
 from app.body_image_validation.concurrency import BodyValidationLimiter
-from app.body_image_validation.detectors import PersonDetector, PoseDetector
+from app.body_image_validation.detectors import DetectionImage, PersonDetector, PoseDetector
 from app.body_image_validation.exceptions import BodyImageSystemError
 from app.body_image_validation.image_io import load_image, open_image
 from app.body_image_validation.models import BodyImageValidationResult
@@ -56,30 +56,7 @@ class BodyImageValidationService:
 
     def _validate_decoded(self, image: Image.Image) -> BodyImageValidationResult:
         """image 는 호출자가 닫는다. 여기서 만든 배경 제거 결과는 여기서 닫는다."""
-        try:
-            detections = self.person_detector.detect(image)
-        except Exception as error:
-            raise BodyImageSystemError("PERSON_DETECTION_FAILED") from error
-        person_box = validation_rules.select_single_person(detections, image.height)
-
-        try:
-            landmarks = self.pose_detector.detect(image)
-        except Exception as error:
-            raise BodyImageSystemError("POSE_ESTIMATION_FAILED") from error
-        if landmarks is None:
-            from app.body_image_validation.exceptions import user_error
-
-            raise user_error("FULL_BODY_NOT_VISIBLE")
-
-        validation_rules.validate_full_body(landmarks)
-        validation_rules.validate_arms(landmarks)
-        validation_rules.validate_legs(landmarks)
-        validation_rules.validate_frontal_pose(landmarks, person_box, image.width)
-
-        try:
-            validate_brightness(image, person_box)
-        except BrightnessCheckError as error:
-            raise BodyImageSystemError("BRIGHTNESS_CHECK_FAILED") from error
+        self._check_body(image)
 
         try:
             result = self.background_remover.remove(image)
@@ -98,3 +75,31 @@ class BodyImageValidationService:
         except ImageStorageError as error:
             raise BodyImageSystemError("IMAGE_UPLOAD_FAILED") from error
         return BodyImageValidationResult(s3_key=key)
+
+    def _check_body(self, image: Image.Image) -> None:
+        """사람·자세·밝기 검사. 변환 결과(detection)는 이 안에서만 쓰여 배경 제거 전에 놓인다."""
+        try:
+            detection = DetectionImage(image)
+            detections = self.person_detector.detect(detection)
+        except Exception as error:
+            raise BodyImageSystemError("PERSON_DETECTION_FAILED") from error
+        person_box = validation_rules.select_single_person(detections, image.height)
+
+        try:
+            landmarks = self.pose_detector.detect(detection)
+        except Exception as error:
+            raise BodyImageSystemError("POSE_ESTIMATION_FAILED") from error
+        if landmarks is None:
+            from app.body_image_validation.exceptions import user_error
+
+            raise user_error("FULL_BODY_NOT_VISIBLE")
+
+        validation_rules.validate_full_body(landmarks)
+        validation_rules.validate_arms(landmarks)
+        validation_rules.validate_legs(landmarks)
+        validation_rules.validate_frontal_pose(landmarks, person_box, image.width)
+
+        try:
+            validate_brightness(detection.array, person_box)
+        except BrightnessCheckError as error:
+            raise BodyImageSystemError("BRIGHTNESS_CHECK_FAILED") from error

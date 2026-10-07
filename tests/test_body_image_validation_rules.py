@@ -1,5 +1,5 @@
+import numpy as np
 import pytest
-from PIL import Image
 
 from app.body_image_validation.brightness import validate_brightness
 from app.body_image_validation.exceptions import UserImageValidationError
@@ -150,9 +150,9 @@ def test_brightness_boundary_59_60(monkeypatch):
 
     monkeypatch.setattr("app.body_image_validation.brightness.mean_value_channel", lambda *_: 59)
     assert (
-        reason_from(lambda: validate_brightness(Image.new("RGB", (20, 20), (59, 59, 59)), box))
+        reason_from(lambda: validate_brightness(np.full((20, 20, 3), 59, np.uint8), box))
         == "IMAGE_TOO_DARK"
     )
 
     monkeypatch.setattr("app.body_image_validation.brightness.mean_value_channel", lambda *_: 60)
-    validate_brightness(Image.new("RGB", (20, 20), (60, 60, 60)), box)
+    validate_brightness(np.full((20, 20, 3), 60, np.uint8), box)
