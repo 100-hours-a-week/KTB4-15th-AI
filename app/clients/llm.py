@@ -40,6 +40,8 @@ class LLMClient:
             self._chat_client = AsyncOpenAI(
                 base_url=settings.LLM_BASE_URL,
                 api_key=os.environ["RUNWARE_LLM_API_KEY"],
+                timeout=settings.LLM_TIMEOUT_SECONDS,
+                max_retries=settings.LLM_MAX_RETRIES,
             )
         return self._chat_client
 
