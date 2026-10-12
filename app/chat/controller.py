@@ -3,6 +3,7 @@
 라우터는 HTTP 를 다루고, 그래프를 돌리고 SSE 를 만드는 일은 여기서 한다.
 """
 
+import logging
 from collections.abc import AsyncIterator
 
 from fastapi import status
@@ -12,6 +13,8 @@ from app.chat.graph.state import initial_state
 from app.chat.schemas import ChatRequest
 from app.clients.llm import LLMError
 from app.recommendation import RecommendationError, WishlistCommentError
+
+logger = logging.getLogger(__name__)
 
 # 단계1 §7 — Backend 가 최근 찜 상품 10개를 선별해 전달하는 계약
 WISHLIST_PRODUCT_COUNT = 10
@@ -55,7 +58,12 @@ async def find_pre_stream_error(
 
 
 async def stream_chat(graph, request: ChatRequest) -> AsyncIterator[str]:
-    """그래프를 돌리며 SSE 이벤트를 만든다."""
+    """그래프를 돌리며 SSE 이벤트를 만든다.
+
+    스트림 안의 오류는 여기서만 로그로 남긴다. 아래 단계(LLMClient 등)는 `from` 으로
+    원인만 이어 붙이고 로그를 찍지 않는다. 같은 오류가 두 줄로 남지 않게 하려는 것이다.
+    Backend 에는 고정된 code·message 만 보내고 원인은 로그에만 둔다.
+    """
     chat_id = request.chat_id
     state = initial_state(
         request.message,
@@ -82,17 +90,27 @@ async def stream_chat(graph, request: ChatRequest) -> AsyncIterator[str]:
             elif chunk["event"] == sse.STATUS:
                 yield sse.status(chat_id, chunk["label"])
     except LLMError:
+        logger.exception("chat stream failed: chat_id=%s user message=%r", chat_id, request.message)
         yield sse.error(chat_id, "LLM_GENERATION_FAILED", "응답 생성 중 오류가 발생했습니다.")
     except WishlistCommentError:
+        logger.exception("chat stream failed: chat_id=%s user message=%r", chat_id, request.message)
         yield sse.error(
             chat_id,
             "WISHLIST_COMMENT_GENERATION_FAILED",
             "추천 이유를 만드는 중 오류가 발생했습니다.",
         )
     except RecommendationError:
+        logger.exception("chat stream failed: chat_id=%s user message=%r", chat_id, request.message)
         yield sse.error(
             chat_id, "RECOMMENDATION_SEARCH_FAILED", "상품 추천 처리 중 오류가 발생했습니다."
         )
+    except Exception:
+        # 스트림이 열린 뒤라 errors.py 의 전역 핸들러에 닿지 않는다. 여기서 잡지 않으면
+        # Backend 는 error 도 done 도 받지 못한 채 끊긴다.
+        # TODO: LLM 오류가 아닌 것도 LLM_GENERATION_FAILED 로 나간다. Backend 와 전용 code 를
+        #       합의하면 바꾼다 (docs/고쳐야할것들.md "예상하지 못한 스트림 오류가 ...").
+        logger.exception("chat stream failed: chat_id=%s user message=%r", chat_id, request.message)
+        yield sse.error(chat_id, "LLM_GENERATION_FAILED", "응답 생성 중 오류가 발생했습니다.")
 
     content = "".join(spoken) if done_content is None else done_content
     yield sse.done(chat_id, content, recommended)
