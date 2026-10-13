@@ -190,7 +190,7 @@ class SizeRecordingPerson(FakePersonDetector):
         self.sizes = sizes
 
     def detect(self, image):
-        self.sizes.append(("person", image.size))
+        self.sizes.append(("person", image.image.size))
         return super().detect(image)
 
 
@@ -200,7 +200,7 @@ class SizeRecordingPose(FakePoseDetector):
         self.sizes = sizes
 
     def detect(self, image):
-        self.sizes.append(("pose", image.size))
+        self.sizes.append(("pose", image.image.size))
         return super().detect(image)
 
 

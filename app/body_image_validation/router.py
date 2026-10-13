@@ -29,6 +29,11 @@ router = APIRouter(
         status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ApiResponse},
         status.HTTP_429_TOO_MANY_REQUESTS: {"model": ApiResponse},
         status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": ApiResponse},
+        # remote 모드(AI Server → Modal worker)에서만: BODY_IMAGE_WORKER_UNAVAILABLE(502/503),
+        # BODY_IMAGE_WORKER_TIMEOUT(504).
+        status.HTTP_502_BAD_GATEWAY: {"model": ApiResponse},
+        status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ApiResponse},
+        status.HTTP_504_GATEWAY_TIMEOUT: {"model": ApiResponse},
     },
 )
 

@@ -14,6 +14,12 @@ RELOAD = os.getenv("RELOAD", "1") == "1"
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
 AUTH_DISABLED = os.getenv("AUTH_DISABLED", "") == "1"
 
+# 전신 이미지 검증을 Modal worker 에 맡길 때(BODY_IMAGE_VALIDATION_MODE=remote) 쓰는 인증 정보.
+# Modal proxy auth token(Modal-Key / Modal-Secret 헤더)과 worker 의 INTERNAL_API_KEY(Bearer).
+BODY_IMAGE_REMOTE_PROXY_KEY = os.getenv("BODY_IMAGE_REMOTE_PROXY_KEY", "")
+BODY_IMAGE_REMOTE_PROXY_SECRET = os.getenv("BODY_IMAGE_REMOTE_PROXY_SECRET", "")
+BODY_IMAGE_REMOTE_API_KEY = os.getenv("BODY_IMAGE_REMOTE_API_KEY", "")
+
 # 2026-10-07 결정 — 채팅 LLM 은 Runware 의 OpenAI 호환 API 로 부른다(키는 RUNWARE_LLM_API_KEY).
 # 모델명은 Runware AIR 형식이다. 임베딩은 Runware 가 제공하지 않아 OpenAI 그대로다.
 # gpt@6-luna 는 되묻기 직후 라우팅(103/114)과 첫 말풍선 지연(최댓값 5.19·6.26s)에서 합격선을
