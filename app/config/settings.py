@@ -20,8 +20,19 @@ BODY_IMAGE_REMOTE_PROXY_KEY = os.getenv("BODY_IMAGE_REMOTE_PROXY_KEY", "")
 BODY_IMAGE_REMOTE_PROXY_SECRET = os.getenv("BODY_IMAGE_REMOTE_PROXY_SECRET", "")
 BODY_IMAGE_REMOTE_API_KEY = os.getenv("BODY_IMAGE_REMOTE_API_KEY", "")
 
-# 단계2 §4.2 — 8개 사용처 전부 gpt-5.6-luna
-MODEL = os.getenv("CHAT_MODEL", "gpt-5.6-luna")
+# 2026-10-07 결정 — 채팅 LLM 은 Runware 의 OpenAI 호환 API 로 부른다(키는 RUNWARE_LLM_API_KEY).
+# 모델명은 Runware AIR 형식이다. 임베딩은 Runware 가 제공하지 않아 OpenAI 그대로다.
+# gpt@6-luna 는 되묻기 직후 라우팅(103/114)과 첫 말풍선 지연(최댓값 5.19·6.26s)에서 합격선을
+# 넘지 못해 5.6 을 쓴다 (2026-10-07 로컬 측정).
+MODEL = os.getenv("CHAT_MODEL", "openai:gpt@5.6-luna")
+LLM_BASE_URL = "https://api.runware.ai/v1"
+# 채팅 LLM(Runware) HTTP timeout(초). 지정하지 않으면 SDK 기본값 600초라 Runware 가 멈추면
+# 사용자는 10분 동안 빈 말풍선을 본다. Runware + 5.6 의 첫 토큰까지 최대 3.81초(2026-10-07
+# 로컬 측정)에 여유를 두어 6초로 잡았다 (2026-10-12 결정). 임베딩 클라이언트에는 걸지 않았다.
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "6"))
+# SDK 자동 재시도 횟수. 기본값 2회면 Runware 가 멈췄을 때 6 + 0.5 + 6 + 1 + 6 = 최악 19.5초를
+# 기다린 뒤에야 error 를 보낸다. 1회로 줄여 6 + 0.5 + 6 = 최악 12.5초 (2026-10-12 결정).
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "1"))
 
 # 단계2 §4.8 — 상한은 "보이는 출력"이 아니라 "추론 + 출력"으로 잡아야 한다.
 # analyze는 추론을 끄므로(effort=none) 출력 길이만 고려하면 된다.
