@@ -14,6 +14,12 @@ RELOAD = os.getenv("RELOAD", "1") == "1"
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
 AUTH_DISABLED = os.getenv("AUTH_DISABLED", "") == "1"
 
+# 전신 이미지 검증을 Modal worker 에 맡길 때(BODY_IMAGE_VALIDATION_MODE=remote) 쓰는 인증 정보.
+# Modal proxy auth token(Modal-Key / Modal-Secret 헤더)과 worker 의 INTERNAL_API_KEY(Bearer).
+BODY_IMAGE_REMOTE_PROXY_KEY = os.getenv("BODY_IMAGE_REMOTE_PROXY_KEY", "")
+BODY_IMAGE_REMOTE_PROXY_SECRET = os.getenv("BODY_IMAGE_REMOTE_PROXY_SECRET", "")
+BODY_IMAGE_REMOTE_API_KEY = os.getenv("BODY_IMAGE_REMOTE_API_KEY", "")
+
 # 단계2 §4.2 — 8개 사용처 전부 gpt-5.6-luna
 MODEL = os.getenv("CHAT_MODEL", "gpt-5.6-luna")
 

@@ -219,3 +219,44 @@ def test_encode_png_round_trip_keeps_every_rgba_pixel():
 
     assert np.array_equal(restored, original)
     assert np.array_equal(restored[:, :, 3], original[:, :, 3])
+
+
+def test_providers_are_left_to_rembg_unless_configured(fake_rembg):
+    # fake new_session 은 providers 인자를 받지 않는다. 넘기면 TypeError 로 실패한다.
+    RembgBackgroundRemover("model.onnx")
+
+
+def test_configured_providers_are_passed_in_order(fake_rembg):
+    received = {}
+
+    def new_session(name, model_path, sess_opts, **kwargs):
+        received.update(kwargs, sess_opts=sess_opts)
+        return "session"
+
+    fake_rembg.new_session = new_session
+
+    RembgBackgroundRemover("model.onnx", providers=("CUDAExecutionProvider", "CPUExecutionProvider"))
+
+    assert received["providers"] == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    assert received["sess_opts"].enable_cpu_mem_arena is False
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, ()),
+        ("", ()),
+        ("CUDAExecutionProvider,CPUExecutionProvider", ("CUDAExecutionProvider", "CPUExecutionProvider")),
+        (" CUDAExecutionProvider , CPUExecutionProvider ", ("CUDAExecutionProvider", "CPUExecutionProvider")),
+    ],
+)
+def test_rembg_providers_config(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("BODY_IMAGE_REMBG_PROVIDERS", raising=False)
+    else:
+        monkeypatch.setenv("BODY_IMAGE_REMBG_PROVIDERS", value)
+    try:
+        assert importlib.reload(config).REMBG_PROVIDERS == expected
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)

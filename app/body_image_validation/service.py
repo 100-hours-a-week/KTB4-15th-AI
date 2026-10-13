@@ -5,12 +5,13 @@ from typing import Protocol
 
 from PIL import Image
 
-from app.body_image_validation import validation_rules
+from app.body_image_validation import deadline, validation_rules
 from app.body_image_validation.background import encode_png
 from app.body_image_validation.brightness import BrightnessCheckError, validate_brightness
 from app.body_image_validation.concurrency import BodyValidationLimiter
 from app.body_image_validation.detectors import DetectionImage, PersonDetector, PoseDetector
 from app.body_image_validation.exceptions import BodyImageSystemError
+from app.body_image_validation.gpu_preprocessing import GpuImagePreprocessor
 from app.body_image_validation.image_io import load_image, open_image
 from app.body_image_validation.models import BodyImageValidationResult
 from app.clients.s3 import ImageStorage, ImageStorageError
@@ -29,14 +30,19 @@ class BodyImageValidationService:
         background_remover: BackgroundRemover,
         image_storage: ImageStorage,
         limiter: BodyValidationLimiter | None = None,
+        gpu_preprocessor: GpuImagePreprocessor | None = None,
     ) -> None:
         self.person_detector = person_detector
         self.pose_detector = pose_detector
         self.background_remover = background_remover
         self.image_storage = image_storage
+        # local 모드는 기존 정책 그대로 대기 시간 제한이 없다(대기열 크기만 제한). 대기 시간 제한은 remote 모드의
+        # deadline 과 함께 runtime.RemoteBodyImageRuntime 이 건다.
         self.limiter = limiter or BodyValidationLimiter(
             config.MAX_CONCURRENT_BODY_VALIDATIONS, config.MAX_WAITING_BODY_VALIDATIONS
         )
+        # None 이면 기존처럼 Pillow 로만 처리한다.
+        self.gpu_preprocessor = gpu_preprocessor
 
     def validate(self, image_body: bytes) -> BodyImageValidationResult:
         # 헤더만 읽는 입력 검증은 슬롯 밖에서 한다. 잘못된 이미지가 대기열을 차지하지 않게 하기
@@ -45,7 +51,9 @@ class BodyImageValidationService:
         source = open_image(image_body)
         try:
             with self.limiter.slot():
-                image = load_image(source)
+                # Modal worker 에서만 의미가 있다(AI Server 가 deadline 을 보냈을 때). 이미 지났으면 GPU 작업 전에 멈춘다.
+                deadline.check("before_processing")
+                image = self._load(source, image_body)
                 source.close()  # decode 에 쓴 원본 픽셀과 입력 버퍼를 먼저 놓는다.
                 try:
                     return self._validate_decoded(image)
@@ -54,10 +62,22 @@ class BodyImageValidationService:
         finally:
             source.close()
 
+    def _load(self, source: Image.Image, image_body: bytes) -> Image.Image:
+        """GPU 로 처리할 수 있는 JPEG 는 GPU 로, 나머지와 GPU 실패는 기존 Pillow load_image 로.
+
+        두 경로 모두 source 와 다른 처리용 RGB 이미지를 돌려주고 호출자가 닫는다.
+        """
+        if self.gpu_preprocessor is not None:
+            image = self.gpu_preprocessor.try_load(source, image_body)
+            if image is not None:
+                return image
+        return load_image(source)
+
     def _validate_decoded(self, image: Image.Image) -> BodyImageValidationResult:
         """image 는 호출자가 닫는다. 여기서 만든 배경 제거 결과는 여기서 닫는다."""
         self._check_body(image)
 
+        deadline.check("before_background_removal")
         try:
             result = self.background_remover.remove(image)
         except Exception as error:
@@ -69,6 +89,8 @@ class BodyImageValidationService:
             raise BodyImageSystemError("IMAGE_ENCODING_FAILED") from error
         finally:
             result.close()
+        # AI Server 가 결과를 받을 시간이 남지 않았으면 올리지 않는다(아무도 받지 않을 객체를 만들지 않는다).
+        deadline.check("before_upload", margin=deadline.UPLOAD_MARGIN_SECONDS)
         key = f"body-images/{uuid.uuid4()}.png"
         try:
             self.image_storage.upload_bytes(png, key, "image/png")
