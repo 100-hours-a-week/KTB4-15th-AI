@@ -74,6 +74,21 @@ def test_values_never_enter_the_sql_text():
     assert "레드'" not in sql
 
 
+def test_shown_products_are_excluded_before_top_k():
+    sql, params = _query(exclude_codes=["0000001", "0000002"])
+    where = sql.split("WHERE", 1)[1].split("), ranked", 1)[0]
+    # WHERE 에서 빼야 top_k 가 남은 후보 안에서 잘린다
+    assert "NOT (product_code = ANY(%(exclude_codes)s::bigint[]))" in where
+    assert params["exclude_codes"] == ["0000001", "0000002"]
+    assert "NOT IN" not in sql
+
+
+def test_no_shown_products_adds_no_condition():
+    sql, params = _query(exclude_codes=[])
+    assert "product_code = ANY" not in sql
+    assert "exclude_codes" not in params
+
+
 def test_category_expands_to_its_source_categories():
     sql, params = _query(category="쇼츠")
     assert "sub_category = ANY(%(category_sources)s)" in sql
@@ -97,6 +112,8 @@ def test_item_type_is_sent_as_top_or_bottom():
     # Backend 합의 (2026-09-27): DB 의 한글 대분류가 아니라 TOP / BOTTOM 으로 보낸다
     assert _to_product(_row("상의"))["item_type"] == "TOP"
     assert _to_product(_row("하의"))["item_type"] == "BOTTOM"
+
+
 
 
 def test_price_range_uses_both_bounds():
