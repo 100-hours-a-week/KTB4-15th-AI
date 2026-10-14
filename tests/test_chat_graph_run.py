@@ -17,10 +17,10 @@ PRODUCTS = [
     {
         "product_code": "0000011",
         "product_name": "오버핏 후드 집업",
-        "image_url": "https://example.com/11.jpg",
-        "detail_url": "https://example.com/p/11",
+        "product_image_url": "https://example.com/11.jpg",
+        "purchase_url": "https://example.com/p/11",
         "color": "IVORY",
-        "llm_comment": "최근 찜한 상품과 비슷한 실루엣입니다.",
+        "recommended_reason": "최근 찜한 상품과 비슷한 실루엣입니다.",
     }
 ]
 

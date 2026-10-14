@@ -22,10 +22,10 @@ PRODUCTS = [
     {
         "product_code": "0000001",
         "product_name": "오버핏 코튼 셔츠",
-        "image_url": "https://example.com/1.jpg",
-        "detail_url": "https://example.com/p/1",
+        "product_image_url": "https://example.com/1.jpg",
+        "purchase_url": "https://example.com/p/1",
         "color": "NAVY",
-        "llm_comment": "차분한 네이비 셔츠입니다.",
+        "recommended_reason": "차분한 네이비 셔츠입니다.",
     }
 ]
 

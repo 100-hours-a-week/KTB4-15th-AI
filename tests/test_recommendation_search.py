@@ -114,6 +114,13 @@ def test_item_type_is_sent_as_top_or_bottom():
     assert _to_product(_row("하의"))["item_type"] == "BOTTOM"
 
 
+def test_product_keys_match_backend_contract():
+    # Backend 와 맞춘 필드명 (2026-10-14 변경). types.py 를 읽지 않고 여기 직접 적어야
+    # types.py 와 search.py 를 같이 잘못 바꿔도 잡힌다
+    assert set(_to_product(_row("상의"))) == {
+        "product_code", "product_name", "product_image_url", "purchase_url", "color",
+        "current_price", "item_type", "recommended_reason",
+    }
 
 
 def test_price_range_uses_both_bounds():

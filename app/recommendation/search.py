@@ -128,12 +128,12 @@ def _to_product(row: dict) -> Product:
     return Product(
         product_code=str(row["product_code"]),
         product_name=row["product_name"],
-        image_url=row["image_url"],
-        detail_url=row["detail_url"],
+        product_image_url=row["image_url"],
+        purchase_url=row["detail_url"],
         color=row["color"] or "",
-        price=row["price"],
+        current_price=row["price"],
         item_type=ITEM_TYPES[row["main_category"]],
-        llm_comment=row["description_summary"] or "",
+        recommended_reason=row["description_summary"] or "",
     )
 
 
