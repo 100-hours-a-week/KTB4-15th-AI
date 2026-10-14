@@ -249,6 +249,7 @@ async def search(state: dict) -> dict:
         for item in conditions.get("dislikes", [])
         if item.get("field") in vocab.FILTERABLE_FIELDS
     ]
+    shown = state.get("shown_product_codes", [])
 
     products = await recommendation.search_products(
         color=conditions.get("color"),
@@ -258,15 +259,21 @@ async def search(state: dict) -> dict:
         dislikes=dislikes,
         semantic_query=_search_query(state),
         top_k=settings.TOP_K,
+        exclude_codes=shown,
     )
 
     # 0건이면 빈 배열 그대로 내보낸다. 문구는 프론트가 만든다.
     # done 의 content 는 말풍선이 없는 이 턴을 위해 합의한 고정 문구로 채운다.
     writer({"event": sse.PRODUCTS, "products": products, "done_content": sse.SEARCH_DONE_CONTENT})
 
+    # 다음 턴의 "다른 거"(no)는 같은 조건으로 바로 다시 검색, "고마워"(yes)는 chat 으로 간다.
+    # 0건이면 아무것도 묻지 않은 상태(None)로 둔다 (2026-10-14). 같은 조건으로 다시 찾아도 0건이라
+    # 다음 턴은 조건을 말하면 summarize, 그 밖에는 chat 으로 간다. ask_change 를 남기면 "응"(yes)이
+    # 같은 0건 검색으로 간다. chat 은 대화 기록의 "찾지 못했다"를 보고 조건을 다시 묻는다.
     return {
         "messages": [_recommendation_message(products)],
-        "pending_question": None,
+        "pending_question": "confirm_result" if products else None,
+        "shown_product_codes": shown + [product["product_code"] for product in products],
     }
 
 
@@ -286,7 +293,12 @@ async def wishlist(state: dict) -> dict:
     )
 
     writer({"event": sse.PRODUCTS, "products": products})
+    # 찜 추천도 보여준 상품이므로 다음 검색에서 뺀다 (2026-10-13, QA 9번)
+    # sabu: 찜 추천 뒤의 "다른 거" — 여기서는 confirm_result 를 남기지 않는다.
+    #       칩 턴 바로 다음에 "다른 거 보여줘"가 오면 어느 노드로 가고, 사용자는 무엇을 보게 되나?
     return {
         "messages": [_recommendation_message(products)],
         "pending_question": None,
+        "shown_product_codes": state.get("shown_product_codes", [])
+        + [product["product_code"] for product in products],
     }

@@ -20,7 +20,7 @@ async def recommend_from_wishlist(
     comment 6회는 병렬로 생성한다 (2026-09-17 결정). 갈래별 공통 특징 추출 2회의
     병렬 여부는 미정이다.
 
-    개별 상품의 comment 생성이 실패하면 그 상품의 llm_comment 를 빈 문자열로 두고
+    개별 상품의 comment 생성이 실패하면 그 상품의 recommended_reason 을 빈 문자열로 두고
     나머지는 그대로 추천한다. 전부 실패한 경우에만 WishlistCommentError 를 던진다.
 
     on_progress 는 진행 라벨을 받는 선택 콜백이다. 화면에 그대로 나가는 문구이므로

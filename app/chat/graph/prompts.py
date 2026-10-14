@@ -55,6 +55,14 @@ _ANSWER_MEANING = """answer 의 뜻:
 _PENDING_CONTEXT = {
     "confirm_summary": "봇이 지금까지의 조건을 요약하고, 이 조건으로 추천해도 될지 물었다.",
     "ask_change": "봇이 추천 조건 중 무엇을 바꾸고 싶은지 물었다.",
+    "confirm_result": (
+        "봇이 상품을 추천했다. 추천한 상품이 마음에 드는지에 대한 답으로 읽는다. "
+        "만족·감사(\"고마워\", \"좋네\")는 yes, 다른 상품을 원하면(\"다른 거\", \"별로야\") no 다. "
+        "\"다른 거\"는 조건이 아니므로 detail_category·mood 에 넣지 않는다."
+    ),
+    # "다른 거"를 조건으로 보지 말라는 문장은 이 상황에만 둔다. _ANALYZE_RULES 에 두면 모든 상황에
+    # 실려 요약 직후 "다시 할래"가 yes(search)로, "가을 말고 여름"이 조건 없음으로 읽혔다
+    # (2026-10-14 같은 시각 20회: 20/20 → 12/20, 20/20 → 16/20).
 }
 _NO_PENDING_CONTEXT = "봇이 묻고 있는 것이 없다."
 
@@ -62,9 +70,6 @@ _NO_PENDING_CONTEXT = "봇이 묻고 있는 것이 없다."
 # sabu: 배포 전 대화 — 운영 checkpointer 에는 pending_question 없이 awaiting_confirm=True 로 저장된
 #       대화가 남아 있다. 배포 직후 그 대화에 "응"이 오면 여기서는 무엇으로 읽히고, 어느 노드로 가지?
 def analyze_prompt(state: dict, message: str) -> list[dict]:
-    # sabu: 재검색 — analyze 는 누적 조건과 현재 메시지만 보고 추천 기록은 보지 않는다.
-    #       "다른 것도 보여줘"가 왔을 때 이미 보여준 상품을 빼고 다시 찾으려면
-    #       무엇이 더 필요하지? 그 값은 어느 State 필드에 있어야 하지?
     rules = _ANALYZE_RULES.format(
         answers=", ".join(ANSWERS),
         colors=", ".join(vocab.ALLOWED_COLORS),
