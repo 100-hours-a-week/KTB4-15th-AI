@@ -122,6 +122,14 @@ def apply_color_quota(rows: list[dict], *, top_k: int) -> list[dict]:
     return (main + sub)[:top_k]
 
 
+# 최종 선정한 상품에 추천 이력을 남긴다 (2026-10-15 결정). 가격 변동 알림이 이 표시로 고른다.
+MARK_RECOMMENDED_SQL = """
+UPDATE products
+   SET has_been_recommended = true
+ WHERE product_code = ANY(%(codes)s::bigint[])
+"""
+
+
 # sabu: 목록 밖 대분류 — main_category 에 "상의"/"하의" 말고 다른 값(예: 나중에 분리할 "아우터")이
 #       들어오면 이 함수는 어떻게 되고, 그 예외는 search_products 의 except 안에서 나나 밖에서 나나?
 def _to_product(row: dict) -> Product:
@@ -140,6 +148,8 @@ def _to_product(row: dict) -> Product:
 # sabu: 빈 질의 — nodes._search_query 는 조건도 분위기도 없는 턴에 "" 를 돌려준다(테스트가 그걸 지킨다).
 #       그 "" 가 여기 오면 임베딩 API 는 무엇을 하고, 사용자는 무엇을 보게 되나?
 # sabu: 품절 — 단계3 은 품절 상태를 metadata filter 로 적어 두었는데, 이 쿼리는 is_sold_out 을 보나?
+# sabu: 추천 표시 실패 — 검색은 성공했는데 표시 UPDATE 만 실패하면 사용자는 무엇을 보게 되나?
+#       표시가 검색 결과를 막을 만큼 중요한가? 그리고 SSE 가 프론트에 닿기 전에 끊긴 상품도 "추천했다"인가?
 async def search_products(
     *,
     color: str | None,
@@ -179,8 +189,11 @@ async def search_products(
         ):
             await cursor.execute(sql, params)
             rows = await cursor.fetchall()
+            picked = apply_color_quota(rows, top_k=top_k)
+            if picked:
+                codes = [row["product_code"] for row in picked]
+                await cursor.execute(MARK_RECOMMENDED_SQL, {"codes": codes})
     except (LLMError, psycopg.Error) as error:
         raise RecommendationError(f"상품 검색에 실패했습니다: {error}") from error
 
-    picked = apply_color_quota(rows, top_k=top_k)
     return [_to_product(row) for row in picked]
