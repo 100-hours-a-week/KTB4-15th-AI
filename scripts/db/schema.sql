@@ -41,6 +41,13 @@ ALTER TABLE products
 -- sabu: 같은 사실이 두 컬럼에 있다 — color 가 colors 안에 없는 행이 생기면 무엇이 맞는 값인가? 적재할 때 그걸 막는가, 읽을 때 알아채는가?
 CREATE INDEX IF NOT EXISTS products_colors_gin ON products USING gin (colors);
 
+-- 추천 이력 (2026-10-15 결정). 가격 변동 알림이 "추천된 적 있는 상품"만 고르는 데 쓴다.
+--   검색 추천과 찜 기반 추천이 최종 선정한 상품만 true 로 바꾼다.
+--   한 번 true 가 되면 되돌리지 않는다. 누구에게·언제 추천했는지는 담지 않는다.
+--   이미 떠 있는 DB 에서는 기존 행이 모두 false 로 생긴다.
+ALTER TABLE products
+    ADD COLUMN IF NOT EXISTS has_been_recommended boolean NOT NULL DEFAULT false;
+
 -- 가상피팅 Runware 하루 사용액 (2026-09-28 결정). 하루 한 줄.
 --   usage_date    : UTC 날짜. getUsageActivity 기본 timezone(UTC)과 같은 "오늘" — KST 09:00 에 바뀐다.
 --   amount        : includeCost 로 받은 금액을 누적한 값(USD). 보정 때 Runware 합계와 큰 쪽을 남긴다.
