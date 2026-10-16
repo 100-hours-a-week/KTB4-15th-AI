@@ -68,6 +68,21 @@ CHECKPOINT_DSN = os.getenv("CHECKPOINT_DSN", "")
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
 S3_BUCKET = os.getenv("S3_BUCKET", "")
 
+# V2 비동기 가상피팅 Presigned URL 유효기간(초). 버킷은 위 S3_BUCKET 하나를 그대로 쓴다.
+# - 사용자 원본 GET: Pruna 호출 직전에 발급한다. Pruna 가 실제로 읽을 때까지 유효해야 한다.
+# - 결과 PUT(uploadEndpoint): Pruna 가 생성을 마치고 업로드할 때까지 유효해야 한다.
+# - 결과 GET: OpenAI 후처리에 넘길 때 발급한다.
+# IAM Role(임시 자격증명)으로 서명하므로 실제 만료는 이 값과 자격증명 만료 중 이른 쪽이다.
+VIRTUAL_FITTING_USER_IMAGE_URL_EXPIRES_SECONDS = int(
+    os.getenv("VIRTUAL_FITTING_USER_IMAGE_URL_EXPIRES_SECONDS", "1800")
+)
+VIRTUAL_FITTING_RESULT_UPLOAD_URL_EXPIRES_SECONDS = int(
+    os.getenv("VIRTUAL_FITTING_RESULT_UPLOAD_URL_EXPIRES_SECONDS", "3600")
+)
+VIRTUAL_FITTING_RESULT_IMAGE_URL_EXPIRES_SECONDS = int(
+    os.getenv("VIRTUAL_FITTING_RESULT_IMAGE_URL_EXPIRES_SECONDS", "600")
+)
+
 # PostgreSQL pool 크기. 가상피팅 상품 조회는 짧은 SELECT만 수행하고 connection을 즉시
 # 반환한다. 외부 모델 응답을 기다리는 동안 connection을 점유하지 않는다.
 DATABASE_POOL_MIN_SIZE = int(os.getenv("DATABASE_POOL_MIN_SIZE", "1"))
