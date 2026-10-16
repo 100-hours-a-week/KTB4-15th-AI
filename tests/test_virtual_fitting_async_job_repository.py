@@ -72,6 +72,8 @@ class UnusablePool:
         {"user_image_key": "https://bucket.s3.amazonaws.com/users/3.jpg?X-Amz-Signature=x"},
         {"user_image_key": "/users/3.jpg"},
         {"products": []},
+        {"products": ["1", "2", "3"]},
+        {"products": ["1", "2", "3", "4", "5"]},
         {"products": "123456"},
         {"products": [123456]},
         {"products": ["123456", ""]},
@@ -83,6 +85,19 @@ class UnusablePool:
 def test_invalid_new_job_is_rejected_before_db(overrides):
     with pytest.raises((TypeError, ValueError)):
         AsyncJobRepository(UnusablePool()).create(_new_job(**overrides))
+
+
+@pytest.mark.parametrize("products", [["123456"], ["123456", "789012"]])
+def test_one_or_two_products_pass_validation(products):
+    params = repo_module._check_new_job(_new_job(products=products))
+    assert params[3] == products
+
+
+@pytest.mark.parametrize("count", [0, 3, 4])
+def test_wrong_product_count_never_reaches_the_db(count):
+    products = [str(100000 + i) for i in range(count)]
+    with pytest.raises(ValueError, match="1~2"):
+        AsyncJobRepository(UnusablePool()).create(_new_job(products=products))
 
 
 @pytest.mark.parametrize("value", [None, "", "not-a-uuid", 123])
@@ -228,6 +243,19 @@ def test_duplicate_job_id_keeps_existing_input_and_result(pg):
     assert again.job.created_at == original.created_at
     assert again.job.requested_at == REQUESTED_AT  # 재수신으로 바뀌지 않는다
     assert pg["sql"]("SELECT count(*) FROM virtual_fitting_async_jobs") == [(1,)]
+
+
+@pytest.mark.parametrize("products", [["123456"], ["123456", "789012"]])
+def test_one_or_two_products_are_stored(pg, products):
+    job = AsyncJobRepository(pg["pool"]).create(_new_job(products=products)).job
+    assert job.products == tuple(products)
+
+
+@pytest.mark.parametrize("count", [0, 3])
+def test_wrong_product_count_is_not_saved(pg, count):
+    with pytest.raises(ValueError):
+        AsyncJobRepository(pg["pool"]).create(_new_job(products=[str(i + 1) for i in range(count)]))
+    assert pg["sql"]("SELECT count(*) FROM virtual_fitting_async_jobs") == [(0,)]
 
 
 def test_max_bigint_job_id_is_stored(pg):

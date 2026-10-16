@@ -17,6 +17,8 @@ from app.virtual_fitting.exceptions import FittingDatabaseError
 
 TABLE = "virtual_fitting_async_jobs"
 _MAX_BIGINT = 2**63 - 1
+# 한 작업의 상품 수. 상의·하의 각 1개까지라 최대 2개다.
+MAX_PRODUCTS = 2
 
 
 class AsyncJobStatus(str, Enum):
@@ -123,7 +125,9 @@ def _check_new_job(job: NewAsyncFittingJob) -> tuple:
     if isinstance(job.products, (str, bytes)) or not isinstance(job.products, Sequence):
         raise TypeError("products 는 상품 코드 문자열 목록이어야 합니다.")
     products = list(job.products)
-    if not products or any(not isinstance(code, str) or not code.strip() for code in products):
+    if not 1 <= len(products) <= MAX_PRODUCTS:
+        raise ValueError(f"products 는 1~{MAX_PRODUCTS}개여야 합니다.")
+    if any(not isinstance(code, str) or not code.strip() for code in products):
         raise ValueError("products 는 비어 있지 않은 상품 코드 문자열 목록이어야 합니다.")
     if not isinstance(job.requested_at, datetime) or job.requested_at.utcoffset() is None:
         raise ValueError("requested_at 은 timezone 이 있는 datetime 이어야 합니다.")
