@@ -83,6 +83,15 @@ VIRTUAL_FITTING_RESULT_IMAGE_URL_EXPIRES_SECONDS = int(
     os.getenv("VIRTUAL_FITTING_RESULT_IMAGE_URL_EXPIRES_SECONDS", "600")
 )
 
+# V2 비동기 가상피팅 SQS Standard 큐 URL. 리전은 AWS_REGION 과 같아야 한다(app/clients/sqs.py 가 검사).
+# 큐·DLQ 생성과 IAM 설정은 Cloud 담당이다. 비어 있으면 그 큐를 쓰는 시점에 SQS_CONFIG_ERROR.
+# - be-fitting-request : BE 가 발행, AI 요청 Worker 가 수신·삭제·Visibility 연장
+# - ai-fitting-response: AI Webhook·요청 Worker·Watchdog 이 발행, AI 후처리 Worker 가 수신
+# - be-fitting-response: AI 가 최종 결과 발행, BE 결과 Worker 가 소비
+BE_FITTING_REQUEST_QUEUE_URL = os.getenv("BE_FITTING_REQUEST_QUEUE_URL", "")
+AI_FITTING_RESPONSE_QUEUE_URL = os.getenv("AI_FITTING_RESPONSE_QUEUE_URL", "")
+BE_FITTING_RESPONSE_QUEUE_URL = os.getenv("BE_FITTING_RESPONSE_QUEUE_URL", "")
+
 # PostgreSQL pool 크기. 가상피팅 상품 조회는 짧은 SELECT만 수행하고 connection을 즉시
 # 반환한다. 외부 모델 응답을 기다리는 동안 connection을 점유하지 않는다.
 DATABASE_POOL_MIN_SIZE = int(os.getenv("DATABASE_POOL_MIN_SIZE", "1"))
