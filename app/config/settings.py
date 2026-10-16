@@ -45,6 +45,12 @@ SUMMARY_MAX_OUTPUT_TOKENS = int(os.getenv("SUMMARY_MAX_OUTPUT_TOKENS", "300"))
 # 검색 기반 추천은 Top 3 (단계1 §7, 단계5 §3.2)
 TOP_K = int(os.getenv("TOP_K", "3"))
 
+# 찜 기반 추천은 최빈 색상 갈래 3 + 최빈 카테고리 갈래 3, 최대 6개 (단계1 §7)
+WISHLIST_TOP_K_PER_BRANCH = int(os.getenv("WISHLIST_TOP_K_PER_BRANCH", "3"))
+# 공통 특징 한 문장, 추천 이유 한두 문장. 둘 다 추론을 끈다(effort=none).
+WISHLIST_FEATURES_MAX_OUTPUT_TOKENS = int(os.getenv("WISHLIST_FEATURES_MAX_OUTPUT_TOKENS", "200"))
+WISHLIST_REASON_MAX_OUTPUT_TOKENS = int(os.getenv("WISHLIST_REASON_MAX_OUTPUT_TOKENS", "200"))
+
 # 검색 질의와 상품 설명을 같은 모델로 임베딩해야 거리가 의미를 갖는다 (단계5 §3.5).
 # 차원은 scripts/db/schema.sql 의 embedding vector(1536) 과 한 몸이다. 적재 스크립트
 # scripts/pipeline/embed_products.py 도 이 값을 읽는다.

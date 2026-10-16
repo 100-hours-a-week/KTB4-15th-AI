@@ -292,7 +292,8 @@ async def wishlist(state: dict) -> dict:
         on_progress=on_progress,
     )
 
-    writer({"event": sse.PRODUCTS, "products": products})
+    done_content = sse.WISHLIST_DONE_CONTENT if products else sse.WISHLIST_EMPTY_DONE_CONTENT
+    writer({"event": sse.PRODUCTS, "products": products, "done_content": done_content})
     # 찜 추천도 보여준 상품이므로 다음 검색에서 뺀다 (2026-10-13, QA 9번)
     # sabu: 찜 추천 뒤의 "다른 거" — 여기서는 confirm_result 를 남기지 않는다.
     #       칩 턴 바로 다음에 "다른 거 보여줘"가 오면 어느 노드로 가고, 사용자는 무엇을 보게 되나?

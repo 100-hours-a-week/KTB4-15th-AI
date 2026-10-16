@@ -52,6 +52,29 @@ def test_chip_click_reaches_the_wishlist_node(monkeypatch):
 
     assert [event["event"] for event in events] == [sse.STATUS, sse.PRODUCTS]
     assert events[-1]["products"] == PRODUCTS
+    assert events[-1]["done_content"] == sse.WISHLIST_DONE_CONTENT
+
+
+def test_chip_click_with_no_result_sends_the_empty_phrase(monkeypatch):
+    async def fake_wishlist(*, product_ids, on_progress=None):
+        return []
+
+    monkeypatch.setattr(recommendation, "recommend_from_wishlist", fake_wishlist)
+
+    graph = build_graph(InMemorySaver())
+    state = initial_state(
+        "내 찜 목록으로 추천받기",
+        source_type="WISHLIST",
+        product_ids=[str(i) for i in range(10)],
+    )
+
+    events = _collect(graph, state, "chip-turn-empty")
+
+    assert events[-1] == {
+        "event": sse.PRODUCTS,
+        "products": [],
+        "done_content": sse.WISHLIST_EMPTY_DONE_CONTENT,
+    }
 
 
 def test_recommendation_is_left_in_the_conversation(monkeypatch):
