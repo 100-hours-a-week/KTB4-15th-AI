@@ -11,7 +11,7 @@ name: AI dev CD
 run-name: >-
   ${{ github.event_name == 'push'
       && format('AI dev auto deploy - {0}', github.sha)
-      || format('AI dev rollback - {0}', inputs.image_tag) }}
+      || format('AI dev rollback - {0} ({1})', inputs.image_tag, inputs.target) }}
 
 on:
   # develop: 평소 dev 배포 / hotfix/**: 운영 반영 전 dev 서버에서 hotfix 검증
@@ -31,6 +31,17 @@ on:
         description: "롤백 사유"
         required: true
         type: string
+      # all: V1(EC2) + V2(ECS) / v1: EC2만 / v2: ECS만
+      # 한쪽만 다시 배포하거나, 다른 쪽에 영향 없이 배포 실패 경로를 검증할 때 사용한다.
+      target:
+        description: "배포 대상 (all: V1+V2, v1: EC2만, v2: ECS만)"
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - v1
+          - v2
 
 permissions: {}
 
@@ -106,7 +117,7 @@ jobs:
         always() &&
         (
           (github.event_name == 'push' && needs.build-and-push.result == 'success') ||
-          github.event_name == 'workflow_dispatch'
+          (github.event_name == 'workflow_dispatch' && inputs.target != 'v2')
         )
       }}
     runs-on: ubuntu-24.04
@@ -243,7 +254,7 @@ jobs:
         always() &&
         (
           (github.event_name == 'push' && needs.build-and-push.result == 'success') ||
-          github.event_name == 'workflow_dispatch'
+          (github.event_name == 'workflow_dispatch' && inputs.target != 'v1')
         )
       }}
     runs-on: ubuntu-24.04
