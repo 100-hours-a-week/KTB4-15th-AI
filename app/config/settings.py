@@ -126,3 +126,26 @@ VIRTUAL_FITTING_LLM_CONCURRENCY = int(os.getenv("VIRTUAL_FITTING_LLM_CONCURRENCY
 VIRTUAL_FITTING_LLM_SLOT_WAIT_TIMEOUT_SECONDS = float(
     os.getenv("VIRTUAL_FITTING_LLM_SLOT_WAIT_TIMEOUT_SECONDS", "15")
 )
+
+# V2 비동기 가상피팅 요청 Worker (app/virtual_fitting/request_worker.py). 별도 실행 명령 없이 FastAPI lifespan 이
+# 시작·종료한다(구조는 구현됨). 기본은 꺼짐: 꺼져 있으면 Worker 를 만들지 않으므로 Worker 용 SQS client·DB pool
+# 조립도 하지 않는다.
+# 주의: 7단계에는 Pruna 호출(8단계)과 결과 발행(14단계)이 없어 메시지를 거의 삭제하지 않는다. 켜면 같은 메시지가
+# Visibility Timeout 마다 다시 오고 maxReceiveCount(3) 뒤 DLQ 로 갈 수 있다. 운영 활성화는 Pruna 제출·Webhook·
+# 후처리·결과 발행·복구 경로를 함께 확인한 뒤 정한다(8단계 완료만으로 켜지 않는다).
+VIRTUAL_FITTING_REQUEST_WORKER_ENABLED = (
+    os.getenv("VIRTUAL_FITTING_REQUEST_WORKER_ENABLED", "false").strip().lower() == "true"
+)
+# 작업 실행 권한(DB lease)과 처리 중인 메시지의 숨김 시간(SQS Visibility Timeout)은 따로 연장한다(초).
+# 연장은 처리 단계 사이에서만 한다. 긴 외부 호출 하나가 진행되는 동안 주기적으로 연장하지는 않는다.
+VIRTUAL_FITTING_REQUEST_LEASE_SECONDS = float(
+    os.getenv("VIRTUAL_FITTING_REQUEST_LEASE_SECONDS", "120")
+)
+VIRTUAL_FITTING_REQUEST_VISIBILITY_SECONDS = int(
+    os.getenv("VIRTUAL_FITTING_REQUEST_VISIBILITY_SECONDS", "120")
+)
+# 종료할 때 Worker 가 스스로 끝나기를 기다리는 시간(초). 전체 종료 시간의 상한이 아니다. 넘으면 수신 대기(long
+# polling)는 버리지만, DB·S3·Runware 를 쓰는 처리 단계는 버리지 않고 끝날 때까지 추가로 기다린다(제한 없음).
+VIRTUAL_FITTING_REQUEST_SHUTDOWN_TIMEOUT_SECONDS = float(
+    os.getenv("VIRTUAL_FITTING_REQUEST_SHUTDOWN_TIMEOUT_SECONDS", "30")
+)

@@ -6,6 +6,7 @@
 
 from contextlib import asynccontextmanager
 
+from anyio import to_thread
 from fastapi import FastAPI
 
 from app import health as health_router
@@ -24,6 +25,7 @@ from app.virtual_fitting.providers.runware import (
     get_runware_llm_api_key,
     get_runware_vton_api_key,
 )
+from app.virtual_fitting.request_worker import create_request_worker
 
 # 컨테이너 CMD(`uvicorn app.main:app`)는 log_config 를 넘기지 않는다. uvicorn 은 이 모듈을
 # import 한 뒤에 "Started server process" 를 찍으므로, 여기서 적용하면 서버 로그부터 포맷이 맞는다.
@@ -38,13 +40,24 @@ async def lifespan(app: FastAPI):
     # 가상피팅 VTON / LLM 동시 실행 제한. 앱마다 새로 만들어 요청이 앱 상태로 꺼내 쓴다.
     app.state.fitting_limiters = create_fitting_limiters()
     runtime_manager.start()
+    # V2 요청 Worker 는 켰을 때만 이 프로세스와 함께 돈다(기본 꺼짐: SQS·AWS 를 보지 않는다).
+    app.state.request_worker = None
     try:
         await open_async_pool()
+        if settings.VIRTUAL_FITTING_REQUEST_WORKER_ENABLED:
+            # 조립은 blocking(DB pool·boto3)이라 thread 에서 한다.
+            app.state.request_worker = await to_thread.run_sync(create_request_worker)
+            app.state.request_worker.start()
         async with checkpointer_scope() as checkpointer:
             app.state.checkpointer = checkpointer
             app.state.graph = build_graph(checkpointer)
             yield
     finally:
+        # Worker 가 쓰는 DB pool 을 닫기 전에 Worker 부터 멈춘다.
+        if app.state.request_worker is not None:
+            await app.state.request_worker.stop(
+                settings.VIRTUAL_FITTING_REQUEST_SHUTDOWN_TIMEOUT_SECONDS
+            )
         runtime_manager.close()
         close_connection_pool()
         await close_async_pool()

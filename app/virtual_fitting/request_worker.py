@@ -1,0 +1,667 @@
+"""가상피팅 V2 AI 요청 Worker (be-fitting-request).
+
+FastAPI lifespan 이 시작·종료한다(별도 실행 명령 없음, VIRTUAL_FITTING_REQUEST_WORKER_ENABLED 기본 꺼짐).
+한 번에 메시지 하나씩:
+  수신(6단계 receive_fitting_requests) → fingerprint → 작업 등록·중복 비교 → 실행 권한 선점 → 사전 검증
+  → (통과) 8단계 Pruna 제출 연결 지점 / (확정 실패) 실패 결과 저장 / (일시 장애) 그대로 두고 다음 수신 때 재처리
+
+메시지 삭제 원칙: 접수 결과와 후속 실행·복구에 필요한 기록이 저장되고, 실제로 이어서 처리할 경로가 있을 때만
+삭제한다. RECEIVED 저장, task_uuid·이미지 Key·호출 시작 기록만으로는 삭제하지 않고, 아직 없는 Watchdog·결과
+발행을 복구 수단으로 가정하지 않는다.
+7단계 실제 동작: 결과 발행까지 끝난 작업(COMPLETED/FAILED + PUBLISHED)의 중복 메시지만 삭제한다. 사전 검증 통과·
+실패 결과 저장·일시 장애·충돌·형식 오류 등은 삭제하지 않는다. Pruna 접수·복구 연결에 따른 삭제 판단은 8단계에서
+submit 연결 지점에 구현한다.
+
+실행 권한(DB lease)·SQS Visibility Timeout 은 처리 단계 사이(before_step)에서만 각각 연장한다. 하나의 긴 외부
+호출이 진행되는 동안 주기적으로 연장하는 기능은 없다(8단계에서 확인·보완).
+
+동기 작업(SQS long polling·DB·S3·Runware)은 worker thread 에서 하나씩 돈다(전용 CapacityLimiter(1)). 그래서
+FastAPI 이벤트 루프와 다른 요청의 thread 를 막지 않는다. DB 트랜잭션·행 잠금은 5단계 메서드 안에서만 짧게 잡고,
+외부 조회 동안 들고 있지 않는다.
+"""
+
+import asyncio
+import hashlib
+import json
+import logging
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Protocol
+
+from anyio import CapacityLimiter, to_thread
+
+from app.clients.s3 import S3ObjectState
+from app.clients.sqs import FittingQueue, SqsQueueClient, SqsResult
+from app.virtual_fitting.async_request import (
+    FittingRequest,
+    InvalidRequestMessage,
+    RequestBatch,
+    ValidRequestMessage,
+)
+from app.virtual_fitting.exceptions import (
+    FittingBalanceExhaustedError,
+    FittingDailyBudgetExceededError,
+    InvalidFittingCombinationError,
+    ProductImageMissingError,
+    ProductNotFoundError,
+    UnsupportedSubCategoryError,
+    VirtualFittingError,
+)
+from app.virtual_fitting.models import FittingProduct
+from app.virtual_fitting.repositories.async_job_repository import (
+    AsyncFittingJob,
+    AsyncJobRepository,
+    AsyncJobStatus,
+    NewAsyncFittingJob,
+    NextAction,
+    ResultMessageStatus,
+)
+from app.virtual_fitting.repositories.async_job_state import AsyncJobStateRepository, ChangeReason
+
+logger = logging.getLogger(__name__)
+
+FINGERPRINT_VERSION = "v1"
+USER_IMAGE_NOT_FOUND_CODE = "INVALID_REQUEST"
+USER_IMAGE_NOT_FOUND_MESSAGE = "가상 피팅에 사용할 사진을 찾을 수 없습니다."
+# 재시도로 풀리지 않는 업무 실패. 모델을 부르지 않고 실패 결과를 저장한다.
+_PERMANENT_FAILURES = (
+    ProductNotFoundError,
+    InvalidFittingCombinationError,
+    ProductImageMissingError,
+    UnsupportedSubCategoryError,
+    FittingDailyBudgetExceededError,
+    FittingBalanceExhaustedError,
+)
+
+
+# --- fingerprint ---
+
+
+def request_fingerprint(user_image_key: str, product_codes: Sequence[str]) -> str:
+    """같은 fitting_job_id 로 다시 온 요청의 사진·상품이 같은지 비교하는 값.
+
+    규칙(v1): {"product_codes": 정렬한 상품 코드 목록(중복 개수 유지, 문자열 그대로), "user_image_key": Key} 를
+    키 정렬·공백 없는 UTF-8 JSON 으로 직렬화해 SHA-256 → "v1:<hex>". requested_at·수신 정보·추가 필드는 넣지
+    않는다. 정렬은 비교용일 뿐, 저장하는 상품 순서는 요청 그대로다.
+    """
+    canonical = json.dumps(
+        {"product_codes": sorted(product_codes), "user_image_key": user_image_key},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return f"{FINGERPRINT_VERSION}:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
+# --- 사전 검증 ---
+
+
+class PrecheckStatus(str, Enum):
+    PASSED = "passed"
+    # 재시도로 풀리지 않는 업무 실패(실패 결과 저장 대상)
+    FAILED = "failed"
+    # 일시 장애·설정 문제 등 지금 확정할 수 없음(결과 저장 안 함)
+    RETRY = "retry"
+
+
+@dataclass(frozen=True)
+class PrecheckOutcome:
+    status: PrecheckStatus
+    error_code: str | None = None
+    error_message: str | None = None
+    reason: str = ""
+    # PASSED 일 때 상의 → 하의 순서의 상품(8단계 Pruna 입력 준비에 쓴다)
+    products: tuple[FittingProduct, ...] = ()
+
+
+class ProductLookup(Protocol):
+    def find_by_codes(self, product_codes: Sequence[str]) -> list[FittingProduct]: ...
+
+
+class ObjectHead(Protocol):
+    def head_object(self, key: str) -> Any: ...
+
+
+class Budget(Protocol):
+    def ensure_available(self) -> None: ...
+
+
+class BalanceCheck(Protocol):
+    """Runware 잔액 사전 확인 연결 지점. 구현체는 잔액이 부족하면 FittingBalanceExhaustedError 를 낸다.
+
+    7단계에는 실제 잔액을 조회하는 구현이 없다(기본 NoBalancePrecheck). 8단계 계획(미구현): 실제 잔액 조회를
+    연결하고 FITTING_MIN_BALANCE_USD(기본 1.00 달러) 이하이면 생성을 막는다. 조회 실패는 생성을 보류하고
+    재처리하며, 잔액 부족이면 V1 fallback 도 하지 않는다.
+    """
+
+    def ensure_available(self) -> None: ...
+
+
+class NoBalancePrecheck:
+    """기본값. 실제 잔액을 조회하지 않고 아무것도 막지 않는다.
+
+    프로젝트에 Runware 잔액 사전 조회 기능이 없다(V1 도 생성 요청에 대한 402 응답으로만 잔액 부족을 안다).
+    생성 요청의 잔액 부족 응답은 Provider 가 분류한다(V1: FittingBalanceExhaustedError, V2 1단계 Provider:
+    REJECTED / balance_exhausted). V2 의 실제 생성 호출 연결은 8단계다.
+    """
+
+    def ensure_available(self) -> None:
+        return None
+
+
+class RequestPrecheck:
+    """Pruna 호출 전 확인. V1 의 상품 조회·조합 검증·세부 분류 매핑·하루 예산 확인을 그대로 쓴다.
+
+    순서: 상품(존재·이미지·조합·중복 코드) → 세부 분류 → 원본 사진(S3 HEAD, 내려받지 않음) → 하루 예산 → 잔액.
+    - 하루 예산(FittingBudget.ensure_available): 오늘 사용액이 FITTING_DAILY_BUDGET_USD(5 달러) **이상**이면 막는다.
+      남은 잔액이 아니라 오늘 쓴 금액이 기준이다. 마지막 보정이 FITTING_USAGE_RECONCILE_SECONDS 보다 오래됐으면
+      Runware getUsageActivity 로 하루 사용액을 조회해 AI DB usage_amount 에 보정값(큰 쪽)과 보정 시각을 저장한다.
+      새 생성 비용을 더하는 기록(record)은 하지 않는다(생성 후에 하는 일, 8단계).
+    - 잔액: BalanceCheck 연결 지점만 있다(기본 NoBalancePrecheck 는 막지 않음).
+    - 유료 생성 시도 횟수는 늘리지 않는다.
+    """
+
+    def __init__(
+        self,
+        products: ProductLookup,
+        image_storage: ObjectHead,
+        budget: Budget,
+        balance: BalanceCheck | None = None,
+    ):
+        self._products = products
+        self._image_storage = image_storage
+        self._budget = budget
+        self._balance = balance or NoBalancePrecheck()
+
+    def run(
+        self, request: FittingRequest, before_step: Callable[[], bool] = lambda: True
+    ) -> PrecheckOutcome:
+        """before_step() 이 False 면(lease·Visibility 연장 실패, 종료 요청) 다음 외부 조회를 시작하지 않는다."""
+        from app.virtual_fitting.product_selection import select_fitting_products
+        from app.virtual_fitting.prompt import build_fitting_prompt
+
+        try:
+            if not before_step():
+                return PrecheckOutcome(PrecheckStatus.RETRY, reason="stopped_before_products")
+            codes = list(request.product_codes)
+            not_numeric = [code for code in codes if not code.isdigit()]
+            if not_numeric:  # 상품 DB 의 product_code 는 정수다. 숫자가 아닌 코드는 없는 상품이다.
+                raise ProductNotFoundError(not_numeric)
+            products = select_fitting_products(codes, self._products)
+            build_fitting_prompt(products)  # 지원하지 않는 세부 분류면 UnsupportedSubCategoryError
+
+            if not before_step():
+                return PrecheckOutcome(PrecheckStatus.RETRY, reason="stopped_before_image")
+            image = self._image_storage.head_object(request.user_image_key)
+            state = getattr(image, "state", None)
+            if state is S3ObjectState.NOT_FOUND:
+                return PrecheckOutcome(
+                    PrecheckStatus.FAILED,
+                    USER_IMAGE_NOT_FOUND_CODE,
+                    USER_IMAGE_NOT_FOUND_MESSAGE,
+                    reason="user_image_not_found",
+                )
+            if state is not S3ObjectState.EXISTS:
+                # 403·설정 오류·일시 오류는 확정하지 않는다(403 은 객체가 없을 때도 날 수 있다).
+                return PrecheckOutcome(
+                    PrecheckStatus.RETRY, reason=f"user_image_{getattr(state, 'value', 'unknown')}"
+                )
+
+            if not before_step():
+                return PrecheckOutcome(PrecheckStatus.RETRY, reason="stopped_before_budget")
+            self._budget.ensure_available()
+            if not before_step():
+                return PrecheckOutcome(PrecheckStatus.RETRY, reason="stopped_before_balance")
+            self._balance.ensure_available()
+        except _PERMANENT_FAILURES as error:
+            return PrecheckOutcome(
+                PrecheckStatus.FAILED, error.code, error.message, reason=type(error).__name__
+            )
+        except VirtualFittingError as error:  # DB 조회 실패·Runware 사용량 조회 실패 등
+            return PrecheckOutcome(PrecheckStatus.RETRY, reason=error.code)
+        except Exception as error:
+            # 예상하지 못한 오류도 업무 실패로 확정하지 않는다.
+            logger.exception("request precheck crashed fitting_job_id=%s", request.fitting_job_id)
+            return PrecheckOutcome(PrecheckStatus.RETRY, reason=type(error).__name__)
+        return PrecheckOutcome(PrecheckStatus.PASSED, products=tuple(products))
+
+
+def failure_payload(fitting_job_id: int, error_code: str, error_message: str) -> dict[str, Any]:
+    """V2 실패 결과(result_payload / be-fitting-response)."""
+    return {
+        "fitting_job_id": fitting_job_id,
+        "status": "FAILED",
+        "error_code": error_code,
+        "error_message": error_message,
+    }
+
+
+# --- 메시지 하나 처리 ---
+
+
+@dataclass(frozen=True)
+class RequestOutcome:
+    """메시지 하나의 처리 결과. delete 가 True 일 때만 Worker 가 메시지를 지운다."""
+
+    message_id: str
+    fitting_job_id: int | None
+    action: str
+    delete: bool = False
+
+
+class Heartbeat:
+    """DB lease 와 SQS Visibility Timeout 을 각각 연장한다. 둘 중 하나라도 실패하면 False.
+
+    beat() 는 처리 단계 사이에서 불릴 때만 연장한다(마지막 연장 뒤 interval 이 지났을 때). 백그라운드에서 주기적으로
+    연장하지 않으므로, 단계 하나(외부 호출 하나)가 lease·Visibility 시간보다 오래 걸리면 그 사이에 만료될 수 있다.
+    """
+
+    def __init__(
+        self,
+        sqs: SqsQueueClient,
+        state: AsyncJobStateRepository,
+        fitting_job_id: int,
+        token: str,
+        receipt_handle: str,
+        *,
+        lease_seconds: float,
+        visibility_seconds: int,
+        interval_seconds: float,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self._sqs, self._state = sqs, state
+        self._job_id, self._token, self._receipt = fitting_job_id, token, receipt_handle
+        self._lease_seconds, self._visibility_seconds = lease_seconds, visibility_seconds
+        self._interval, self._clock = interval_seconds, clock
+        self._last = clock()
+
+    def beat(self) -> bool:
+        if self._clock() - self._last < self._interval:
+            return True
+        lease = self._state.renew_lease(self._job_id, self._token, self._lease_seconds)
+        if not lease.applied:
+            logger.warning(
+                "request worker lease renewal failed fitting_job_id=%s reason=%s",
+                self._job_id,
+                lease.reason.value,
+            )
+            return False
+        visibility: SqsResult = self._sqs.change_visibility(
+            FittingQueue.BE_FITTING_REQUEST, self._receipt, self._visibility_seconds
+        )
+        if not visibility.succeeded:
+            logger.warning(
+                "request worker visibility extension failed fitting_job_id=%s reason=%s",
+                self._job_id,
+                visibility.reason,
+            )
+            return False
+        self._last = self._clock()
+        return True
+
+
+# 8단계 Pruna 제출 연결 지점. (작업, lease 토큰, 요청, 사전 검증 결과, heartbeat) → 메시지를 지워도 되는지.
+# True 는 접수 결과와 후속 실행·복구에 필요한 기록을 저장했고, 실제로 이어서 처리할 경로가 있을 때만 돌려준다
+# (task_uuid·이미지 Key·호출 시작 기록만으로는 False). 7단계에는 연결돼 있지 않다(submit=None).
+SubmitHandler = Callable[[AsyncFittingJob, str, FittingRequest, PrecheckOutcome, Heartbeat], bool]
+ConflictAlert = Callable[[AsyncFittingJob, FittingRequest, str], None]
+
+
+def log_conflict(job: AsyncFittingJob, request: FittingRequest, message_id: str) -> None:
+    """기본 입력 충돌 처리: 오류 로그만 남긴다(실제 알림 전송은 구현돼 있지 않다). 기존 작업은 그대로 둔다.
+
+    운영 알림이 필요하면 RequestProcessor(on_conflict=...) 로 다른 구현을 넣는다.
+    """
+    logger.error(
+        "be-fitting-request input conflict fitting_job_id=%s message_id=%s existing_status=%s",
+        job.fitting_job_id,
+        message_id,
+        job.status.value,
+    )
+
+
+class RequestProcessor:
+    """동기. 메시지 하나를 처리하고 RequestOutcome 을 돌려준다. 예외를 밖으로 내지 않는다."""
+
+    def __init__(
+        self,
+        jobs: AsyncJobRepository,
+        state: AsyncJobStateRepository,
+        precheck: RequestPrecheck,
+        sqs: SqsQueueClient,
+        *,
+        lease_seconds: float,
+        visibility_seconds: int,
+        heartbeat_interval_seconds: float | None = None,
+        submit: SubmitHandler | None = None,
+        on_conflict: ConflictAlert = log_conflict,
+        should_stop: Callable[[], bool] = lambda: False,
+    ):
+        self._jobs, self._state, self._precheck, self._sqs = jobs, state, precheck, sqs
+        self._lease_seconds = lease_seconds
+        self._visibility_seconds = visibility_seconds
+        self._heartbeat_interval = (
+            lease_seconds / 3 if heartbeat_interval_seconds is None else heartbeat_interval_seconds
+        )
+        self._submit = submit
+        self._on_conflict = on_conflict
+        self._should_stop = should_stop
+
+    def process(self, item: ValidRequestMessage | InvalidRequestMessage) -> RequestOutcome:
+        if isinstance(item, InvalidRequestMessage):
+            return self._invalid(item)
+        try:
+            return self._valid(item)
+        except Exception:
+            # 메시지는 남겨 두고 다음 수신 때 다시 본다.
+            logger.exception(
+                "request worker failed fitting_job_id=%s message_id=%s",
+                item.request.fitting_job_id,
+                item.message_id,
+            )
+            return RequestOutcome(item.message_id, item.request.fitting_job_id, "error")
+
+    @staticmethod
+    def _invalid(item: InvalidRequestMessage) -> RequestOutcome:
+        # 저장할 수 있는 값이 없다(가짜 사진·상품·시각을 만들지 않는다). 읽힌 작업 번호가 있어도 기존 작업에
+        # 실패를 쓰지 않는다. 삭제하지 않으므로 재전달되다가 Redrive Policy 에 따라 DLQ 로 간다(운영 복구 대상).
+        logger.error(
+            "be-fitting-request invalid message kept for DLQ message_id=%s fitting_job_id=%s kind=%s "
+            "field=%s receive_count=%s",
+            item.message_id,
+            item.fitting_job_id,
+            item.error.kind.value,
+            item.error.field,
+            item.approximate_receive_count,
+        )
+        return RequestOutcome(item.message_id, item.fitting_job_id, "invalid_kept")
+
+    def _valid(self, item: ValidRequestMessage) -> RequestOutcome:
+        request = item.request
+        job_id = request.fitting_job_id
+
+        def outcome(action: str, delete: bool = False) -> RequestOutcome:
+            logger.info(
+                "be-fitting-request processed fitting_job_id=%s message_id=%s action=%s delete=%s",
+                job_id,
+                item.message_id,
+                action,
+                delete,
+            )
+            return RequestOutcome(item.message_id, job_id, action, delete)
+
+        fingerprint = request_fingerprint(request.user_image_key, request.product_codes)
+        created = self._jobs.create(
+            NewAsyncFittingJob(
+                fitting_job_id=job_id,
+                request_fingerprint=fingerprint,
+                user_image_key=request.user_image_key,
+                products=request.product_codes,
+                requested_at=request.requested_at,
+            )
+        )
+        job = created.job
+        if not created.created and job.request_fingerprint != fingerprint:
+            self._on_conflict(job, request, item.message_id)
+            return outcome("input_conflict_kept")
+        if (
+            job.status in (AsyncJobStatus.COMPLETED, AsyncJobStatus.FAILED)
+            and job.result_message_status is ResultMessageStatus.PUBLISHED
+        ):
+            # 결과 발행까지 끝난 작업의 중복 메시지. 다시 할 일이 없으므로 삭제해도 잃는 것이 없다.
+            return outcome("already_published_deleted", delete=True)
+        if job.next_action is not NextAction.SUBMIT_PRUNA:
+            # 실패 결과 저장 뒤(PUBLISH_RESULT)나 Pruna 이후 단계. 이어서 할 처리는 해당 단계가 맡는다.
+            return outcome(
+                f"waiting_{(job.next_action.value if job.next_action else 'none').lower()}"
+            )
+        if self._should_stop():
+            return outcome("stopping_kept")
+
+        grant = self._state.acquire_lease(job_id, NextAction.SUBMIT_PRUNA, self._lease_seconds)
+        if not grant.acquired:
+            # 다른 Worker 가 처리 중(LEASE_HELD)이거나 상태가 바뀌었다. 추가로 실행하지 않는다.
+            return outcome(f"lease_{grant.reason.value}")
+        token = grant.token
+        try:
+            heartbeat = Heartbeat(
+                self._sqs,
+                self._state,
+                job_id,
+                token,
+                item.receipt_handle,
+                lease_seconds=self._lease_seconds,
+                visibility_seconds=self._visibility_seconds,
+                interval_seconds=self._heartbeat_interval,
+            )
+            check = self._precheck.run(
+                request, before_step=lambda: not self._should_stop() and heartbeat.beat()
+            )
+            if check.status is PrecheckStatus.RETRY:
+                return outcome(f"retry_{check.reason}")
+            if check.status is PrecheckStatus.FAILED:
+                saved = self._state.save_final_result(
+                    job_id, token, failure_payload(job_id, check.error_code, check.error_message)
+                )
+                if saved.reason not in (ChangeReason.APPLIED, ChangeReason.ALREADY_RECORDED):
+                    return outcome(f"failure_not_saved_{saved.reason.value}")
+                # 결과 발행(14단계)이 아직 없다. 저장만으로 삭제하지 않는다.
+                return outcome(f"failure_saved_{check.error_code}")
+            if self._submit is None:
+                # 8단계에서 Pruna 제출을 연결한다. 그 전에는 제출·삭제하지 않는다.
+                return outcome("prechecked_awaiting_submit")
+            if not heartbeat.beat():
+                return outcome("heartbeat_failed_before_submit")
+            return outcome("submitted", delete=self._submit(job, token, request, check, heartbeat))
+        finally:
+            released = self._state.release_lease(job_id, token)
+            if not released.applied and released.reason is not ChangeReason.LEASE_INVALID:
+                logger.warning(
+                    "request worker lease release failed fitting_job_id=%s reason=%s",
+                    job_id,
+                    released.reason.value,
+                )
+
+
+# --- 반복 수신 Worker ---
+
+
+@dataclass
+class WorkerStatus:
+    running: bool = False
+    stopped: bool = False
+    crashed: bool = False
+    last_error: str | None = None
+    consecutive_errors: int = 0
+    received: int = 0
+    deleted: int = 0
+    outcomes: dict[str, int] = field(default_factory=dict)
+
+
+class RequestWorker:
+    """FastAPI 이벤트 루프에서 도는 반복 수신 Task. 동기 단계는 전용 thread 하나에서 한다.
+
+    예기치 않은 종료는 오류 로그와 status(crashed·last_error)로만 드러난다(자동 재시작·알림 전송 없음).
+    """
+
+    def __init__(
+        self,
+        receive: Callable[[], RequestBatch],
+        process: Callable[[ValidRequestMessage | InvalidRequestMessage], RequestOutcome],
+        delete: Callable[[str], SqsResult],
+        *,
+        idle_seconds: float = 1.0,
+        backoff_initial_seconds: float = 1.0,
+        backoff_max_seconds: float = 60.0,
+    ):
+        self._receive, self._process, self._delete = receive, process, delete
+        self._idle = idle_seconds
+        self._backoff_initial, self._backoff_max = backoff_initial_seconds, backoff_max_seconds
+        self._limiter = CapacityLimiter(1)
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task | None = None
+        self.status = WorkerStatus()
+
+    @property
+    def stopping(self) -> bool:
+        return self._stop.is_set()
+
+    def start(self) -> asyncio.Task:
+        if self._task is None:
+            self._task = asyncio.create_task(self._run(), name="virtual-fitting-request-worker")
+            self._task.add_done_callback(self._finished)
+        return self._task
+
+    async def stop(self, timeout: float) -> None:
+        """새 수신을 멈추고 진행 중인 단계를 정리한다. 전체 종료 시간의 상한이 아니다.
+
+        1. stop 표시 → 진행 중인 수신·메시지 처리가 끝나기를 최대 timeout 초 기다린다.
+        2. timeout 이 지나면 Task 를 취소한다.
+           - long polling 수신 중이면 그 대기를 버리고 바로 끝난다(abandon_on_cancel). 버린 thread 는 남은 수신
+             시간 동안 SQS 를 계속 기다릴 수 있고, 그때 받은 메시지는 처리·삭제하지 않아 Visibility Timeout 뒤 다시 보인다.
+           - 메시지 처리·삭제 단계(DB·S3·Runware 를 쓰는 thread)는 버리지 않는다. 그 단계가 끝날 때까지 추가로 기다리며,
+             이 시간은 timeout 에 포함되지 않고 제한도 없다(각 DB·HTTP 호출 자체의 timeout 만 적용된다).
+        그래서 DB pool 은 처리 중인 단계가 끝난 뒤에 닫힌다.
+        """
+        self._stop.set()
+        if self._task is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(self._task), timeout)
+        except TimeoutError:
+            logger.warning(
+                "request worker did not stop within %ss; cancelling receive wait", timeout
+            )
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+    def _finished(self, task: asyncio.Task) -> None:
+        self.status.running = False
+        if task.cancelled():
+            self.status.stopped = True
+            return
+        error = task.exception()
+        if error is not None:  # 예상하지 못한 종료를 숨기지 않는다.
+            self.status.crashed = True
+            self.status.last_error = type(error).__name__
+            logger.error("request worker crashed", exc_info=error)
+        else:
+            self.status.stopped = True
+
+    async def _sleep(self, seconds: float) -> None:
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=seconds)
+        except TimeoutError:
+            pass
+
+    def _backoff(self) -> float:
+        return min(
+            self._backoff_max,
+            self._backoff_initial * 2 ** max(0, self.status.consecutive_errors - 1),
+        )
+
+    async def _run(self) -> None:
+        self.status.running = True
+        logger.info("request worker started")
+        while not self._stop.is_set():
+            try:
+                # long polling 은 thread 에서 기다린다. 종료 때 이 대기는 버릴 수 있다(받은 메시지는 지우지 않으므로
+                # Visibility Timeout 뒤 다시 보인다).
+                batch = await to_thread.run_sync(
+                    self._receive, limiter=self._limiter, abandon_on_cancel=True
+                )
+            except Exception as error:
+                # 설정 오류 등. 빠르게 반복하지 않고 물러난다.
+                self.status.consecutive_errors += 1
+                self.status.last_error = type(error).__name__
+                logger.exception(
+                    "request worker receive crashed; backing off %.1fs", self._backoff()
+                )
+                await self._sleep(self._backoff())
+                continue
+            if not batch.received:
+                self.status.consecutive_errors += 1
+                self.status.last_error = batch.receive_result.reason
+                logger.warning(
+                    "request worker receive failed reason=%s; backing off %.1fs",
+                    batch.receive_result.reason,
+                    self._backoff(),
+                )
+                await self._sleep(self._backoff())
+                continue
+            self.status.consecutive_errors = 0
+            if not batch.messages:
+                await self._sleep(self._idle)
+                continue
+            for item in batch.messages:
+                if self._stop.is_set():
+                    break  # 남은 메시지는 처리·삭제하지 않는다(다시 보인다).
+                self.status.received += 1
+                result = await to_thread.run_sync(self._process, item, limiter=self._limiter)
+                self.status.outcomes[result.action] = self.status.outcomes.get(result.action, 0) + 1
+                if result.delete:
+                    deleted = await to_thread.run_sync(
+                        self._delete, item.receipt_handle, limiter=self._limiter
+                    )
+                    if deleted.succeeded:
+                        self.status.deleted += 1
+                    else:
+                        logger.warning(
+                            "request worker delete failed message_id=%s reason=%s",
+                            item.message_id,
+                            deleted.reason,
+                        )
+        logger.info("request worker stopped")
+
+
+def create_request_worker() -> RequestWorker:
+    """실제 의존성으로 조립한다(blocking: DB pool·boto3 client). lifespan 이 thread 에서 부른다."""
+    from datetime import timedelta
+
+    from app.clients.s3 import S3ImageStorage
+    from app.config import settings
+    from app.config.database import get_connection_pool
+    from app.virtual_fitting.async_request import receive_fitting_requests
+    from app.virtual_fitting.budget import FittingBudget
+    from app.virtual_fitting.providers.runware_usage import RunwareUsageClient
+    from app.virtual_fitting.repositories.product_repository import ProductRepository
+    from app.virtual_fitting.repositories.usage_repository import UsageRepository
+
+    pool = get_connection_pool()
+    sqs = SqsQueueClient()
+    precheck = RequestPrecheck(
+        ProductRepository(pool),
+        S3ImageStorage(),
+        FittingBudget(
+            UsageRepository(pool),
+            RunwareUsageClient(),
+            daily_limit=settings.FITTING_DAILY_BUDGET_USD,
+            reconcile_interval=timedelta(seconds=settings.FITTING_USAGE_RECONCILE_SECONDS),
+        ),
+    )
+    worker: RequestWorker
+
+    processor = RequestProcessor(
+        AsyncJobRepository(pool),
+        AsyncJobStateRepository(pool),
+        precheck,
+        sqs,
+        lease_seconds=settings.VIRTUAL_FITTING_REQUEST_LEASE_SECONDS,
+        visibility_seconds=settings.VIRTUAL_FITTING_REQUEST_VISIBILITY_SECONDS,
+        should_stop=lambda: worker.stopping,
+    )
+    worker = RequestWorker(
+        lambda: receive_fitting_requests(
+            sqs,
+            max_messages=1,
+            visibility_timeout=settings.VIRTUAL_FITTING_REQUEST_VISIBILITY_SECONDS,
+        ),
+        processor.process,
+        lambda receipt: sqs.delete(FittingQueue.BE_FITTING_REQUEST, receipt),
+    )
+    return worker
