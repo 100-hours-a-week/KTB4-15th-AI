@@ -167,8 +167,13 @@ def _decimal_env(name: str, default: str) -> Decimal:
 # 사용 가능한 잔액이 이 값 **이하**이면 생성 요청을 막는다. 하루 사용액 상한(FITTING_DAILY_BUDGET_USD)과 별개다.
 FITTING_MIN_BALANCE_USD = _decimal_env("FITTING_MIN_BALANCE_USD", "1.00")
 # Runware 가 완료를 알릴 Webhook URL(https, 인증 token query 포함). 비밀값이 들어 있으므로 로그에 남기지 않는다.
-# Webhook 엔드포인트는 9단계에서 구현한다. 비어 있으면 Pruna 제출을 시작하지 않는다.
+# 비어 있으면 Pruna 제출을 시작하지 않는다. 요청 Worker 를 켤 때 경로가 /api/v2/webhooks/runware 이고
+# token 이 WEBHOOK_TOKEN 과 같은지 확인한다(다르면 Worker 를 만들지 않는다).
 VIRTUAL_FITTING_RUNWARE_WEBHOOK_URL = os.getenv("VIRTUAL_FITTING_RUNWARE_WEBHOOK_URL", "").strip()
+# Runware Webhook(POST /api/v2/webhooks/runware?token=...) 인증 토큰. RUNWARE_API_KEY 와 별개다.
+# 비어 있으면 Webhook 은 모든 요청을 설정 오류(500 WEBHOOK_NOT_CONFIGURED)로 거절한다(빈 토큰을 허용하지 않음).
+# 다른 API 와 서버 시작은 막지 않는다.
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
 # 모든 AI 서버·프로세스가 PostgreSQL 로 공유하는 Pruna 생성 요청 제한(scripts/db/virtual_fitting_pruna_limits.sql).
 # 진행 중 생성 작업 수, 생성 요청 HTTP 동시 전송 수, 생성 요청 전송 사이 최소 간격(초).
 VIRTUAL_FITTING_PRUNA_MAX_IN_FLIGHT = int(os.getenv("VIRTUAL_FITTING_PRUNA_MAX_IN_FLIGHT", "3"))

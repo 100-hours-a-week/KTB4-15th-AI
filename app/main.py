@@ -20,6 +20,7 @@ from app.config.database import close_async_pool, close_connection_pool, open_as
 from app.config.logging_config import LOGGING_CONFIG, configure_logging
 from app.errors import register_error_handlers
 from app.virtual_fitting import router as virtual_fitting_router
+from app.virtual_fitting import webhook_router as virtual_fitting_webhook_router
 from app.virtual_fitting.concurrency import create_fitting_limiters
 from app.virtual_fitting.providers.runware import (
     get_runware_llm_api_key,
@@ -69,6 +70,8 @@ register_error_handlers(app)
 app.include_router(health_router.router)
 app.include_router(chat_router.router)
 app.include_router(virtual_fitting_router.router)
+# Runware Webhook 은 내부 API 키가 아니라 URL token 으로 인증한다(별도 Router).
+app.include_router(virtual_fitting_webhook_router.router)
 app.include_router(body_image_validation_router.router)
 # 도메인이 늘어나면 여기에 한 줄씩 추가한다
 

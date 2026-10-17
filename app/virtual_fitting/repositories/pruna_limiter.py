@@ -225,17 +225,20 @@ class PrunaLimiter:
             (reason,),
         )
 
-    def release_in_flight(self, fitting_job_id: int) -> bool:
+    def release_in_flight(self, fitting_job_id: int, task_uuid: str | None = None) -> bool:
         """진행 중 자리를 놓는다. 생성이 끝났다는 근거(완료·확정 종료·명확한 미접수)가 있을 때만 부른다.
 
-        이미 놓였으면 False(중복 종료 이벤트로 두 번 반환되지 않는다).
+        task_uuid 를 주면 그 생성 시도(task)가 잡은 자리만 놓는다. 같은 작업 번호라도 다른 시도가 잡은 자리는
+        놓지 않는다(완료 Webhook·Watchdog 경로). 이미 놓였으면 False(중복 종료 이벤트로 두 번 반환되지 않는다).
         """
         job_id = _check_job_id(fitting_job_id)
+        task = uuid.UUID(task_uuid) if task_uuid is not None else None
 
         def work(cursor) -> bool:
             cursor.execute(
-                f"DELETE FROM {IN_FLIGHT} WHERE fitting_job_id = %s RETURNING fitting_job_id",
-                (job_id,),
+                f"DELETE FROM {IN_FLIGHT} WHERE fitting_job_id = %s "
+                "AND (%s::uuid IS NULL OR task_uuid = %s::uuid) RETURNING fitting_job_id",
+                (job_id, task, task),
             )
             return cursor.fetchone() is not None
 

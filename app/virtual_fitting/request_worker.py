@@ -655,7 +655,16 @@ def create_request_worker() -> RequestWorker:
     from app.virtual_fitting.repositories.product_repository import ProductRepository
     from app.virtual_fitting.repositories.pruna_limiter import PrunaLimiter
     from app.virtual_fitting.repositories.usage_repository import UsageRepository
+    from app.virtual_fitting.runware_webhook import webhook_url_matches_token
 
+    # Runware 에 넘길 Webhook URL 의 token 이 이 서버의 검증값과 다르면 모든 완료 알림이 401 이 된다. 시작 전에 멈춘다.
+    if not webhook_url_matches_token(
+        settings.VIRTUAL_FITTING_RUNWARE_WEBHOOK_URL, settings.WEBHOOK_TOKEN
+    ):
+        raise ValueError(
+            "VIRTUAL_FITTING_RUNWARE_WEBHOOK_URL 이 https://<host>/api/v2/webhooks/runware?token=<WEBHOOK_TOKEN> "
+            "형식이 아니거나 token 이 WEBHOOK_TOKEN 과 다릅니다."
+        )
     pool = get_connection_pool()
     sqs = SqsQueueClient()
     storage = S3ImageStorage()
@@ -669,7 +678,8 @@ def create_request_worker() -> RequestWorker:
     precheck = RequestPrecheck(ProductRepository(pool), storage, budget, balance)
     jobs, state = AsyncJobRepository(pool), AsyncJobStateRepository(pool)
     worker: RequestWorker
-    # 이어 갈 경로(Webhook 9단계·결과 발행 14단계·Watchdog 15단계)가 아직 없으므로 기본 NoFollowUpPaths 를 쓴다.
+    # 기본 NoFollowUpPaths 를 쓴다. Webhook(9단계)은 구현됐지만 Webhook 이 오지 않을 때의 복구(Watchdog 15단계)와
+    # 후처리(10~11단계)·결과 발행(14단계)이 없어, 접수 뒤 요청 메시지를 지워도 되는 경로는 아직 없다.
     submitter = PrunaSubmitter(
         jobs=jobs,
         state=state,

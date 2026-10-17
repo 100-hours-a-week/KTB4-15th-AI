@@ -257,15 +257,18 @@ class AsyncJobStateRepository:
     ) -> StateChange:
         """Worker 가 Runware 접수 응답(ACCEPTED)을 받았을 때. RECEIVED 면 WAITING_PRUNA 로 바꾸고 next_action 을 비운다.
 
-        Webhook 이 먼저 와서 이미 진전된 상태(POSTPROCESSING·FALLBACK_RUNNING)는 되돌리지 않는다. 최초 접수
+        Webhook 이 먼저 와서 이미 진전된 상태(POSTPROCESSING·FALLBACK_RUNNING, 또는 RECEIVED 인 채 실패 결과와
+        PUBLISH_RESULT 가 저장된 작업)는 되돌리지 않는다(next_action 이 SUBMIT_PRUNA 일 때만 옮김). 최초 접수
         시각은 처음 한 번만 기록한다.
         """
         return self._update(
             fitting_job_id,
             """
             runware_accepted_at = COALESCE(runware_accepted_at, statement_timestamp()),
-            status = CASE WHEN status = 'RECEIVED' THEN 'WAITING_PRUNA' ELSE status END,
-            next_action = CASE WHEN status = 'RECEIVED' THEN NULL ELSE next_action END
+            status = CASE WHEN status = 'RECEIVED' AND next_action = 'SUBMIT_PRUNA'
+                          THEN 'WAITING_PRUNA' ELSE status END,
+            next_action = CASE WHEN status = 'RECEIVED' AND next_action = 'SUBMIT_PRUNA'
+                               THEN NULL ELSE next_action END
             """,
             """
             status <> ALL(%(terminal)s) AND task_uuid = %(task_uuid)s
@@ -280,29 +283,34 @@ class AsyncJobStateRepository:
         """Runware 가 이 task_uuid 의 생성 요청을 접수했다는 응답(ACCEPTED)을 기록한다. 토큰을 쓰지 않는다.
 
         접수 근거는 task 에 대한 사실이므로, 긴 HTTP 호출 중 lease 가 만료됐어도 기록할 수 있어야 한다. 등록된
-        task_uuid·호출 시작 기록이 있고 종료되지 않은 작업만 바꾼다. RECEIVED 면 WAITING_PRUNA·next_action=NULL 로
-        바꾸고, 완료 알림 등으로 이미 진전된 상태는 되돌리지 않는다. 최초 접수 시각은 처음 한 번만 기록한다.
+        task_uuid·호출 시작 기록이 있고 종료되지 않은 작업만 바꾼다. RECEIVED / SUBMIT_PRUNA 면 WAITING_PRUNA·
+        next_action=NULL 로 바꾸고, 완료 알림 등으로 이미 진전된 상태(RECEIVED 인 채 실패 결과·PUBLISH_RESULT 가
+        저장된 경우 포함)는 되돌리지 않는다. 최초 접수 시각은 처음 한 번만 기록한다.
         """
         return self._event_update(
             task_uuid,
             f"""
             runware_accepted_at = COALESCE(runware_accepted_at, {_NOW}),
-            status = CASE WHEN status = 'RECEIVED' THEN 'WAITING_PRUNA' ELSE status END,
-            next_action = CASE WHEN status = 'RECEIVED' THEN NULL ELSE next_action END
+            status = CASE WHEN status = 'RECEIVED' AND next_action = 'SUBMIT_PRUNA'
+                          THEN 'WAITING_PRUNA' ELSE status END,
+            next_action = CASE WHEN status = 'RECEIVED' AND next_action = 'SUBMIT_PRUNA'
+                               THEN NULL ELSE next_action END
             """,
             "TRUE",
             {},
         )
 
     def record_pruna_succeeded(self, task_uuid: str) -> StateChange:
-        """Pruna 성공 알림. 접수 대기 중(RECEIVED·WAITING_PRUNA)인 작업만 POSTPROCESSING / POSTPROCESS 로 바꾼다."""
+        """Pruna 성공 알림. 접수 대기 중(RECEIVED·WAITING_PRUNA)이고 결과가 아직 없는 작업만 POSTPROCESSING /
+        POSTPROCESS 로 바꾼다. 실패 결과가 먼저 저장됐으면(PUBLISH_RESULT) 늦은 성공 알림이 그 다음 작업을 덮어쓰지 않는다.
+        """
         return self._event_update(
             task_uuid,
             """
             status = 'POSTPROCESSING', next_action = 'POSTPROCESS',
             runware_accepted_at = COALESCE(runware_accepted_at, statement_timestamp())
             """,
-            "status IN ('RECEIVED', 'WAITING_PRUNA')",
+            "status IN ('RECEIVED', 'WAITING_PRUNA') AND result_payload IS NULL",
             {},
         )
 

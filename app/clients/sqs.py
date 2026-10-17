@@ -178,6 +178,31 @@ def get_sqs_client() -> Any:
     )
 
 
+# Webhook 처리(응답 목표 약 5초) 안에서 쓰는 전송 timeout(초). 기본 client(60초)를 쓰면 응답이 늦어진다.
+WEBHOOK_CONNECT_TIMEOUT_SECONDS = 1.0
+WEBHOOK_READ_TIMEOUT_SECONDS = 2.0
+
+
+@lru_cache(maxsize=1)
+def get_webhook_sqs_client() -> Any:
+    """Webhook 전용 SQS client. SDK 재시도를 하지 않고(total_max_attempts=1) 짧은 timeout 을 쓴다.
+
+    timeout 으로 응답을 받지 못하면 SendMessage 결과는 UNKNOWN 이다(큐에 들어갔을 수 있음).
+    """
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "sqs",
+        region_name=settings.AWS_REGION,
+        config=Config(
+            retries={"mode": "standard", "total_max_attempts": 1},
+            connect_timeout=WEBHOOK_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=WEBHOOK_READ_TIMEOUT_SECONDS,
+        ),
+    )
+
+
 def _check_int(name: str, value: int, low: int, high: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
         raise ValueError(f"{name} 는 {low}~{high} 사이 정수여야 합니다.")
