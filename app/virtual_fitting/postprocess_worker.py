@@ -1,7 +1,8 @@
 """가상피팅 V2 AI 후처리 Worker (ai-fitting-response, 10단계).
 
 FastAPI lifespan 이 시작·종료한다(별도 실행 명령 없음). VIRTUAL_FITTING_POSTPROCESS_WORKER_ENABLED 기본 꺼짐.
-켜도 POSTPROCESS(11단계)·RUN_FALLBACK(13단계) 핸들러가 모두 연결돼 있지 않으면 수신을 시작하지 않는다(not_ready).
+켜도 POSTPROCESS(11단계, 연결됨)·RUN_FALLBACK(13단계, 미연결) 핸들러가 모두 연결돼 있지 않으면 수신을 시작하지 않는다
+(not_ready).
 미구현 단계 때문에 실제 큐 메시지를 받기만 하고 지우지 못해 DLQ 로 보내는 일을 막는다.
 
 메시지 하나 처리(FollowUpProcessor.process):
@@ -11,7 +12,7 @@ FastAPI lifespan 이 시작·종료한다(별도 실행 명령 없음). VIRTUAL_
   → 최신 DB 기록으로 삭제 판단 → 자기 토큰의 실행 권한만 반납
 
 | action       | 실행 대상(status / next_action)        | 핸들러(연결 단계) |
-| POSTPROCESS  | POSTPROCESSING / POSTPROCESS           | 11단계            |
+| POSTPROCESS  | POSTPROCESSING / POSTPROCESS           | 11단계(연결됨)    |
 | RUN_FALLBACK | FALLBACK_RUNNING / RUN_FALLBACK        | 13단계            |
 
 삭제는 (1) 결과 발행까지 끝난 같은 작업의 중복(COMPLETED/FAILED + PUBLISHED), 또는 (2) 핸들러가 완료를 알렸고
@@ -124,11 +125,14 @@ class PostprocessHandlers:
 
 
 def connected_postprocess_handlers() -> PostprocessHandlers:
-    """실제 조립에 연결된 핸들러. 11·13단계가 구현되기 전에는 비어 있다(그래서 Worker 는 not_ready).
+    """실제 조립에 연결된 핸들러. POSTPROCESS 는 11단계 PostprocessHandler, RUN_FALLBACK 은 13단계 전까지 없음.
 
-    설정값으로 채우지 않는다. 해당 단계를 구현할 때 코드로 연결한다. 테스트는 이 함수를 바꿔 가짜 핸들러를 넣는다.
+    두 핸들러가 모두 있어야 Worker 가 수신을 시작하므로 지금은 not_ready:run_fallback 이다(한쪽만으로 실제 큐를
+    소비하지 않는다). 설정값으로 채우지 않는다. PostprocessHandler 는 처음 불릴 때 DB·S3·LLM client 를 만든다.
     """
-    return PostprocessHandlers()
+    from app.virtual_fitting.postprocess_handler import PostprocessHandler
+
+    return PostprocessHandlers(postprocess=PostprocessHandler())
 
 
 # --- 메시지 하나 처리 ---

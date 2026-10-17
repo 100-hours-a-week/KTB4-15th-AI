@@ -694,8 +694,12 @@ def test_settings_are_range_checked(monkeypatch, name, value):
 
 
 def test_real_assembly_has_no_handlers_and_refuses_to_build():
+    # 11단계: POSTPROCESS 는 연결됐지만 RUN_FALLBACK(13단계)이 없어 여전히 조립·수신하지 않는다.
+    from app.virtual_fitting.postprocess_handler import PostprocessHandler
+
     handlers = pw.connected_postprocess_handlers()
-    assert handlers.missing() == ["postprocess", "run_fallback"]
+    assert isinstance(handlers.postprocess, PostprocessHandler)
+    assert handlers.missing() == ["run_fallback"]
     with pytest.raises(ValueError):
         pw.create_postprocess_worker(handlers)
 
@@ -795,7 +799,7 @@ def test_enabled_without_handlers_does_not_start_receiving(app_env, monkeypatch,
     monkeypatch.setattr("app.clients.sqs.get_sqs_client", forbidden)
     with caplog.at_level(logging.WARNING), TestClient(app_env.app) as client:
         assert client.app.state.postprocess_worker is None
-        assert client.app.state.postprocess_worker_status == "not_ready:postprocess,run_fallback"
+        assert client.app.state.postprocess_worker_status == "not_ready:run_fallback"
         assert client.get("/health").status_code == 200
     assert "handlers not connected" in caplog.text
 
