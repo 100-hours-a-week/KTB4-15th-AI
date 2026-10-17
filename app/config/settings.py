@@ -149,3 +149,32 @@ VIRTUAL_FITTING_REQUEST_VISIBILITY_SECONDS = int(
 VIRTUAL_FITTING_REQUEST_SHUTDOWN_TIMEOUT_SECONDS = float(
     os.getenv("VIRTUAL_FITTING_REQUEST_SHUTDOWN_TIMEOUT_SECONDS", "30")
 )
+
+
+def _decimal_env(name: str, default: str) -> Decimal:
+    """금액 설정. float 를 거치지 않고 Decimal 로 읽는다. 숫자가 아니거나 NaN·무한대·음수면 시작할 때 거절한다."""
+    raw = os.getenv(name, default).strip()
+    try:
+        value = Decimal(raw)
+    except ArithmeticError as error:
+        raise ValueError(f"{name} 는 금액(예: 1.00)이어야 합니다: {raw!r}") from error
+    if not value.is_finite() or value < 0:
+        raise ValueError(f"{name} 는 0 이상의 유한한 금액이어야 합니다: {raw!r}")
+    return value
+
+
+# V2 Pruna 제출 전 Runware 계정 잔액 사전 확인(accountManagement / getDetails 의 balance.amount, USD).
+# 사용 가능한 잔액이 이 값 **이하**이면 생성 요청을 막는다. 하루 사용액 상한(FITTING_DAILY_BUDGET_USD)과 별개다.
+FITTING_MIN_BALANCE_USD = _decimal_env("FITTING_MIN_BALANCE_USD", "1.00")
+# Runware 가 완료를 알릴 Webhook URL(https, 인증 token query 포함). 비밀값이 들어 있으므로 로그에 남기지 않는다.
+# Webhook 엔드포인트는 9단계에서 구현한다. 비어 있으면 Pruna 제출을 시작하지 않는다.
+VIRTUAL_FITTING_RUNWARE_WEBHOOK_URL = os.getenv("VIRTUAL_FITTING_RUNWARE_WEBHOOK_URL", "").strip()
+# 모든 AI 서버·프로세스가 PostgreSQL 로 공유하는 Pruna 생성 요청 제한(scripts/db/virtual_fitting_pruna_limits.sql).
+# 진행 중 생성 작업 수, 생성 요청 HTTP 동시 전송 수, 생성 요청 전송 사이 최소 간격(초).
+VIRTUAL_FITTING_PRUNA_MAX_IN_FLIGHT = int(os.getenv("VIRTUAL_FITTING_PRUNA_MAX_IN_FLIGHT", "3"))
+VIRTUAL_FITTING_PRUNA_MAX_CONCURRENT_SENDS = int(
+    os.getenv("VIRTUAL_FITTING_PRUNA_MAX_CONCURRENT_SENDS", "2")
+)
+VIRTUAL_FITTING_PRUNA_MIN_SEND_INTERVAL_SECONDS = float(
+    os.getenv("VIRTUAL_FITTING_PRUNA_MIN_SEND_INTERVAL_SECONDS", "10")
+)

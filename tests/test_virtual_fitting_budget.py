@@ -203,8 +203,12 @@ def test_add_is_a_single_upsert_that_adds_in_the_database():
 
     UsageRepository(FakePool(connection)).add(TODAY, Decimal("0.03"))
 
-    assert connection.cursor_instance.executed == [(ADD_SQL, (TODAY, Decimal("0.03")))]
-    assert "usage_amount.amount + EXCLUDED.amount" in ADD_SQL
+    assert connection.cursor_instance.executed == [
+        (ADD_SQL, {"day": TODAY, "cost": Decimal("0.03")})
+    ]
+    # 개별 비용은 개별 기록 합계에만 더한다. 보정값(reconciled_amount)에는 더하지 않는다.
+    assert "recorded_amount = usage_amount.recorded_amount + EXCLUDED.recorded_amount" in ADD_SQL
+    assert "reconciled_amount =" not in ADD_SQL
 
 
 def test_reconcile_keeps_the_larger_amount_and_returns_it():
@@ -213,8 +217,15 @@ def test_reconcile_keeps_the_larger_amount_and_returns_it():
     amount = UsageRepository(FakePool(connection)).reconcile(TODAY, Decimal("2.5"))
 
     assert amount == Decimal("2.5")
-    assert connection.cursor_instance.executed == [(RECONCILE_SQL, (TODAY, Decimal("2.5")))]
-    assert "GREATEST(usage_amount.amount, EXCLUDED.amount)" in RECONCILE_SQL
+    assert connection.cursor_instance.executed == [
+        (RECONCILE_SQL, {"day": TODAY, "total": Decimal("2.5")})
+    ]
+    # Runware 합계는 보정값에만 반영하고(줄지 않음), 개별 기록 합계는 바꾸지 않는다.
+    assert (
+        "reconciled_amount = GREATEST(usage_amount.reconciled_amount, EXCLUDED.reconciled_amount)"
+        in RECONCILE_SQL
+    )
+    assert "recorded_amount =" not in RECONCILE_SQL
 
 
 def test_database_errors_become_domain_errors():

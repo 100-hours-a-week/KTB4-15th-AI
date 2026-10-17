@@ -18,16 +18,25 @@ POST https://api.runware.ai/v1 (V1 과 같은 endpoint·모델·VTON 키)
             taskUUID 가 없거나 다른 2xx 등. 이미 접수됐을 수 있으므로 같은 taskUUID 로 다시 보내지 않고
             상위 Worker / Watchdog(getResponse) 이 확인한다.
 
+대기 안내(retry_after): 본문 errors[].retryAfter 와 HTTP Retry-After 헤더를 함께 본다. 둘 다 Runware 계약상
+초 단위다(https://runware.ai/docs/models-api/rate-limits). 단위를 추측해 바꾸지 않는다.
+- 잘못된 값(안내 아님): 숫자가 아닌 값(본문의 문자열 포함)·음수·NaN·Infinity 표기·HTTP-date·지수 표기 헤더.
+- 유효한 값: 0 이상의 숫자. 크기 제한 없이 그대로 쓰고, 둘 다 유효하면 더 긴 쪽을 쓴다(줄이지 않음).
+- 유효하지만 float 로 표현할 수 없는 큰 값: retry_after 대신 retry_after_unrepresentable=True 로 알린다.
+  이때는 다른 쪽의 짧은 값을 채택하지 않는다. 호출하는 쪽이 새 생성 요청을 보류한다.
+
 자동 재시도는 하지 않는다. taskUUID 생성·S3 Presigned URL 생성·AI DB 기록은 호출하는 쪽의 일이다.
 webhookURL(token)·uploadEndpoint(서명)·person 이미지 URL(서명)·API 키는 로그와 결과에 남기지 않는다.
 """
 
 import json
 import logging
+import math
 import re
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from http.client import HTTPException
 from typing import Any
@@ -87,8 +96,10 @@ class AsyncSubmission:
     error_codes: tuple[str, ...] = ()
     # Runware 가 다시 보내도 된다고 알려준 경우(429·5xx·재시도 가능 코드·retryAfter). 자동 재시도는 하지 않는다.
     retryable: bool = False
-    # errors[].retryAfter 원문(단위 미확정). 없으면 None.
-    retry_after: Any = None
+    # 유효한 대기 안내(초). 본문 errors[].retryAfter 와 HTTP Retry-After 중 더 긴 값. 없거나 잘못됐으면 None.
+    retry_after: float | None = None
+    # 유효한 안내지만 너무 커서 초(float)로 표현할 수 없다. True 면 retry_after 는 None 이고 새 생성 요청을 보류해야 한다.
+    retry_after_unrepresentable: bool = False
     detail: str = ""
 
     @property
@@ -157,34 +168,106 @@ def _error_list(data: Any) -> list[dict]:
     return [error for error in errors if isinstance(error, dict)]
 
 
+class _NonFinite:
+    """본문의 NaN·Infinity 표기. 숫자로 보지 않는다(잘못된 값)."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+@dataclass(frozen=True)
+class RetryAfter:
+    """대기 안내 해석 결과. seconds 와 unrepresentable 이 동시에 참이 되지 않는다."""
+
+    seconds: float | None = None
+    unrepresentable: bool = False
+
+
+_TOO_LARGE = object()
+
+
+def _seconds(value: Any, *, header: bool = False) -> Any:
+    """유효한 안내면 초(float), 유효하지만 float 로 표현할 수 없으면 _TOO_LARGE, 잘못된 값이면 None.
+
+    본문 retryAfter 는 JSON 숫자만(정확한 Decimal 로 읽음), 헤더 Retry-After 는 숫자로만 된 문자열만 받는다.
+    """
+    if isinstance(value, bool):
+        return None
+    if header:
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        # 헤더는 RFC 9110 delay-seconds(숫자만). HTTP-date 는 Runware 계약(초)이 아니므로 쓰지 않는다.
+        if not text or not all(c in "0123456789." for c in text):
+            return None
+        try:
+            value = Decimal(text)
+        except InvalidOperation:
+            return None
+    if isinstance(value, int | float):
+        value = Decimal(value) if math.isfinite(value) else None
+    if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
+        return None
+    seconds = float(value)  # 범위를 넘으면 inf 가 된다(값을 줄이지 않는다)
+    return seconds if math.isfinite(seconds) else _TOO_LARGE
+
+
+def parse_retry_after(body_values: Sequence[Any], header_value: Any = None) -> RetryAfter:
+    """본문 retryAfter 들과 헤더 Retry-After 를 함께 해석한다.
+
+    하나라도 표현할 수 없게 크면 unrepresentable(다른 쪽의 짧은 값을 쓰지 않음). 아니면 유효한 값의 최댓값.
+    """
+    candidates = [_seconds(v) for v in body_values] + [_seconds(header_value, header=True)]
+    if any(c is _TOO_LARGE for c in candidates):
+        return RetryAfter(unrepresentable=True)
+    valid = [c for c in candidates if c is not None]
+    return RetryAfter(seconds=max(valid) if valid else None)
+
+
 def _error_fields(errors: Sequence[dict]) -> dict[str, Any]:
     codes = tuple(str(error["code"]) for error in errors if error.get("code"))
-    retry_after = next(
-        (error["retryAfter"] for error in errors if error.get("retryAfter") is not None), None
+    retry_after = parse_retry_after(
+        [error["retryAfter"] for error in errors if error.get("retryAfter") is not None]
     )
     messages = "; ".join(
         f"{error.get('code', '')}: {error.get('message', '')}".strip(": ") for error in errors
     )
     return {
         "error_codes": codes,
-        "retry_after": retry_after,
-        "retryable": retry_after is not None or any(c in RETRYABLE_ERROR_CODES for c in codes),
+        "retry_after": retry_after.seconds,
+        "retry_after_unrepresentable": retry_after.unrepresentable,
+        "retryable": retry_after != RetryAfter() or any(c in RETRYABLE_ERROR_CODES for c in codes),
         "detail": _redact(messages),
     }
 
 
 def _parse_json(body: bytes) -> Any:
     try:
-        return json.loads(body)
+        # 숫자는 정확한 Decimal 로 읽는다(큰 정수의 자릿수 제한·float 반올림 없이 retryAfter 를 해석하려고).
+        return json.loads(body, parse_float=Decimal, parse_int=Decimal, parse_constant=_NonFinite)
     except (ValueError, UnicodeDecodeError):
         return None
 
 
-def classify_response(status: int, body: bytes, task_uuid: str) -> AsyncSubmission:
-    """HTTP status 와 본문으로 접수 결과를 나눈다. 근거가 부족하면 ACCEPTED 로 보지 않는다."""
+def classify_response(
+    status: int, body: bytes, task_uuid: str, *, retry_after_header: Any = None
+) -> AsyncSubmission:
+    """HTTP status 와 본문(·Retry-After 헤더)으로 접수 결과를 나눈다. 근거가 부족하면 ACCEPTED 로 보지 않는다."""
     data = _parse_json(body)
     errors = _error_list(data)
     fields = _error_fields(errors) if errors else {}
+    if retry_after_header is not None:
+        body_values = [
+            error["retryAfter"] for error in errors if error.get("retryAfter") is not None
+        ]
+        combined = parse_retry_after(body_values, retry_after_header)
+        if combined != RetryAfter():
+            fields = {
+                **fields,
+                "retry_after": combined.seconds,
+                "retry_after_unrepresentable": combined.unrepresentable,
+                "retryable": True,
+            }
 
     def result(outcome: SubmissionOutcome, reason: str, **extra: Any) -> AsyncSubmission:
         return AsyncSubmission(
@@ -266,7 +349,8 @@ class RunwarePrunaAsyncProvider:
         submission = self._send(request, task_uuid)
         logger.info(
             "runware async submit task_uuid=%s outcome=%s reason=%s http_status=%s "
-            "task_status=%s error_codes=%s retryable=%s",
+            "task_status=%s error_codes=%s retryable=%s retry_after=%s "
+            "retry_after_unrepresentable=%s",
             submission.task_uuid,
             submission.outcome.value,
             submission.reason,
@@ -274,6 +358,8 @@ class RunwarePrunaAsyncProvider:
             submission.task_status,
             ",".join(submission.error_codes),
             submission.retryable,
+            submission.retry_after,
+            submission.retry_after_unrepresentable,
         )
         return submission
 
@@ -288,7 +374,9 @@ class RunwarePrunaAsyncProvider:
                 body = error.read()
             except (OSError, HTTPException):
                 body = b""
-            return classify_response(error.code, body, task_uuid)
+            headers = error.headers
+            header = headers.get("Retry-After") if headers is not None else None
+            return classify_response(error.code, body, task_uuid, retry_after_header=header)
         except URLError as error:
             reason = "timeout" if _is_timeout(error.reason) else "network_error"
             return self._unknown(task_uuid, reason, status)

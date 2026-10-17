@@ -8,12 +8,14 @@ FastAPI lifespan 이 시작·종료한다(별도 실행 명령 없음, VIRTUAL_F
 메시지 삭제 원칙: 접수 결과와 후속 실행·복구에 필요한 기록이 저장되고, 실제로 이어서 처리할 경로가 있을 때만
 삭제한다. RECEIVED 저장, task_uuid·이미지 Key·호출 시작 기록만으로는 삭제하지 않고, 아직 없는 Watchdog·결과
 발행을 복구 수단으로 가정하지 않는다.
-7단계 실제 동작: 결과 발행까지 끝난 작업(COMPLETED/FAILED + PUBLISHED)의 중복 메시지만 삭제한다. 사전 검증 통과·
-실패 결과 저장·일시 장애·충돌·형식 오류 등은 삭제하지 않는다. Pruna 접수·복구 연결에 따른 삭제 판단은 8단계에서
-submit 연결 지점에 구현한다.
+결과 발행까지 끝난 작업(COMPLETED/FAILED + PUBLISHED)의 중복 메시지는 지운다. 그 밖에는 deletion_allowed
+(pruna_submitter.py)가 최신 기록·다음 일·FollowUpPaths 로 판단한다. 기본 NoFollowUpPaths 는 이어 갈 경로가 없다고
+답하므로(Webhook 9단계·결과 발행 14단계·Watchdog 15단계 미구현), 8단계에서도 접수·실패 저장·UNKNOWN 뒤 메시지를
+지우지 않는다. Pruna 제출은 8단계 PrunaSubmitter 가 submit 연결 지점으로 한다.
 
-실행 권한(DB lease)·SQS Visibility Timeout 은 처리 단계 사이(before_step)에서만 각각 연장한다. 하나의 긴 외부
-호출이 진행되는 동안 주기적으로 연장하는 기능은 없다(8단계에서 확인·보완).
+실행 권한(DB lease)·SQS Visibility Timeout 은 처리 단계 사이(before_step)에서 각각 연장하고, Pruna 생성 요청 HTTP
+전송 중에는 PrunaSubmitter 의 keepalive thread 가 주기적으로 연장한다. 잔액·사용량 조회 같은 짧은 단계 하나 안에서는
+주기적으로 연장하지 않는다.
 
 동기 작업(SQS long polling·DB·S3·Runware)은 worker thread 에서 하나씩 돈다(전용 CapacityLimiter(1)). 그래서
 FastAPI 이벤트 루프와 다른 요청의 thread 를 막지 않는다. DB 트랜잭션·행 잠금은 5단계 메서드 안에서만 짧게 잡고,
@@ -50,6 +52,12 @@ from app.virtual_fitting.exceptions import (
     VirtualFittingError,
 )
 from app.virtual_fitting.models import FittingProduct
+from app.virtual_fitting.pruna_submitter import (
+    FollowUpPaths,
+    NoFollowUpPaths,
+    deletion_allowed,
+    failure_payload,
+)
 from app.virtual_fitting.repositories.async_job_repository import (
     AsyncFittingJob,
     AsyncJobRepository,
@@ -131,16 +139,18 @@ class Budget(Protocol):
 class BalanceCheck(Protocol):
     """Runware 잔액 사전 확인 연결 지점. 구현체는 잔액이 부족하면 FittingBalanceExhaustedError 를 낸다.
 
-    7단계에는 실제 잔액을 조회하는 구현이 없다(기본 NoBalancePrecheck). 8단계 계획(미구현): 실제 잔액 조회를
-    연결하고 FITTING_MIN_BALANCE_USD(기본 1.00 달러) 이하이면 생성을 막는다. 조회 실패는 생성을 보류하고
-    재처리하며, 잔액 부족이면 V1 fallback 도 하지 않는다.
+    8단계 구현: providers/runware_balance.py 의 MinimumBalanceCheck 가 getDetails 의 balance.amount(USD)를 조회해
+    FITTING_MIN_BALANCE_USD(기본 1.00 달러) 이하이면 막는다. 조회 실패(FittingBalanceUnknownError)는 잔액 부족으로
+    확정하지 않고 생성을 보류·재처리하며, 잔액 부족이면 V1 fallback 도 하지 않는다. create_request_worker 가 연결한다.
     """
 
     def ensure_available(self) -> None: ...
 
 
 class NoBalancePrecheck:
-    """기본값. 실제 잔액을 조회하지 않고 아무것도 막지 않는다.
+    """RequestPrecheck 에 balance 를 주지 않았을 때의 기본값(테스트용). 실제 잔액을 조회하지 않고 막지 않는다.
+
+    실제 Worker(create_request_worker)는 MinimumBalanceCheck 를 쓴다.
 
     프로젝트에 Runware 잔액 사전 조회 기능이 없다(V1 도 생성 요청에 대한 402 응답으로만 잔액 부족을 안다).
     생성 요청의 잔액 부족 응답은 Provider 가 분류한다(V1: FittingBalanceExhaustedError, V2 1단계 Provider:
@@ -159,7 +169,8 @@ class RequestPrecheck:
       남은 잔액이 아니라 오늘 쓴 금액이 기준이다. 마지막 보정이 FITTING_USAGE_RECONCILE_SECONDS 보다 오래됐으면
       Runware getUsageActivity 로 하루 사용액을 조회해 AI DB usage_amount 에 보정값(큰 쪽)과 보정 시각을 저장한다.
       새 생성 비용을 더하는 기록(record)은 하지 않는다(생성 후에 하는 일, 8단계).
-    - 잔액: BalanceCheck 연결 지점만 있다(기본 NoBalancePrecheck 는 막지 않음).
+    - 잔액: BalanceCheck(실제 Worker 는 MinimumBalanceCheck — 사용 가능한 잔액이 1 달러 이하이면 막음). 하루 사용액
+      5 달러 상한과는 별개다.
     - 유료 생성 시도 횟수는 늘리지 않는다.
     """
 
@@ -228,16 +239,6 @@ class RequestPrecheck:
         return PrecheckOutcome(PrecheckStatus.PASSED, products=tuple(products))
 
 
-def failure_payload(fitting_job_id: int, error_code: str, error_message: str) -> dict[str, Any]:
-    """V2 실패 결과(result_payload / be-fitting-response)."""
-    return {
-        "fitting_job_id": fitting_job_id,
-        "status": "FAILED",
-        "error_code": error_code,
-        "error_message": error_message,
-    }
-
-
 # --- 메시지 하나 처리 ---
 
 
@@ -254,8 +255,8 @@ class RequestOutcome:
 class Heartbeat:
     """DB lease 와 SQS Visibility Timeout 을 각각 연장한다. 둘 중 하나라도 실패하면 False.
 
-    beat() 는 처리 단계 사이에서 불릴 때만 연장한다(마지막 연장 뒤 interval 이 지났을 때). 백그라운드에서 주기적으로
-    연장하지 않으므로, 단계 하나(외부 호출 하나)가 lease·Visibility 시간보다 오래 걸리면 그 사이에 만료될 수 있다.
+    beat() 는 불릴 때만 연장한다(마지막 연장 뒤 interval 이 지났을 때). 처리 단계 사이에서 부르고, Pruna 생성 요청
+    전송 중에는 pruna_submitter.keepalive 가 별도 thread 에서 주기적으로 부른다.
     """
 
     def __init__(
@@ -304,7 +305,7 @@ class Heartbeat:
 
 # 8단계 Pruna 제출 연결 지점. (작업, lease 토큰, 요청, 사전 검증 결과, heartbeat) → 메시지를 지워도 되는지.
 # True 는 접수 결과와 후속 실행·복구에 필요한 기록을 저장했고, 실제로 이어서 처리할 경로가 있을 때만 돌려준다
-# (task_uuid·이미지 Key·호출 시작 기록만으로는 False). 7단계에는 연결돼 있지 않다(submit=None).
+# (task_uuid·이미지 Key·호출 시작 기록만으로는 False). 8단계 구현은 pruna_submitter.PrunaSubmitter 다.
 SubmitHandler = Callable[[AsyncFittingJob, str, FittingRequest, PrecheckOutcome, Heartbeat], bool]
 ConflictAlert = Callable[[AsyncFittingJob, FittingRequest, str], None]
 
@@ -338,8 +339,11 @@ class RequestProcessor:
         submit: SubmitHandler | None = None,
         on_conflict: ConflictAlert = log_conflict,
         should_stop: Callable[[], bool] = lambda: False,
+        follow_up: FollowUpPaths | None = None,
     ):
         self._jobs, self._state, self._precheck, self._sqs = jobs, state, precheck, sqs
+        # 이미 진행된 작업의 중복 메시지를 지워도 되는지(이어 갈 실제 경로가 있는지). 기본은 "없음".
+        self._follow_up = follow_up or NoFollowUpPaths()
         self._lease_seconds = lease_seconds
         self._visibility_seconds = visibility_seconds
         self._heartbeat_interval = (
@@ -414,8 +418,10 @@ class RequestProcessor:
             return outcome("already_published_deleted", delete=True)
         if job.next_action is not NextAction.SUBMIT_PRUNA:
             # 실패 결과 저장 뒤(PUBLISH_RESULT)나 Pruna 이후 단계. 이어서 할 처리는 해당 단계가 맡는다.
+            # 그 일을 이어 갈 실제 경로가 있을 때만 메시지를 지운다(최신 기록으로 판단).
             return outcome(
-                f"waiting_{(job.next_action.value if job.next_action else 'none').lower()}"
+                f"waiting_{(job.next_action.value if job.next_action else 'none').lower()}",
+                delete=deletion_allowed(self._jobs.find_by_fitting_job_id(job_id), self._follow_up),
             )
         if self._should_stop():
             return outcome("stopping_kept")
@@ -436,6 +442,14 @@ class RequestProcessor:
                 visibility_seconds=self._visibility_seconds,
                 interval_seconds=self._heartbeat_interval,
             )
+            if grant.job is not None and grant.job.pruna_submit_started_at is not None:
+                # 보냈을 수 있는 작업(접수 여부 불명). 사전 검증·재전송 없이 복구 경로 유무만 본다.
+                return outcome(
+                    "submit_already_started",
+                    delete=deletion_allowed(
+                        self._jobs.find_by_fitting_job_id(job_id), self._follow_up
+                    ),
+                )
             check = self._precheck.run(
                 request, before_step=lambda: not self._should_stop() and heartbeat.beat()
             )
@@ -450,7 +464,7 @@ class RequestProcessor:
                 # 결과 발행(14단계)이 아직 없다. 저장만으로 삭제하지 않는다.
                 return outcome(f"failure_saved_{check.error_code}")
             if self._submit is None:
-                # 8단계에서 Pruna 제출을 연결한다. 그 전에는 제출·삭제하지 않는다.
+                # submit 이 연결되지 않은 조립(테스트 등). 제출·삭제하지 않는다. 실제 Worker 는 PrunaSubmitter 를 쓴다.
                 return outcome("prechecked_awaiting_submit")
             if not heartbeat.beat():
                 return outcome("heartbeat_failed_before_submit")
@@ -628,32 +642,62 @@ def create_request_worker() -> RequestWorker:
     from app.config.database import get_connection_pool
     from app.virtual_fitting.async_request import receive_fitting_requests
     from app.virtual_fitting.budget import FittingBudget
+    from app.virtual_fitting.providers.runware_async import (
+        DEFAULT_SUBMIT_TIMEOUT,
+        RunwarePrunaAsyncProvider,
+    )
+    from app.virtual_fitting.providers.runware_balance import (
+        MinimumBalanceCheck,
+        RunwareBalanceClient,
+    )
     from app.virtual_fitting.providers.runware_usage import RunwareUsageClient
+    from app.virtual_fitting.pruna_submitter import PrunaSubmitter
     from app.virtual_fitting.repositories.product_repository import ProductRepository
+    from app.virtual_fitting.repositories.pruna_limiter import PrunaLimiter
     from app.virtual_fitting.repositories.usage_repository import UsageRepository
 
     pool = get_connection_pool()
     sqs = SqsQueueClient()
-    precheck = RequestPrecheck(
-        ProductRepository(pool),
-        S3ImageStorage(),
-        FittingBudget(
-            UsageRepository(pool),
-            RunwareUsageClient(),
-            daily_limit=settings.FITTING_DAILY_BUDGET_USD,
-            reconcile_interval=timedelta(seconds=settings.FITTING_USAGE_RECONCILE_SECONDS),
-        ),
+    storage = S3ImageStorage()
+    budget = FittingBudget(
+        UsageRepository(pool),
+        RunwareUsageClient(),
+        daily_limit=settings.FITTING_DAILY_BUDGET_USD,
+        reconcile_interval=timedelta(seconds=settings.FITTING_USAGE_RECONCILE_SECONDS),
     )
+    balance = MinimumBalanceCheck(RunwareBalanceClient(), settings.FITTING_MIN_BALANCE_USD)
+    precheck = RequestPrecheck(ProductRepository(pool), storage, budget, balance)
+    jobs, state = AsyncJobRepository(pool), AsyncJobStateRepository(pool)
     worker: RequestWorker
+    # 이어 갈 경로(Webhook 9단계·결과 발행 14단계·Watchdog 15단계)가 아직 없으므로 기본 NoFollowUpPaths 를 쓴다.
+    submitter = PrunaSubmitter(
+        jobs=jobs,
+        state=state,
+        limiter=PrunaLimiter(
+            pool,
+            max_in_flight=settings.VIRTUAL_FITTING_PRUNA_MAX_IN_FLIGHT,
+            max_concurrent_sends=settings.VIRTUAL_FITTING_PRUNA_MAX_CONCURRENT_SENDS,
+            min_send_interval_seconds=settings.VIRTUAL_FITTING_PRUNA_MIN_SEND_INTERVAL_SECONDS,
+            send_hold_seconds=DEFAULT_SUBMIT_TIMEOUT + 30,
+        ),
+        provider=RunwarePrunaAsyncProvider(),
+        storage=storage,
+        budget=budget,
+        balance=balance,
+        webhook_url=settings.VIRTUAL_FITTING_RUNWARE_WEBHOOK_URL,
+        should_stop=lambda: worker.stopping,
+        keepalive_seconds=settings.VIRTUAL_FITTING_REQUEST_LEASE_SECONDS / 3,
+    )
 
     processor = RequestProcessor(
-        AsyncJobRepository(pool),
-        AsyncJobStateRepository(pool),
+        jobs,
+        state,
         precheck,
         sqs,
         lease_seconds=settings.VIRTUAL_FITTING_REQUEST_LEASE_SECONDS,
         visibility_seconds=settings.VIRTUAL_FITTING_REQUEST_VISIBILITY_SECONDS,
         should_stop=lambda: worker.stopping,
+        submit=submitter,
     )
     worker = RequestWorker(
         lambda: receive_fitting_requests(

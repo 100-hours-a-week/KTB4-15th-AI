@@ -276,6 +276,24 @@ class AsyncJobStateRepository:
 
     # --- 외부 이벤트(Webhook) 경로: 토큰 대신 task_uuid·호출 시작·예상 상태 ---
 
+    def record_submission_accepted(self, task_uuid: str) -> StateChange:
+        """Runware 가 이 task_uuid 의 생성 요청을 접수했다는 응답(ACCEPTED)을 기록한다. 토큰을 쓰지 않는다.
+
+        접수 근거는 task 에 대한 사실이므로, 긴 HTTP 호출 중 lease 가 만료됐어도 기록할 수 있어야 한다. 등록된
+        task_uuid·호출 시작 기록이 있고 종료되지 않은 작업만 바꾼다. RECEIVED 면 WAITING_PRUNA·next_action=NULL 로
+        바꾸고, 완료 알림 등으로 이미 진전된 상태는 되돌리지 않는다. 최초 접수 시각은 처음 한 번만 기록한다.
+        """
+        return self._event_update(
+            task_uuid,
+            f"""
+            runware_accepted_at = COALESCE(runware_accepted_at, {_NOW}),
+            status = CASE WHEN status = 'RECEIVED' THEN 'WAITING_PRUNA' ELSE status END,
+            next_action = CASE WHEN status = 'RECEIVED' THEN NULL ELSE next_action END
+            """,
+            "TRUE",
+            {},
+        )
+
     def record_pruna_succeeded(self, task_uuid: str) -> StateChange:
         """Pruna 성공 알림. 접수 대기 중(RECEIVED·WAITING_PRUNA)인 작업만 POSTPROCESSING / POSTPROCESS 로 바꾼다."""
         return self._event_update(

@@ -43,7 +43,8 @@ CREATE INDEX IF NOT EXISTS products_colors_gin ON products USING gin (colors);
 
 -- 가상피팅 Runware 하루 사용액 (2026-09-28 결정). 하루 한 줄.
 --   usage_date    : UTC 날짜. getUsageActivity 기본 timezone(UTC)과 같은 "오늘" — KST 09:00 에 바뀐다.
---   amount        : includeCost 로 받은 금액을 누적한 값(USD). 보정 때 Runware 합계와 큰 쪽을 남긴다.
+--   amount        : 판단 금액(USD). 처음 만들 때의 정의. 개별 기록 합계·Runware 보정값을 나누는 컬럼은
+--                   scripts/db/usage_amount_split_totals.sql 이 추가한다(이 CREATE 를 다시 실행해도 추가되지 않음).
 --   reconciled_at : 마지막으로 Runware 합계와 맞춘 시각. NULL 이면 오늘 아직 맞추지 않았다.
 CREATE TABLE IF NOT EXISTS usage_amount (
     usage_date    date         PRIMARY KEY,
