@@ -247,7 +247,7 @@ jobs:
         )
       }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     environment: develop
     permissions:
       id-token: write
@@ -369,8 +369,11 @@ jobs:
           wait-for-service-stability: true
           wait-for-minutes: 20
 
-      # 안정화 대기는 circuit breaker가 롤백을 끝낸 경우에도 성공할 수 있다.
-      # 실제로 이번 revision이 PRIMARY로 배포 완료됐는지 다시 확인한다.
+      # 안정화 대기(services-stable)는 rolloutState가 아직 IN_PROGRESS일 때도 끝나고,
+      # circuit breaker가 롤백을 끝낸 경우에도 성공할 수 있다.
+      # 그래서 PRIMARY 배포가 이번 revision으로 COMPLETED가 될 때까지 따로 기다린다.
+      # - COMPLETED + 이번 revision → 성공
+      # - FAILED, PRIMARY가 다른 revision(롤백), 제한 시간 초과 → 실패
       - name: 배포 결과 확인
         if: ${{ always() && steps.meta.outcome == 'success' }}
         env:
@@ -380,14 +383,27 @@ jobs:
           TEMPLATE_VERSION: ${{ steps.template.outputs.version }}
           REQUESTED: ${{ steps.deploy.outputs.task-definition-arn }}
           DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          ROLLOUT_TIMEOUT: "600" # COMPLETED 대기 제한: 10분
         run: |
-          PRIMARY=$(aws ecs describe-services \
-            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
-            --query 'services[0].deployments[?status==`PRIMARY`] | [0]' \
-            --output json 2>/dev/null || echo 'null')
-          ACTUAL=$(echo "$PRIMARY" | jq -r '.taskDefinition // "unknown"')
-          ROLLOUT=$(echo "$PRIMARY" | jq -r '.rolloutState // "unknown"')
-          ROLLOUT_REASON=$(echo "$PRIMARY" | jq -r '.rolloutStateReason // ""')
+          read_primary() {
+            PRIMARY=$(aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+              --query 'services[0].deployments[?status==`PRIMARY`] | [0]' \
+              --output json 2>/dev/null || echo 'null')
+            ACTUAL=$(echo "$PRIMARY" | jq -r '.taskDefinition // "unknown"')
+            ROLLOUT=$(echo "$PRIMARY" | jq -r '.rolloutState // "unknown"')
+            ROLLOUT_REASON=$(echo "$PRIMARY" | jq -r '.rolloutStateReason // ""')
+          }
+
+          read_primary
+          if [[ "$DEPLOY_OUTCOME" == "success" && -n "$REQUESTED" ]]; then
+            DEADLINE=$(( $(date +%s) + ROLLOUT_TIMEOUT ))
+            while [[ "$ACTUAL" == "$REQUESTED" && "$ROLLOUT" == "IN_PROGRESS" && "$(date +%s)" -lt "$DEADLINE" ]]; do
+              echo "$(date '+%T') rolloutState=${ROLLOUT} primary=${ACTUAL##*/}"
+              sleep 15
+              read_primary
+            done
+          fi
 
           {
             echo "### AI dev V2(ECS) 배포 결과"
@@ -410,7 +426,7 @@ jobs:
             exit 1
           fi
           if [[ "$ROLLOUT" != "COMPLETED" ]]; then
-            echo "::error::배포가 완료 상태가 아닙니다 (rolloutState=${ROLLOUT})"
+            echo "::error::배포가 완료 상태가 아닙니다 (rolloutState=${ROLLOUT} ${ROLLOUT_REASON})"
             exit 1
           fi
           echo "V2 배포 성공: ${ACTUAL}"
