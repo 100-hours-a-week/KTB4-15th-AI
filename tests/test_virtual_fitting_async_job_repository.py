@@ -225,7 +225,17 @@ def test_duplicate_job_id_keeps_existing_input_and_result(pg):
     pg["sql"](
         "UPDATE virtual_fitting_async_jobs SET status = 'COMPLETED', result_payload = %s, "
         "result_image_key = 'virtual-fitting/results/3/pruna-async.jpg' WHERE fitting_job_id = 3",
-        (Jsonb({"code": "FITTING_SUCCESS"}),),
+        (
+            Jsonb(
+                {
+                    "fitting_job_id": 3,
+                    "status": "COMPLETED",
+                    "result_image_key": "virtual-fitting/results/3/pruna-async.jpg",
+                    "llm_title": "차분한 데일리룩",
+                    "llm_comment": "선택하신 상품으로 완성한 가상 피팅 결과입니다.",
+                }
+            ),
+        ),
     )
     before = repository.find_by_fitting_job_id(3)
 
@@ -327,22 +337,19 @@ def test_times_are_timestamptz_and_read_back_as_utc(pg):
 def test_result_payload_jsonb_round_trip(pg):
     repository = AsyncJobRepository(pg["pool"])
     repository.create(_new_job())
+    # V2 결과 형식(최상위 status). 한글과 줄바꿈이 그대로 남는지도 본다.
     payload = {
-        "code": "FITTING_SUCCESS",
-        "data": {
-            "fitting_job_id": 3,
-            "status": "COMPLETED",
-            "result_image_key": "virtual-fitting/results/3/pruna-async.jpg",
-            "llm_title": "차분한 올블랙 셔츠룩",
-            "llm_comment": "가슴 포켓이 돋보입니다.\n블랙 팬츠와 맞췄습니다.",
-        },
-        "message": "가상 피팅이 완료되었습니다.",
+        "fitting_job_id": 3,
+        "status": "COMPLETED",
+        "result_image_key": "virtual-fitting/results/3/pruna-async.jpg",
+        "llm_title": "차분한 올블랙 셔츠룩",
+        "llm_comment": "가슴 포켓이 돋보입니다.\n블랙 팬츠와 맞췄습니다.",
     }
     pg["sql"]("UPDATE virtual_fitting_async_jobs SET result_payload = %s", (Jsonb(payload),))
 
     assert repository.find_by_fitting_job_id(3).result_payload == payload
     assert pg["sql"](
-        "SELECT pg_typeof(result_payload)::text, result_payload->'data'->>'llm_title' "
+        "SELECT pg_typeof(result_payload)::text, result_payload->>'llm_title' "
         "FROM virtual_fitting_async_jobs"
     ) == [("jsonb", "차분한 올블랙 셔츠룩")]
     with pytest.raises(psycopg.errors.CheckViolation):
