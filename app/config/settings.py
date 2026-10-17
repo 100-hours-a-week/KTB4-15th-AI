@@ -150,6 +150,26 @@ VIRTUAL_FITTING_REQUEST_SHUTDOWN_TIMEOUT_SECONDS = float(
     os.getenv("VIRTUAL_FITTING_REQUEST_SHUTDOWN_TIMEOUT_SECONDS", "30")
 )
 
+# V2 AI 후처리 Worker (ai-fitting-response, app/virtual_fitting/postprocess_worker.py). 요청 Worker 와 따로 켠다.
+# 기본은 꺼짐: 꺼져 있으면 Worker·SQS client 를 만들지 않는다. 켜도 POSTPROCESS(11단계)·RUN_FALLBACK(13단계) 핸들러가
+# 코드로 연결되기 전에는 수신을 시작하지 않는다(not_ready, 메시지를 받기만 하고 DLQ 로 보내지 않게).
+VIRTUAL_FITTING_POSTPROCESS_WORKER_ENABLED = (
+    os.getenv("VIRTUAL_FITTING_POSTPROCESS_WORKER_ENABLED", "false").strip().lower() == "true"
+)
+# 실행 권한(DB lease, 초)과 숨김 시간(SQS Visibility Timeout, 초)은 따로 연장한다. 기준은 큐 Visibility Timeout 300초.
+# 처리 중에는 lease/3 마다 둘 다 연장한다. 범위는 Worker 를 켤 때 확인한다(lease 0~3600, Visibility 1~43200).
+VIRTUAL_FITTING_POSTPROCESS_LEASE_SECONDS = float(
+    os.getenv("VIRTUAL_FITTING_POSTPROCESS_LEASE_SECONDS", "300")
+)
+VIRTUAL_FITTING_POSTPROCESS_VISIBILITY_SECONDS = int(
+    os.getenv("VIRTUAL_FITTING_POSTPROCESS_VISIBILITY_SECONDS", "300")
+)
+# 종료할 때 스스로 끝나기를 기다리는 시간(초). 요청 Worker 와 같은 의미: 넘으면 수신 대기만 버리고, 처리 중인 단계는
+# 끝날 때까지 추가로 기다린다(전체 종료 시간의 상한이 아님).
+VIRTUAL_FITTING_POSTPROCESS_SHUTDOWN_TIMEOUT_SECONDS = float(
+    os.getenv("VIRTUAL_FITTING_POSTPROCESS_SHUTDOWN_TIMEOUT_SECONDS", "30")
+)
+
 
 def _decimal_env(name: str, default: str) -> Decimal:
     """금액 설정. float 를 거치지 않고 Decimal 로 읽는다. 숫자가 아니거나 NaN·무한대·음수면 시작할 때 거절한다."""

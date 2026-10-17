@@ -256,7 +256,8 @@ class Heartbeat:
     """DB lease 와 SQS Visibility Timeout 을 각각 연장한다. 둘 중 하나라도 실패하면 False.
 
     beat() 는 불릴 때만 연장한다(마지막 연장 뒤 interval 이 지났을 때). 처리 단계 사이에서 부르고, Pruna 생성 요청
-    전송 중에는 pruna_submitter.keepalive 가 별도 thread 에서 주기적으로 부른다.
+    전송 중에는 pruna_submitter.keepalive 가 별도 thread 에서 주기적으로 부른다. queue 는 그 메시지를 받은 큐다
+    (요청 Worker: be-fitting-request, 후처리 Worker: ai-fitting-response).
     """
 
     def __init__(
@@ -271,8 +272,11 @@ class Heartbeat:
         visibility_seconds: int,
         interval_seconds: float,
         clock: Callable[[], float] = time.monotonic,
+        queue: FittingQueue = FittingQueue.BE_FITTING_REQUEST,
+        name: str = "request",
     ):
         self._sqs, self._state = sqs, state
+        self._queue, self._name = queue, name
         self._job_id, self._token, self._receipt = fitting_job_id, token, receipt_handle
         self._lease_seconds, self._visibility_seconds = lease_seconds, visibility_seconds
         self._interval, self._clock = interval_seconds, clock
@@ -284,17 +288,19 @@ class Heartbeat:
         lease = self._state.renew_lease(self._job_id, self._token, self._lease_seconds)
         if not lease.applied:
             logger.warning(
-                "request worker lease renewal failed fitting_job_id=%s reason=%s",
+                "%s worker lease renewal failed fitting_job_id=%s reason=%s",
+                self._name,
                 self._job_id,
                 lease.reason.value,
             )
             return False
         visibility: SqsResult = self._sqs.change_visibility(
-            FittingQueue.BE_FITTING_REQUEST, self._receipt, self._visibility_seconds
+            self._queue, self._receipt, self._visibility_seconds
         )
         if not visibility.succeeded:
             logger.warning(
-                "request worker visibility extension failed fitting_job_id=%s reason=%s",
+                "%s worker visibility extension failed fitting_job_id=%s reason=%s",
+                self._name,
                 self._job_id,
                 visibility.reason,
             )
@@ -498,6 +504,7 @@ class RequestWorker:
     """FastAPI 이벤트 루프에서 도는 반복 수신 Task. 동기 단계는 전용 thread 하나에서 한다.
 
     예기치 않은 종료는 오류 로그와 status(crashed·last_error)로만 드러난다(자동 재시작·알림 전송 없음).
+    수신·처리·삭제 함수만 받으므로 후처리 Worker(ai-fitting-response, 10단계)도 같은 루프를 쓴다(name 으로 구분).
     """
 
     def __init__(
@@ -509,8 +516,10 @@ class RequestWorker:
         idle_seconds: float = 1.0,
         backoff_initial_seconds: float = 1.0,
         backoff_max_seconds: float = 60.0,
+        name: str = "request",
     ):
         self._receive, self._process, self._delete = receive, process, delete
+        self.name = name
         self._idle = idle_seconds
         self._backoff_initial, self._backoff_max = backoff_initial_seconds, backoff_max_seconds
         self._limiter = CapacityLimiter(1)
@@ -524,7 +533,9 @@ class RequestWorker:
 
     def start(self) -> asyncio.Task:
         if self._task is None:
-            self._task = asyncio.create_task(self._run(), name="virtual-fitting-request-worker")
+            self._task = asyncio.create_task(
+                self._run(), name=f"virtual-fitting-{self.name}-worker"
+            )
             self._task.add_done_callback(self._finished)
         return self._task
 
@@ -546,7 +557,7 @@ class RequestWorker:
             await asyncio.wait_for(asyncio.shield(self._task), timeout)
         except TimeoutError:
             logger.warning(
-                "request worker did not stop within %ss; cancelling receive wait", timeout
+                "%s worker did not stop within %ss; cancelling receive wait", self.name, timeout
             )
             self._task.cancel()
             try:
@@ -563,7 +574,7 @@ class RequestWorker:
         if error is not None:  # 예상하지 못한 종료를 숨기지 않는다.
             self.status.crashed = True
             self.status.last_error = type(error).__name__
-            logger.error("request worker crashed", exc_info=error)
+            logger.error("%s worker crashed", self.name, exc_info=error)
         else:
             self.status.stopped = True
 
@@ -581,7 +592,7 @@ class RequestWorker:
 
     async def _run(self) -> None:
         self.status.running = True
-        logger.info("request worker started")
+        logger.info("%s worker started", self.name)
         while not self._stop.is_set():
             try:
                 # long polling 은 thread 에서 기다린다. 종료 때 이 대기는 버릴 수 있다(받은 메시지는 지우지 않으므로
@@ -594,7 +605,7 @@ class RequestWorker:
                 self.status.consecutive_errors += 1
                 self.status.last_error = type(error).__name__
                 logger.exception(
-                    "request worker receive crashed; backing off %.1fs", self._backoff()
+                    "%s worker receive crashed; backing off %.1fs", self.name, self._backoff()
                 )
                 await self._sleep(self._backoff())
                 continue
@@ -602,7 +613,8 @@ class RequestWorker:
                 self.status.consecutive_errors += 1
                 self.status.last_error = batch.receive_result.reason
                 logger.warning(
-                    "request worker receive failed reason=%s; backing off %.1fs",
+                    "%s worker receive failed reason=%s; backing off %.1fs",
+                    self.name,
                     batch.receive_result.reason,
                     self._backoff(),
                 )
@@ -626,11 +638,12 @@ class RequestWorker:
                         self.status.deleted += 1
                     else:
                         logger.warning(
-                            "request worker delete failed message_id=%s reason=%s",
+                            "%s worker delete failed message_id=%s reason=%s",
+                            self.name,
                             item.message_id,
                             deleted.reason,
                         )
-        logger.info("request worker stopped")
+        logger.info("%s worker stopped", self.name)
 
 
 def create_request_worker() -> RequestWorker:
