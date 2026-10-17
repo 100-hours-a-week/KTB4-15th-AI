@@ -230,3 +230,187 @@ jobs:
             *:75) echo "::error::다른 배포가 진행 중이라 시작하지 못함. 끝난 뒤 재실행"; exit 1 ;;
             *)    echo "::error::결과 확인 불가(status=$STATUS). CloudWatch /lookddak/dev/deploy 확인"; exit 1 ;;
           esac
+
+  # V2 dev(ECS) 배포. V1 dev-deploy와 같은 이미지(태그)를 병렬로 배포한다.
+  # - Task Definition 설정은 CLOUD 레포 Terraform이 S3 템플릿으로 관리한다.
+  #   이 job은 템플릿의 __DIGEST__만 이번 이미지 digest로 바꿔 revision을 등록한다.
+  # - 실패하면 dev CD 전체 실패로 본다 (main merge 필수 체크).
+  deploy-v2:
+    name: dev-v2-deploy
+    needs: build-and-push
+    if: >-
+      ${{
+        always() &&
+        (
+          (github.event_name == 'push' && needs.build-and-push.result == 'success') ||
+          github.event_name == 'workflow_dispatch'
+        )
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: develop
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ECS_CLUSTER: lookddak-dev-v2
+      ECS_SERVICE: lookddak-dev-v2-fastapi-service
+      TASK_FAMILY: lookddak-dev-v2-fastapi
+      TEMPLATE_KEY: dev/v2/fastapi.json
+    steps:
+      - name: Guard - develop / hotfix 브랜치 확인
+        if: ${{ github.ref != 'refs/heads/develop' && !startsWith(github.ref, 'refs/heads/hotfix/') }}
+        run: |
+          echo "develop, hotfix/* 브랜치의 워크플로만 dev 서버에 배포할 수 있습니다. 현재 ref: ${GITHUB_REF}"
+          exit 1
+
+      - name: 배포 태그와 사유 확정
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.image_tag }}
+          INPUT_REASON: ${{ inputs.reason }}
+          BUILT_TAG: ${{ needs.build-and-push.outputs.tag }}
+        run: |
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            TAG="$BUILT_TAG"
+            REASON="${GITHUB_REF_NAME} push by ${GITHUB_ACTOR}"
+          else
+            TAG="$INPUT_TAG"
+            REASON="$INPUT_REASON"
+          fi
+          if [[ ! "$TAG" =~ ^[0-9a-f]{7}$ ]]; then
+            echo "태그 형식이 잘못되었습니다: '$TAG'"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "reason<<__EOF__"
+            echo "$REASON"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: AWS 인증 - deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AI_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 태그는 사람이 읽는 이름이고, 배포는 바뀌지 않는 digest로 한다.
+      - name: 이미지 digest 조회
+        id: image
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          DIGEST=$(aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$TAG" \
+            --query 'imageDetails[0].imageDigest' --output text) \
+          || { echo "ECR에 ${ECR_REPOSITORY}:${TAG} 이미지가 없습니다."; exit 1; }
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "digest 형식이 잘못되었습니다: '$DIGEST'"
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      # 버킷 이름에 계정 ID가 들어가므로 레포에 적지 않고 실행 시 만든다.
+      - name: Task Definition 템플릿 다운로드
+        id: template
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="lookddak-ecs-taskdef-${ACCOUNT}-${AWS_REGION}"
+          VERSION=$(aws s3api get-object \
+            --bucket "$BUCKET" --key "$TEMPLATE_KEY" \
+            "$RUNNER_TEMP/template.json" \
+            --query VersionId --output text)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "repository_uri=${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}" >> "$GITHUB_OUTPUT"
+
+      # __DIGEST__만 바꾸고, 결과가 예상과 정확히 같은지 확인한다.
+      # 다른 저장소 이미지나 다른 family로 바뀌지 않게 막는다.
+      - name: digest 치환 및 검증
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+          REPOSITORY_URI: ${{ steps.template.outputs.repository_uri }}
+        run: |
+          TEMPLATE="$RUNNER_TEMP/template.json"
+          TASKDEF="$RUNNER_TEMP/taskdef.json"
+
+          jq -e --arg family "$TASK_FAMILY" --arg image "${REPOSITORY_URI}@__DIGEST__" '
+            .family == $family and
+            (.containerDefinitions | length) == 1 and
+            .containerDefinitions[0].image == $image
+          ' "$TEMPLATE" > /dev/null \
+          || { echo "::error::템플릿이 예상과 다릅니다 (family, 컨테이너 수, image 확인)"; exit 1; }
+
+          jq --arg digest "$DIGEST" \
+            '.containerDefinitions[0].image |= sub("@__DIGEST__$"; "@" + $digest)' \
+            "$TEMPLATE" > "$TASKDEF"
+
+          if grep -q '__DIGEST__' "$TASKDEF"; then
+            echo "::error::치환 후에도 __DIGEST__가 남아 있습니다."
+            exit 1
+          fi
+          jq -e --arg image "${REPOSITORY_URI}@${DIGEST}" \
+            '.containerDefinitions[0].image == $image' "$TASKDEF" > /dev/null \
+          || { echo "::error::치환 결과 image가 예상과 다릅니다."; exit 1; }
+
+          echo "image=$(jq -r '.containerDefinitions[0].image' "$TASKDEF")"
+
+      # revision 등록 → 서비스 갱신 → 안정화 대기
+      # 새 Task가 계속 실패하면 circuit breaker가 직전 revision으로 되돌린다.
+      - name: ECS 배포
+        id: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ runner.temp }}/taskdef.json
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
+          wait-for-minutes: 20
+
+      # 안정화 대기는 circuit breaker가 롤백을 끝낸 경우에도 성공할 수 있다.
+      # 실제로 이번 revision이 PRIMARY로 배포 완료됐는지 다시 확인한다.
+      - name: 배포 결과 확인
+        if: ${{ always() && steps.meta.outcome == 'success' }}
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          REASON: ${{ steps.meta.outputs.reason }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+          TEMPLATE_VERSION: ${{ steps.template.outputs.version }}
+          REQUESTED: ${{ steps.deploy.outputs.task-definition-arn }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+        run: |
+          PRIMARY=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].deployments[?status==`PRIMARY`] | [0]' \
+            --output json 2>/dev/null || echo 'null')
+          ACTUAL=$(echo "$PRIMARY" | jq -r '.taskDefinition // "unknown"')
+          ROLLOUT=$(echo "$PRIMARY" | jq -r '.rolloutState // "unknown"')
+          ROLLOUT_REASON=$(echo "$PRIMARY" | jq -r '.rolloutStateReason // ""')
+
+          {
+            echo "### AI dev V2(ECS) 배포 결과"
+            echo "- 이벤트: ${GITHUB_EVENT_NAME}"
+            echo "- 태그: \`${TAG}\`"
+            echo "- 사유: ${REASON}"
+            echo "- digest: \`${DIGEST:-조회 실패}\`"
+            echo "- 템플릿: \`${TEMPLATE_KEY}\` (S3 버전 \`${TEMPLATE_VERSION:-조회 실패}\`)"
+            echo "- 요청 revision: \`${REQUESTED:-등록 안 됨}\`"
+            echo "- 실제 PRIMARY revision: \`${ACTUAL}\`"
+            echo "- rolloutState: ${ROLLOUT} ${ROLLOUT_REASON}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$DEPLOY_OUTCOME" != "success" ]]; then
+            echo "::error::ECS 배포 단계 실패 (outcome=${DEPLOY_OUTCOME})"
+            exit 1
+          fi
+          if [[ -z "$REQUESTED" || "$ACTUAL" != "$REQUESTED" ]]; then
+            echo "::error::요청 revision이 실행 중이 아닙니다 (circuit breaker 롤백 가능성). 요청=${REQUESTED} 실제=${ACTUAL}"
+            exit 1
+          fi
+          if [[ "$ROLLOUT" != "COMPLETED" ]]; then
+            echo "::error::배포가 완료 상태가 아닙니다 (rolloutState=${ROLLOUT})"
+            exit 1
+          fi
+          echo "V2 배포 성공: ${ACTUAL}"
