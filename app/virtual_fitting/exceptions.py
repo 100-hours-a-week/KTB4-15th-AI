@@ -124,14 +124,3 @@ class FittingImageStorageError(VirtualFittingError):
     status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
     code = "FITTING_IMAGE_STORAGE_FAILED"
     message = "가상 피팅 결과 이미지를 저장하지 못했습니다."
-
-
-class FittingBalanceUnknownError(VirtualFittingError):
-    """Runware 잔액을 확인하지 못했을 때(조회 timeout·권한·5xx·응답 형식·통화 불일치).
-
-    잔액 부족으로 확정하지 않는다. V2 요청 Worker 는 생성 요청을 보류하고 다시 처리한다.
-    """
-
-    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-    code = "FITTING_BALANCE_UNKNOWN"
-    message = "현재 가상 피팅 서비스를 이용할 수 없습니다. 잠시 후 다시 시도해주세요."

@@ -1,13 +1,11 @@
 """가상피팅 하루 사용액 상한 (2026-09-28 결정).
 
-  ① try_on 전 : 오늘 판단 금액이 상한에 닿았으면 402 FITTING_DAILY_BUDGET_EXCEEDED 로 막는다.
+  ① try_on 전 : 오늘 합계가 상한에 닿았으면 402 FITTING_DAILY_BUDGET_EXCEEDED 로 막는다.
                 마지막 보정이 FITTING_USAGE_RECONCILE_SECONDS 보다 오래됐으면 먼저 보정한다.
-  ③ try_on 후 : Runware 가 알려준 이 호출의 금액(includeCost)을 오늘 개별 기록 합계에 더한다.
+  ③ try_on 후 : Runware 가 알려준 이 호출의 금액(includeCost)을 오늘 합계에 더한다.
 
-판단 금액 = max(개별 기록 합계, Runware 보정값) (UsageRepository). Runware 집계(getUsageActivity)는 늦게
-반영되므로 우리가 응답을 못 받은 호출(타임아웃 등)의 금액을 메우는 데 쓴다. 두 값을 더하지 않으므로 보정에 이미
-들어간 비용이 늦게 기록돼도 다시 세지 않는다. 실시간 계정 사용액이나 상한 엄수를 보장하지 않는다(진행 중인
-호출의 비용, 보정값에만 있던 비용과 그 뒤 새 비용의 차이는 다음 보정까지 빠질 수 있다).
+판단은 지연 없는 우리 합계로 한다. Runware 집계(getUsageActivity)는 늦게 반영되므로
+판단에 쓰지 않고, 우리가 응답을 못 받은 호출(타임아웃 등)의 금액을 메우는 보정에만 쓴다.
 """
 
 from collections.abc import Callable

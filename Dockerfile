@@ -54,7 +54,6 @@ WORKDIR /app
 COPY pyproject.toml .
 COPY app ./app
 COPY tests ./tests
-COPY scripts/db ./scripts/db
 
 # 최종 이미지 빌드 시 테스트가 반드시 실행되도록 통과 표시 파일을 만든다.
 RUN ruff check app tests \
