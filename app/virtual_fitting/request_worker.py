@@ -694,6 +694,10 @@ def create_request_worker() -> RequestWorker:
             "VIRTUAL_FITTING_RUNWARE_WEBHOOK_URL 이 https://<host>/api/v2/webhooks/runware?token=<WEBHOOK_TOKEN> "
             "형식이 아니거나 token 이 WEBHOOK_TOKEN 과 다릅니다."
         )
+    from app.virtual_fitting.result_publisher import result_publish_paths
+
+    # 결과 발행(14단계)만 결과 전송 루프가 실제로 돌 때 준비된 경로로 본다. Watchdog(15단계)은 아직 없다.
+    follow_up = result_publish_paths()
     pool = get_connection_pool()
     sqs = SqsQueueClient()
     storage = S3ImageStorage()
@@ -724,6 +728,7 @@ def create_request_worker() -> RequestWorker:
         budget=budget,
         balance=balance,
         webhook_url=settings.VIRTUAL_FITTING_RUNWARE_WEBHOOK_URL,
+        follow_up=follow_up,
         follow_up_queue=sqs,
         should_stop=lambda: worker.stopping,
         keepalive_seconds=settings.VIRTUAL_FITTING_REQUEST_LEASE_SECONDS / 3,
@@ -738,6 +743,7 @@ def create_request_worker() -> RequestWorker:
         visibility_seconds=settings.VIRTUAL_FITTING_REQUEST_VISIBILITY_SECONDS,
         should_stop=lambda: worker.stopping,
         submit=submitter,
+        follow_up=follow_up,
         follow_up_queue=sqs,
     )
     worker = RequestWorker(

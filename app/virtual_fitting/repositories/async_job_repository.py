@@ -217,6 +217,34 @@ class AsyncJobRepository:
         row = self._fetch_one(SELECT_BY_TASK_UUID_SQL, (parsed,))
         return _row_to_job(row) if row is not None else None
 
+    def find_result_publish_due(self, limit: int) -> list[int]:
+        """결과 발행(14단계)을 기다리는 작업 번호. 결과가 저장돼 있고(PUBLISH_RESULT·PENDING) 종료되지 않았으며 다른
+        실행 주체의 유효한 실행 권한이 없는 것만, 오래된 것부터. 선점은 호출부가 acquire_lease 로 다시 확인한다.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit 는 1~100 정수여야 합니다.")
+        try:
+            with self._connection_pool.connection() as connection:
+                connection.autocommit = True
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        SELECT fitting_job_id FROM {TABLE}
+                        WHERE next_action = 'PUBLISH_RESULT' AND result_payload IS NOT NULL
+                          AND result_message_status = 'PENDING'
+                          AND status NOT IN ('COMPLETED', 'FAILED')
+                          AND (worker_lease_token IS NULL OR worker_lease_until <= statement_timestamp())
+                        ORDER BY updated_at, fitting_job_id
+                        LIMIT %s
+                        """,
+                        (limit,),
+                    )
+                    return [row[0] for row in cursor.fetchall()]
+        except psycopg.Error as error:
+            raise FittingDatabaseError(
+                "AI PostgreSQL 결과 발행 대상 조회에 실패했습니다."
+            ) from error
+
     def _fetch_one(self, sql: str, params: tuple) -> Any:
         try:
             with self._connection_pool.connection() as connection:

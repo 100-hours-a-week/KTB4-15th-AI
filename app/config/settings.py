@@ -170,6 +170,22 @@ VIRTUAL_FITTING_POSTPROCESS_SHUTDOWN_TIMEOUT_SECONDS = float(
     os.getenv("VIRTUAL_FITTING_POSTPROCESS_SHUTDOWN_TIMEOUT_SECONDS", "30")
 )
 
+# V2 결과 전송 루프(be-fitting-response, app/virtual_fitting/result_publisher.py, 14단계). 기본은 꺼짐: 꺼져 있으면 DB·SQS
+# 자원을 만들지 않고, 요청·후처리 Worker·Webhook 은 PUBLISH_RESULT 경로가 준비되지 않은 것으로 본다.
+VIRTUAL_FITTING_RESULT_PUBLISHER_ENABLED = (
+    os.getenv("VIRTUAL_FITTING_RESULT_PUBLISHER_ENABLED", "false").strip().lower() == "true"
+)
+# 대상이 없을 때 다시 조회하기까지(초). 전송 한 번(SQS 응답 대기 포함)보다 넉넉한 실행 권한(초). 종료 대기(초, 전체 상한 아님).
+VIRTUAL_FITTING_RESULT_PUBLISHER_POLL_SECONDS = float(
+    os.getenv("VIRTUAL_FITTING_RESULT_PUBLISHER_POLL_SECONDS", "2")
+)
+VIRTUAL_FITTING_RESULT_PUBLISHER_LEASE_SECONDS = float(
+    os.getenv("VIRTUAL_FITTING_RESULT_PUBLISHER_LEASE_SECONDS", "180")
+)
+VIRTUAL_FITTING_RESULT_PUBLISHER_SHUTDOWN_TIMEOUT_SECONDS = float(
+    os.getenv("VIRTUAL_FITTING_RESULT_PUBLISHER_SHUTDOWN_TIMEOUT_SECONDS", "30")
+)
+
 
 def _decimal_env(name: str, default: str) -> Decimal:
     """금액 설정. float 를 거치지 않고 Decimal 로 읽는다. 숫자가 아니거나 NaN·무한대·음수면 시작할 때 거절한다."""

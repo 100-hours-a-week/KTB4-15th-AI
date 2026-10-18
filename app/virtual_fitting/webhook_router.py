@@ -33,7 +33,7 @@ from app.config import settings
 from app.config.database import DatabaseConfigError, get_connection_pool
 from app.errors import INVALID_REQUEST, ApiResponse, error_response
 from app.virtual_fitting.exceptions import FittingDatabaseError, VirtualFittingError
-from app.virtual_fitting.pruna_submitter import FollowUpPaths, NoFollowUpPaths
+from app.virtual_fitting.pruna_submitter import FollowUpPaths
 from app.virtual_fitting.runware_webhook import (
     WEBHOOK_PATH,
     EventResult,
@@ -66,12 +66,15 @@ router = APIRouter(
 
 
 def webhook_follow_up_paths() -> FollowUpPaths:
-    """Webhook 뒤에 남는 일(결과 발행 14단계·Watchdog 복구 15단계)을 이어 갈 실제 경로.
+    """Webhook 뒤에 남는 일을 이어 갈 실제 경로.
 
-    아직 구현되지 않았으므로 항상 NoFollowUpPaths 다. Router 가 있거나 큐 URL·환경변수가 설정됐다는 이유로 준비됐다고
-    보지 않는다. 해당 단계를 구현할 때 코드로 연결한다.
+    결과 발행(PUBLISH_RESULT, 14단계)은 결과 전송 루프가 실제로 돌고 있고 그 결과가 PENDING 일 때만 준비됐다고 본다
+    (ResultPublishPaths). 루프가 꺼져 있거나 멈췄으면 준비되지 않음. 운영 확인·복구(RECOVER_UNKNOWN, 15단계 Watchdog)는
+    아직 준비되지 않음. 큐 URL·환경변수 설정만으로 준비됐다고 보지 않는다.
     """
-    return NoFollowUpPaths()
+    from app.virtual_fitting.result_publisher import result_publish_paths
+
+    return result_publish_paths()
 
 
 @contextmanager

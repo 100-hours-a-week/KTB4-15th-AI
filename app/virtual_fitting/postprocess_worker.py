@@ -391,6 +391,7 @@ def create_postprocess_worker(handlers: PostprocessHandlers):
     from app.virtual_fitting.repositories.async_job_repository import AsyncJobRepository
     from app.virtual_fitting.repositories.async_job_state import AsyncJobStateRepository
     from app.virtual_fitting.request_worker import RequestWorker
+    from app.virtual_fitting.result_publisher import result_publish_paths
 
     missing = handlers.missing()
     if missing:
@@ -406,6 +407,8 @@ def create_postprocess_worker(handlers: PostprocessHandlers):
         handlers,
         lease_seconds=config.lease_seconds,
         visibility_seconds=config.visibility_seconds,
+        # 결과 발행(14단계)만 결과 전송 루프가 실제로 돌 때 준비된 경로로 본다. Watchdog(15단계)은 아직 없다.
+        follow_up=result_publish_paths(),
         should_stop=lambda: worker.stopping,
     )
     worker = RequestWorker(

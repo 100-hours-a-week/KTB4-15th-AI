@@ -15,7 +15,7 @@ import pytest
 from app.config import settings
 from app.virtual_fitting import runware_webhook, webhook_router
 from app.virtual_fitting.exceptions import FittingDatabaseError
-from app.virtual_fitting.pruna_submitter import NextStep, NoFollowUpPaths, next_step_for
+from app.virtual_fitting.pruna_submitter import NextStep, next_step_for
 from app.virtual_fitting.repositories.async_job_repository import AsyncJobStatus, NextAction
 from app.virtual_fitting.repositories.pruna_limiter import TaskCostRepository
 from app.virtual_fitting.runware_webhook import AUTH_ERROR_CODES, FALLBACK_ERROR_CODES
@@ -154,8 +154,11 @@ def test_injected_ready_publish_path_allows_200_with_the_same_result(api, monkey
 
 
 def test_default_assembly_never_reports_a_publish_or_recovery_path(api, monkeypatch):  # noqa: F811
+    from app.virtual_fitting.result_publisher import ResultPublishPaths
+
+    # 14단계부터 결과 전송 루프의 실제 상태를 본다. 루프가 등록·실행되지 않으면 어떤 단계도 준비되지 않는다.
     paths = webhook_router.webhook_follow_up_paths()
-    assert isinstance(paths, NoFollowUpPaths)
+    assert isinstance(paths, ResultPublishPaths)
     assert not any(paths.ready_for(None, step) for step in NextStep)
     # 결과 큐 URL·Webhook token 이 설정돼 있어도 준비됐다고 보지 않는다.
     monkeypatch.setattr(

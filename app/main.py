@@ -33,6 +33,10 @@ from app.virtual_fitting.providers.runware import (
     get_runware_vton_api_key,
 )
 from app.virtual_fitting.request_worker import create_request_worker
+from app.virtual_fitting.result_publisher import (
+    create_result_publisher,
+    register_result_publisher,
+)
 
 # 컨테이너 CMD(`uvicorn app.main:app`)는 log_config 를 넘기지 않는다. uvicorn 은 이 모듈을
 # import 한 뒤에 "Started server process" 를 찍으므로, 여기서 적용하면 서버 로그부터 포맷이 맞는다.
@@ -53,8 +57,14 @@ async def lifespan(app: FastAPI):
     # V2 후처리 Worker 도 켰을 때만 돈다. 핸들러(11·13단계)가 없으면 시작하지 않고 이유를 status 에 남긴다.
     app.state.postprocess_worker = None
     app.state.postprocess_worker_status = "disabled"
+    # V2 결과 전송 루프(14단계)도 켰을 때만 돈다. 실제로 시작한 루프만 등록해 다른 경로의 PUBLISH_RESULT 준비 판단에 쓴다.
+    app.state.result_publisher = None
     try:
         await open_async_pool()
+        if settings.VIRTUAL_FITTING_RESULT_PUBLISHER_ENABLED:
+            app.state.result_publisher = await to_thread.run_sync(create_result_publisher)
+            app.state.result_publisher.start()
+            register_result_publisher(app.state.result_publisher)
         if settings.VIRTUAL_FITTING_REQUEST_WORKER_ENABLED:
             # 조립은 blocking(DB pool·boto3)이라 thread 에서 한다.
             app.state.request_worker = await to_thread.run_sync(create_request_worker)
@@ -78,8 +88,9 @@ async def lifespan(app: FastAPI):
             app.state.graph = build_graph(checkpointer)
             yield
     finally:
-        # 두 Worker 가 함께 쓰는 DB pool 을 닫기 전에 두 Worker 를 모두 멈춘다(동시에 기다린다). 어느 Worker 도
-        # 공유 자원(DB pool·boto3 client)을 스스로 닫지 않는다.
+        # Worker 들과 결과 전송 루프가 함께 쓰는 DB pool 을 닫기 전에 모두 멈춘다(동시에 기다린다). 어느 쪽도
+        # 공유 자원(DB pool·boto3 client)을 스스로 닫지 않는다. 결과 전송 등록을 먼저 풀어 새 준비 판단에 쓰지 않게 한다.
+        register_result_publisher(None)
         stops = [
             worker.stop(timeout)
             for worker, timeout in (
@@ -90,6 +101,10 @@ async def lifespan(app: FastAPI):
                 (
                     app.state.postprocess_worker,
                     settings.VIRTUAL_FITTING_POSTPROCESS_SHUTDOWN_TIMEOUT_SECONDS,
+                ),
+                (
+                    app.state.result_publisher,
+                    settings.VIRTUAL_FITTING_RESULT_PUBLISHER_SHUTDOWN_TIMEOUT_SECONDS,
                 ),
             )
             if worker is not None
