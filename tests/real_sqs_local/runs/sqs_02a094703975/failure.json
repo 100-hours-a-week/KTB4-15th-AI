@@ -1,7 +1,0 @@
-{
-  "stage": "preflight",
-  "category": "application_or_contract",
-  "error_type": "AssertionError",
-  "error_code": null,
-  "http_status": null
-}

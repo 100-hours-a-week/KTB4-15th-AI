@@ -1,8 +1,0 @@
-  File "/Users/ijaein/Documents/LooKDDak/ai/tests/real_sqs_local/run.py", line 544, in main
-    run.preflight()
-  File "/Users/ijaein/Documents/LooKDDak/ai/tests/real_sqs_local/run.py", line 214, in preflight
-    self.check(role + ': no preexisting queued/inflight/delayed messages', not any(counts.values()))
-  File "/Users/ijaein/Documents/LooKDDak/ai/tests/real_sqs_local/run.py", line 124, in check
-    raise AssertionError(name)
-
-AssertionError
