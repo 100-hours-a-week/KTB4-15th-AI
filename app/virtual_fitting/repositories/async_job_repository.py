@@ -87,6 +87,10 @@ class AsyncFittingJob:
     fallback_task_uuid: str | None
     fallback_started_at: datetime | None
     fallback_image_key: str | None
+    # Runware 인증 오류 보류(15단계 보완, scripts/db/virtual_fitting_auth_hold.sql). 거절된 비동기 생성 시도와 안전한 원인 코드.
+    auth_hold_task_uuid: str | None = None
+    auth_hold_reason: str | None = None
+    auth_hold_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -162,12 +166,15 @@ def _row_to_job(row: Sequence[Any]) -> AsyncFittingJob:
         "image_verified_at",
         "worker_lease_until",
         "fallback_started_at",
+        "auth_hold_at",
     ):
         data[name] = _utc(data[name])
     data["products"] = tuple(data["products"]) if data["products"] is not None else None
     data["task_uuid"] = str(data["task_uuid"]) if data["task_uuid"] is not None else None
     fallback_task = data["fallback_task_uuid"]
     data["fallback_task_uuid"] = str(fallback_task) if fallback_task is not None else None
+    hold_task = data["auth_hold_task_uuid"]
+    data["auth_hold_task_uuid"] = str(hold_task) if hold_task is not None else None
     data["status"] = AsyncJobStatus(data["status"])
     data["next_action"] = NextAction(data["next_action"]) if data["next_action"] else None
     data["result_message_status"] = ResultMessageStatus(data["result_message_status"])

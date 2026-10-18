@@ -154,11 +154,11 @@ def test_injected_ready_publish_path_allows_200_with_the_same_result(api, monkey
 
 
 def test_default_assembly_never_reports_a_publish_or_recovery_path(api, monkeypatch):  # noqa: F811
-    from app.virtual_fitting.result_publisher import ResultPublishPaths
+    from app.virtual_fitting.watchdog import AnyFollowUpPaths
 
-    # 14단계부터 결과 전송 루프의 실제 상태를 본다. 루프가 등록·실행되지 않으면 어떤 단계도 준비되지 않는다.
+    # 14·15단계: 결과 전송 루프·Watchdog 의 실제 상태를 본다. 둘 다 등록·실행되지 않으면 어떤 단계도 준비되지 않는다.
     paths = webhook_router.webhook_follow_up_paths()
-    assert isinstance(paths, ResultPublishPaths)
+    assert isinstance(paths, AnyFollowUpPaths)
     assert not any(paths.ready_for(None, step) for step in NextStep)
     # 결과 큐 URL·Webhook token 이 설정돼 있어도 준비됐다고 보지 않는다.
     monkeypatch.setattr(
@@ -202,7 +202,8 @@ def test_runware_auth_error_is_held_not_saved_as_a_model_failure(api, caplog):  
         response = post(api, error_body(task, code="invalidApiKey", cost=0.015))
 
     assert response.status_code == 503  # Webhook token 인증 실패(401)와 다르다
-    assert response.json() == not_ready_body(task, "recover_unknown", "held")
+    # 15단계: 인증 오류 보류는 Watchdog 복구(recover_unknown)가 아니라 운영 확인(operator_review)이다.
+    assert response.json() == not_ready_body(task, "operator_review", "held")
     state = snapshot(api)
     assert state == before  # 결과 저장·상태 변경·fallback·생성 기록 초기화 없음
     assert state["result_payload"] is None and state["next_action"] is None
@@ -257,13 +258,19 @@ def test_runware_auth_error_after_publish_is_200_and_preserved(api):  # noqa: F8
 
 
 def test_runware_auth_error_with_an_injected_recovery_path_is_200(api, monkeypatch):  # noqa: F811
-    paths = ReadyPaths(NextStep.RECOVER_UNKNOWN)
-    connect(monkeypatch, paths)
+    # Watchdog 복구 경로(RECOVER_UNKNOWN)가 준비돼도 인증 오류 보류는 해결되지 않는다(15단계).
+    recovery = ReadyPaths(NextStep.RECOVER_UNKNOWN, NextStep.AWAIT_WEBHOOK)
+    connect(monkeypatch, recovery)
     task = submitted(api["db"])
+    assert post(api, error_body(task, code="invalidApiKey")).status_code == 503
+    assert recovery.asked == [NextStep.OPERATOR_REVIEW]
+    # 운영 확인 경로가 실제로 연결된 경우(테스트 주입)에만 200.
+    operator = ReadyPaths(NextStep.OPERATOR_REVIEW)
+    connect(monkeypatch, operator)
     response = post(api, error_body(task, code="invalidApiKey"))
     assert response.status_code == 200
     assert response.json()["data"]["results"][0]["outcome"] == "held"
-    assert snapshot(api)["result_payload"] is None and paths.asked == [NextStep.RECOVER_UNKNOWN]
+    assert snapshot(api)["result_payload"] is None and operator.asked == [NextStep.OPERATOR_REVIEW]
 
 
 def test_runware_auth_error_before_the_accept_response(api):  # noqa: F811
@@ -275,8 +282,10 @@ def test_runware_auth_error_before_the_accept_response(api):  # noqa: F811
         AsyncJobStatus.RECEIVED,
         NextAction.SUBMIT_PRUNA,
     )
-    # 접수 불명 복구 대상으로 남는다(같은 task 를 다시 보내지 않음). 호출 시작 기록도 그대로다.
-    assert next_step_for(current) is NextStep.RECOVER_UNKNOWN
+    # 15단계 보완: 일반 접수 불명 복구(recover_unknown)가 아니라 인증 오류 보류(operator_review)로 남는다(DB 기록).
+    # 같은 task 를 다시 보내지 않고, 호출 시작 기록도 그대로다.
+    assert next_step_for(current) is NextStep.OPERATOR_REVIEW
+    assert (current.auth_hold_task_uuid, current.auth_hold_reason) == (task, "invalidApiKey")
     assert current.pruna_submit_started_at is not None
 
 

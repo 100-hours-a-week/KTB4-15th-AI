@@ -28,7 +28,8 @@ Webhook 안에서는 S3 HEAD·이미지 다운로드·OpenAI·V1·BE 결과 발�
 
 Runware 인증 오류(본문 code 가 AUTH_ERROR_CODES): Runware 가 우리 API 키를 거절했다는 외부 오류다(Webhook token
 인증 실패 401 과 다르다). 사용자 실패 결과를 저장하지 않고, fallback·재호출도 하지 않으며, 상태·기존 결과를 바꾸지
-않는다. 운영 확인 대상으로 오류 로그를 남기고 그 task 의 비용·자리만 정리한다.
+않는다. 운영 확인 대상으로 오류 로그를 남기고 그 task 의 비용·자리만 정리한다. 결과를 기다리는 작업이면 인증 오류 보류
+기록(auth_hold_*, 15단계 보완)을 DB 에 남겨 요청 Worker 재수신·재시작 뒤에도 같은 operator_review 로 판단한다.
 """
 
 import json
@@ -49,6 +50,7 @@ from app.virtual_fitting.pruna_submitter import (
     FollowUpPaths,
     NextStep,
     NoFollowUpPaths,
+    auth_hold_active,
     failure_payload,
     next_step_for,
 )
@@ -322,23 +324,15 @@ def follow_up_message(job: AsyncFittingJob, action: NextAction) -> dict[str, Any
     }
 
 
-def _waiting_for_pruna(job: AsyncFittingJob) -> bool:
-    """아직 Pruna 결과를 기다리는 중(결과·후속 작업 없음)."""
-    return (
-        job.status in (AsyncJobStatus.RECEIVED, AsyncJobStatus.WAITING_PRUNA)
-        and job.result_payload is None
-        and job.next_action in (None, NextAction.SUBMIT_PRUNA)
-    )
-
-
 def _pending_step(event: WebhookEvent, job: AsyncFittingJob | None) -> NextStep | None:
     """이 알림 뒤에 남은 일 중 실제 경로가 있어야 하는 것. 후처리 큐로 넘긴 일(POSTPROCESS·RUN_FALLBACK)은 제외."""
     if job is None:
         return None
-    if next_step_for(job) is NextStep.PUBLISH_RESULT:
-        return NextStep.PUBLISH_RESULT
-    if event.auth_error and _waiting_for_pruna(job):
-        return NextStep.RECOVER_UNKNOWN  # 운영 확인 뒤 Watchdog(15단계)이 이어 갈 일
+    step = next_step_for(job)
+    if step in (NextStep.PUBLISH_RESULT, NextStep.OPERATOR_REVIEW):
+        # OPERATOR_REVIEW: DB 의 인증 오류 보류 기록(auth_hold_*)으로 판단한다. 요청 Worker 재수신과 같은 기록·같은 판단.
+        # Watchdog 이 돌아도 인증 오류가 해결된 것은 아니므로 자동 경로가 준비됐다고 보지 않는다.
+        return step
     return None
 
 
@@ -400,9 +394,11 @@ class RunwareWebhookService:
             return EventResult(task, EventOutcome.PROCESSING), job
 
         if event.auth_error:
-            # 상태·결과를 바꾸지 않는다. 최신 기록으로 보류인지 늦은 알림인지 판단한다.
-            current = self._jobs.find_by_task_uuid(task) or job
-            outcome = EventOutcome.HELD if _waiting_for_pruna(current) else EventOutcome.IGNORED
+            # 상태·결과·next_action 은 바꾸지 않는다. 결과를 기다리는 작업이면 보류 기록(auth_hold_*)만 남긴다(처음 한 번).
+            # 기록이 실패하면 예외(FittingDatabaseError)로 올라가 비용·자리 정리 전에 멈추고 5xx 로 응답한다.
+            change = self._state.record_auth_hold(task, event.error_code)
+            current = change.job or job
+            outcome = EventOutcome.HELD if auth_hold_active(current) else EventOutcome.IGNORED
             logger.error(
                 "runware webhook external auth error fitting_job_id=%s task_uuid=%s code=%s "
                 "outcome=%s; Runware API key / settings need operator check",

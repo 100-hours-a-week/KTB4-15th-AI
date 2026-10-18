@@ -37,6 +37,7 @@ from app.virtual_fitting.result_publisher import (
     create_result_publisher,
     register_result_publisher,
 )
+from app.virtual_fitting.watchdog import create_watchdog, register_watchdog
 
 # 컨테이너 CMD(`uvicorn app.main:app`)는 log_config 를 넘기지 않는다. uvicorn 은 이 모듈을
 # import 한 뒤에 "Started server process" 를 찍으므로, 여기서 적용하면 서버 로그부터 포맷이 맞는다.
@@ -59,12 +60,26 @@ async def lifespan(app: FastAPI):
     app.state.postprocess_worker_status = "disabled"
     # V2 결과 전송 루프(14단계)도 켰을 때만 돈다. 실제로 시작한 루프만 등록해 다른 경로의 PUBLISH_RESULT 준비 판단에 쓴다.
     app.state.result_publisher = None
+    # V2 Watchdog(15단계)도 켰을 때만 돈다. 켜져 있어야 할 Worker·결과 전송 루프가 멈추면 알린다.
+    app.state.watchdog = None
     try:
         await open_async_pool()
         if settings.VIRTUAL_FITTING_RESULT_PUBLISHER_ENABLED:
             app.state.result_publisher = await to_thread.run_sync(create_result_publisher)
             app.state.result_publisher.start()
             register_result_publisher(app.state.result_publisher)
+        if settings.VIRTUAL_FITTING_WATCHDOG_ENABLED:
+
+            def components() -> dict:
+                return {
+                    "request_worker": app.state.request_worker,
+                    "postprocess_worker": app.state.postprocess_worker,
+                    "result_publisher": app.state.result_publisher,
+                }
+
+            app.state.watchdog = await to_thread.run_sync(create_watchdog, components)
+            app.state.watchdog.start()
+            register_watchdog(app.state.watchdog)
         if settings.VIRTUAL_FITTING_REQUEST_WORKER_ENABLED:
             # 조립은 blocking(DB pool·boto3)이라 thread 에서 한다.
             app.state.request_worker = await to_thread.run_sync(create_request_worker)
@@ -91,6 +106,7 @@ async def lifespan(app: FastAPI):
         # Worker 들과 결과 전송 루프가 함께 쓰는 DB pool 을 닫기 전에 모두 멈춘다(동시에 기다린다). 어느 쪽도
         # 공유 자원(DB pool·boto3 client)을 스스로 닫지 않는다. 결과 전송 등록을 먼저 풀어 새 준비 판단에 쓰지 않게 한다.
         register_result_publisher(None)
+        register_watchdog(None)
         stops = [
             worker.stop(timeout)
             for worker, timeout in (
@@ -106,6 +122,7 @@ async def lifespan(app: FastAPI):
                     app.state.result_publisher,
                     settings.VIRTUAL_FITTING_RESULT_PUBLISHER_SHUTDOWN_TIMEOUT_SECONDS,
                 ),
+                (app.state.watchdog, settings.VIRTUAL_FITTING_WATCHDOG_SHUTDOWN_TIMEOUT_SECONDS),
             )
             if worker is not None
         ]

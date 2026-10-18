@@ -72,9 +72,9 @@ def webhook_follow_up_paths() -> FollowUpPaths:
     (ResultPublishPaths). 루프가 꺼져 있거나 멈췄으면 준비되지 않음. 운영 확인·복구(RECOVER_UNKNOWN, 15단계 Watchdog)는
     아직 준비되지 않음. 큐 URL·환경변수 설정만으로 준비됐다고 보지 않는다.
     """
-    from app.virtual_fitting.result_publisher import result_publish_paths
+    from app.virtual_fitting.watchdog import follow_up_paths
 
-    return result_publish_paths()
+    return follow_up_paths()
 
 
 @contextmanager

@@ -34,6 +34,7 @@ MIGRATION = (
 )
 # 13단계 변경 SQL(fallback 진행 기록 컬럼). 신규 생성 SQL 뒤에 적용한다(배포 순서와 같음).
 FALLBACK_MIGRATION = MIGRATION.with_name("virtual_fitting_fallback.sql")
+AUTH_HOLD_MIGRATION = MIGRATION.with_name("virtual_fitting_auth_hold.sql")
 KST = timezone(timedelta(hours=9))
 REQUESTED_AT = datetime(2026, 10, 13, 9, 30, tzinfo=KST)  # = 2026-10-13 00:30 UTC
 TASK_UUID = "a770f077-f413-47de-9dac-be0b26a35da6"
@@ -126,9 +127,13 @@ def _migration_columns():
             re.MULTILINE,
         )
     ]
-    added = re.findall(
-        r"ADD COLUMN IF NOT EXISTS ([a-z0-9_]+)\s", FALLBACK_MIGRATION.read_text(encoding="utf-8")
-    )
+    added = [
+        column
+        for migration in (FALLBACK_MIGRATION, AUTH_HOLD_MIGRATION)
+        for column in re.findall(
+            r"ADD COLUMN IF NOT EXISTS ([a-z0-9_]+)\s", migration.read_text(encoding="utf-8")
+        )
+    ]
     return created + added
 
 
@@ -158,6 +163,7 @@ def pg():
     with psycopg.connect(url, autocommit=True, options=options) as connection:
         connection.execute(MIGRATION.read_text(encoding="utf-8"))
         connection.execute(FALLBACK_MIGRATION.read_text(encoding="utf-8"))
+        connection.execute(AUTH_HOLD_MIGRATION.read_text(encoding="utf-8"))
     pool = ConnectionPool(url, min_size=1, max_size=2, kwargs={"options": options}, open=True)
 
     def sql(statement, params=None):
@@ -551,6 +557,9 @@ EXPECTED_COLUMNS = {
     "fallback_task_uuid": ("uuid", "YES"),
     "fallback_started_at": ("timestamp with time zone", "YES"),
     "fallback_image_key": ("text", "YES"),
+    "auth_hold_task_uuid": ("uuid", "YES"),
+    "auth_hold_reason": ("text", "YES"),
+    "auth_hold_at": ("timestamp with time zone", "YES"),
 }
 
 
@@ -585,4 +594,5 @@ def test_migration_can_run_again(pg):
     with psycopg.connect(pg["url"], autocommit=True, options=pg["options"]) as connection:
         connection.execute(MIGRATION.read_text(encoding="utf-8"))
         connection.execute(FALLBACK_MIGRATION.read_text(encoding="utf-8"))
+        connection.execute(AUTH_HOLD_MIGRATION.read_text(encoding="utf-8"))
     assert pg["sql"]("SELECT count(*) FROM virtual_fitting_async_jobs") == [(1,)]

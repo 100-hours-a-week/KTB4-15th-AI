@@ -90,6 +90,8 @@ class S3ObjectCheck:
     error_code: str | None = None
     content_length: int | None = None
     content_type: str | None = None
+    # 객체의 마지막 수정 시각(HEAD 응답의 LastModified). Watchdog 이 "이 생성 시도 뒤에 저장된 객체인지" 확인할 때 쓴다.
+    last_modified: Any = None
 
     @property
     def exists(self) -> bool | None:
@@ -288,6 +290,7 @@ class S3ImageStorage:
                 http_status=response.get("ResponseMetadata", {}).get("HTTPStatusCode"),
                 content_length=response.get("ContentLength"),
                 content_type=response.get("ContentType"),
+                last_modified=response.get("LastModified"),
             )
         if check.state is not S3ObjectState.EXISTS:
             logger.info(

@@ -17,6 +17,7 @@ Worker 경로는 토큰이 필요하다. 외부 이벤트(Runware Webhook) 경�
 예상 상태를 조건으로 쓴다. 이 모듈은 외부 호출·SQS·반복문을 하지 않는다(이후 단계가 연결한다).
 """
 
+import re
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -59,6 +60,7 @@ def lock_timeout_setting(seconds: float) -> str:
 
 
 _TERMINAL = [AsyncJobStatus.COMPLETED.value, AsyncJobStatus.FAILED.value]
+_SAFE_CODE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _NOW = "statement_timestamp()"
 _LEASE_VALID = f"worker_lease_token = %(token)s AND worker_lease_until > {_NOW}"
 
@@ -314,6 +316,34 @@ class AsyncJobStateRepository:
             "TRUE",
             {},
         )
+
+    def record_auth_hold(self, task_uuid: str, reason: str) -> StateChange:
+        """Runware 가 이 task_uuid 의 생성 시도에서 우리 API 키를 거절했다는 확인된 사실을 남긴다(운영 확인 보류).
+
+        정상 Webhook 토큰으로 받은 invalidApiKey 또는 생성 요청의 HTTP 401·403 만 넘긴다. 아직 Pruna 결과를 기다리는 작업
+        (RECEIVED·WAITING_PRUNA, 결과 없음, next_action 이 NULL·SUBMIT_PRUNA)만 바꾼다. 상태·next_action·결과·횟수는
+        바꾸지 않는다. 처음 기록만 남기고(중복 수신은 ALREADY_RECORDED), 결과가 이미 있거나 다른 경로로 진행된 작업은
+        바꾸지 않는다(STATE_MISMATCH·TERMINAL). 원인은 안전한 코드만 받는다.
+        """
+        if not isinstance(reason, str) or not _SAFE_CODE.match(reason):
+            raise ValueError("auth_hold_reason 은 안전한 원인 코드여야 합니다.")
+        change = self._event_update(
+            task_uuid,
+            "auth_hold_task_uuid = task_uuid, auth_hold_reason = %(reason)s, "
+            f"auth_hold_at = {_NOW}",
+            "status IN ('RECEIVED', 'WAITING_PRUNA') AND result_payload IS NULL "
+            "AND (next_action IS NULL OR next_action = 'SUBMIT_PRUNA') AND auth_hold_task_uuid IS NULL",
+            {"reason": reason},
+        )
+        current = change.job
+        if (
+            not change.applied
+            and current is not None
+            and current.auth_hold_task_uuid is not None
+            and current.auth_hold_task_uuid == current.task_uuid
+        ):
+            return StateChange(False, ChangeReason.ALREADY_RECORDED, current)
+        return change
 
     def record_pruna_succeeded(self, task_uuid: str) -> StateChange:
         """Pruna 성공 알림. 접수 대기 중(RECEIVED·WAITING_PRUNA)이고 결과가 아직 없는 작업만 POSTPROCESSING /

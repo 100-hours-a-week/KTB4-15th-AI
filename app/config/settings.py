@@ -186,6 +186,22 @@ VIRTUAL_FITTING_RESULT_PUBLISHER_SHUTDOWN_TIMEOUT_SECONDS = float(
     os.getenv("VIRTUAL_FITTING_RESULT_PUBLISHER_SHUTDOWN_TIMEOUT_SECONDS", "30")
 )
 
+# V2 Watchdog(app/virtual_fitting/watchdog.py, 15단계). 기본은 꺼짐: 꺼져 있으면 DB·SQS·S3·Runware 자원을 만들지 않고, 다른 경로는
+# AWAIT_WEBHOOK·RECOVER_UNKNOWN 복구 경로가 준비되지 않은 것으로 본다. 점검 주기(초)·한 번에 볼 작업 수·상태 조회 최소 간격(초).
+VIRTUAL_FITTING_WATCHDOG_ENABLED = (
+    os.getenv("VIRTUAL_FITTING_WATCHDOG_ENABLED", "false").strip().lower() == "true"
+)
+VIRTUAL_FITTING_WATCHDOG_INTERVAL_SECONDS = float(
+    os.getenv("VIRTUAL_FITTING_WATCHDOG_INTERVAL_SECONDS", "60")
+)
+VIRTUAL_FITTING_WATCHDOG_BATCH_SIZE = int(os.getenv("VIRTUAL_FITTING_WATCHDOG_BATCH_SIZE", "20"))
+VIRTUAL_FITTING_WATCHDOG_STATUS_MIN_INTERVAL_SECONDS = float(
+    os.getenv("VIRTUAL_FITTING_WATCHDOG_STATUS_MIN_INTERVAL_SECONDS", "1")
+)
+VIRTUAL_FITTING_WATCHDOG_SHUTDOWN_TIMEOUT_SECONDS = float(
+    os.getenv("VIRTUAL_FITTING_WATCHDOG_SHUTDOWN_TIMEOUT_SECONDS", "30")
+)
+
 
 def _decimal_env(name: str, default: str) -> Decimal:
     """금액 설정. float 를 거치지 않고 Decimal 로 읽는다. 숫자가 아니거나 NaN·무한대·음수면 시작할 때 거절한다."""

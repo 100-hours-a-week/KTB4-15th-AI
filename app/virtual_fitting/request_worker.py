@@ -694,10 +694,10 @@ def create_request_worker() -> RequestWorker:
             "VIRTUAL_FITTING_RUNWARE_WEBHOOK_URL 이 https://<host>/api/v2/webhooks/runware?token=<WEBHOOK_TOKEN> "
             "형식이 아니거나 token 이 WEBHOOK_TOKEN 과 다릅니다."
         )
-    from app.virtual_fitting.result_publisher import result_publish_paths
+    from app.virtual_fitting.watchdog import follow_up_paths
 
-    # 결과 발행(14단계)만 결과 전송 루프가 실제로 돌 때 준비된 경로로 본다. Watchdog(15단계)은 아직 없다.
-    follow_up = result_publish_paths()
+    # 실제로 도는 경로만 준비됐다고 본다: 결과 발행(14단계 결과 전송 루프) + 접수 대기·접수 불명확 확인(15단계 Watchdog).
+    follow_up = follow_up_paths()
     pool = get_connection_pool()
     sqs = SqsQueueClient()
     storage = S3ImageStorage()

@@ -54,6 +54,8 @@ class NextStep(str, Enum):
     RUN_FALLBACK = "run_fallback"  # 13단계
     PUBLISH_RESULT = "publish_result"  # 14단계
     RECOVER_UNKNOWN = "recover_unknown"  # 보냈을 수 있지만 접수 여부 불명(15단계 Watchdog)
+    # 운영자가 원인(예: Runware 인증 오류)을 확인해야 이어 갈 수 있는 일. 자동 경로가 준비됐다고 답하지 않는다.
+    OPERATOR_REVIEW = "operator_review"
 
 
 class FollowUpPaths(Protocol):
@@ -69,10 +71,27 @@ class NoFollowUpPaths:
         return False
 
 
+def auth_hold_active(job: AsyncFittingJob) -> bool:
+    """이 작업의 현재 비동기 생성 시도에 Runware 인증 오류 보류 기록(DB)이 있고, 아직 결과를 기다리는 중이다.
+
+    기록은 지우지 않는다. 결과가 저장됐거나 다른 경로(POSTPROCESS·RUN_FALLBACK 등)로 진행했으면 보류로 보지 않는다.
+    """
+    return (
+        job.auth_hold_task_uuid is not None
+        and job.auth_hold_task_uuid == job.task_uuid
+        and job.status in (AsyncJobStatus.RECEIVED, AsyncJobStatus.WAITING_PRUNA)
+        and job.result_payload is None
+        and job.next_action in (None, NextAction.SUBMIT_PRUNA)
+    )
+
+
 def next_step_for(job: AsyncFittingJob) -> NextStep | None:
     """최신 작업 기록에서 다음 일을 정한다. 분명하지 않으면 None."""
     if job.status in (AsyncJobStatus.COMPLETED, AsyncJobStatus.FAILED):
         return None
+    if auth_hold_active(job):
+        # 인증 오류 보류는 일반 접수 대기·접수 불명확(await_webhook·recover_unknown)으로 보지 않는다(15단계 보완).
+        return NextStep.OPERATOR_REVIEW
     if job.next_action is NextAction.PUBLISH_RESULT and job.result_payload is not None:
         return NextStep.PUBLISH_RESULT
     if job.next_action is NextAction.RUN_FALLBACK:
@@ -386,10 +405,14 @@ class PrunaSubmitter:
             return
         if result.http_status in (401, 403):
             # 우리 설정·권한 문제다. 사용자 실패로 확정하지 않고 운영 확인에 맡긴다(다시 보내지도 않음).
+            # 재수신·재시작 뒤에도 같은 판단(operator_review)을 하도록 보류 기록을 남긴다. 기록이 실패하면 예외로
+            # 올려 이 메시지를 지우지 않는다.
+            change = self._state.record_auth_hold(task_uuid, f"http_{result.http_status}")
             logger.error(
-                "pruna submit rejected by auth fitting_job_id=%s status=%s",
+                "pruna submit rejected by auth fitting_job_id=%s status=%s hold=%s",
                 job_id,
                 result.http_status,
+                change.reason.value,
             )
             return
         if result.retryable:

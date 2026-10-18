@@ -530,7 +530,7 @@ def test_webhook_auth_error_hold_is_not_solved_by_the_publisher(api):  # noqa: F
     response = post(api, error_body(task, code="invalidApiKey"))
     assert (
         response.status_code == 503
-        and response.json()["data"]["pending"][0]["next_step"] == "recover_unknown"
+        and response.json()["data"]["pending"][0]["next_step"] == "operator_review"
     )
 
 
@@ -577,14 +577,49 @@ def test_postprocess_message_after_publish_is_deleted_without_rerun(db):  # noqa
     assert handler.calls == []
 
 
-def test_late_webhook_after_publish_preserves_the_result(api):  # noqa: F811
+def test_late_webhook_before_publish_preserves_the_saved_result(api):  # noqa: F811
+    # 발행 전(PENDING) 저장된 결과: 늦은 Webhook 이 결과를 덮지 않는다(이전 이름의 테스트가 실제로 확인하던 상황).
     task = submitted(api["db"])
     register_result_publisher(Alive())
     post(api, error_body(task, code="someNewCode"))
-    publisher(api["db"], FakeSqs()).publish(JOB)
-    final = job(api["db"])
+    saved = job(api["db"])
+    assert saved.result_message_status is ResultMessageStatus.PENDING
+    assert saved.next_action is NextAction.PUBLISH_RESULT
     response = post(api, error_body(task))
-    assert response.status_code == 200 and job(api["db"]) == final
+    assert response.status_code == 200 and job(api["db"]) == saved
+
+
+def test_late_webhook_after_publish_preserves_the_result(api):  # noqa: F811
+    db_ = api["db"]
+    task = submitted(db_)
+    register_result_publisher(Alive())
+    post(api, error_body(task, code="someNewCode"))
+    # 준비 단계(submitted)의 요청 Worker 실행 권한을 정상 반납한다(실제 Worker 는 처리 뒤 반납한다).
+    db_["sql"](
+        "UPDATE virtual_fitting_async_jobs SET worker_lease_token = NULL, worker_lease_until = NULL "
+        "WHERE fitting_job_id = %s",
+        (JOB,),
+    )
+    sqs = FakeSqs()
+    assert (
+        publisher(db_, sqs).publish(JOB) is PublishOutcome.PUBLISHED
+    )  # 실제 전송 Processor·가짜 SQS
+    assert sqs.sent == [(FittingQueue.BE_FITTING_RESPONSE, FAILED_PAYLOAD)]
+    final = job(db_)
+    assert final.result_message_status is ResultMessageStatus.PUBLISHED
+    assert final.status.value == final.result_payload["status"] == "FAILED"
+    assert final.next_action is None and final.result_message_attempt_count == 1
+    internal_before = len(api["boto"].bodies)
+
+    for loops in (True, False):  # 결과 전송 루프가 돌거나 꺼져 있어도 발행 완료 중복은 안전하게 200
+        register_result_publisher(Alive() if loops else None)
+        for body in (error_body(task), error_body(task, code="someNewCode")):
+            response = post(api, body)
+            assert response.status_code == 200
+            assert job(db_) == final  # payload·최종 이미지·상태·전송 횟수 그대로
+    assert len(sqs.sent) == 1  # BE 결과를 다시 보내지 않음
+    assert len(api["boto"].bodies) == internal_before  # POSTPROCESS·RUN_FALLBACK 재발행 없음
+    assert api["forbidden"] == []  # 이미지 생성·LLM·S3 를 만들지 않음
 
 
 # --- 반복 루프 ---
