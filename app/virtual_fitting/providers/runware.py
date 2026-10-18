@@ -120,10 +120,17 @@ class RunwarePrunaProvider:
         self.timeout = timeout
         self._opener = opener or urlopen
 
-    def try_on(self, fitting_input: FittingInput) -> FittingResult:
+    def try_on(self, fitting_input: FittingInput, *, task_uuid: str | None = None) -> FittingResult:
+        """동기 생성 요청을 **한 번** 보낸다(urllib, 자동 재시도 없음). timeout·응답 불명확이면 예외를 던지고 다시
+        보내지 않는다. 다시 보낼지는 호출하는 쪽이 정한다(V1 HTTP 는 다시 보내지 않고 V2 fallback 은 1회로 제한).
+
+        task_uuid 를 주면 그 값으로 보낸다(V2: 호출 전에 기록해 두고 작업별 비용 기록·이력 확인에 쓴다. 호출부가
+        이미 알고 있으므로 결과로 돌려주지 않는다). 없으면 새로 만든다(V1, 기존과 같음).
+        """
+        task = str(uuid.UUID(task_uuid)) if task_uuid is not None else str(uuid.uuid4())
         request = Request(
             self.endpoint,
-            data=json.dumps(build_payload(fitting_input, str(uuid.uuid4()))).encode("utf-8"),
+            data=json.dumps(build_payload(fitting_input, task)).encode("utf-8"),
             headers=self._headers(),
             method="POST",
         )

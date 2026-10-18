@@ -213,6 +213,21 @@ class S3ImageStorage:
         return key
 
     def store_remote_image(self, url: str, key_prefix: str) -> str:
+        """V1: 원격 이미지를 내려받아 key_prefix 아래 새 이름(uuid + 감지한 확장자)으로 저장한다."""
+        body, content_type, extension = self._download_image(url)
+        key = f"{key_prefix}/{uuid.uuid4()}{extension}"
+        return self.upload_bytes(body, key, content_type)
+
+    def store_remote_image_at(self, url: str, key: str) -> str:
+        """원격 이미지를 내려받아 정해진 key 에 저장한다(V2 fallback: results/{id}/pruna-sync.jpg).
+
+        Content-Type 은 내려받은 내용으로 정한다(key 의 확장자와 다를 수 있다). URL 은 로그·예외에 남기지 않는다.
+        """
+        key = validate_s3_key(key)
+        body, content_type, _ = self._download_image(url)
+        return self.upload_bytes(body, key, content_type)
+
+    def _download_image(self, url: str) -> tuple[bytes, str, str]:
         request = Request(url, headers={"User-Agent": "LookDDak-AI/1.0"})
         try:
             with self._opener(request, timeout=DEFAULT_DOWNLOAD_TIMEOUT) as response:
@@ -222,8 +237,7 @@ class S3ImageStorage:
         if not body or len(body) > MAX_REMOTE_IMAGE_BYTES:
             raise ImageStorageError("가상피팅 결과 이미지 크기가 허용 범위를 벗어났습니다.")
         content_type, extension = _detect_image_type(body)
-        key = f"{key_prefix}/{uuid.uuid4()}{extension}"
-        return self.upload_bytes(body, key, content_type)
+        return body, content_type, extension
 
     # --- V2 비동기 가상피팅: Presigned URL 과 객체 확인 ---
     # Presigned URL 에는 서명·임시 자격증명이 들어 있다. 로그·예외 메시지·DB 에 남기지 않는다.
