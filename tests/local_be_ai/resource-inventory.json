@@ -1,0 +1,117 @@
+[
+  {
+    "run": "bia_1222f3a07ee4",
+    "job_ids": [
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "member_ids": [
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "product_ids": [
+      2,
+      3
+    ],
+    "ai_schema": "bia_1222f3a07ee4",
+    "status": "passed"
+  },
+  {
+    "run": "bia_1756561996aa",
+    "job_ids": [],
+    "member_ids": [],
+    "product_ids": [],
+    "ai_schema": "bia_1756561996aa",
+    "status": "failed"
+  },
+  {
+    "run": "bia_8004a1add17a",
+    "job_ids": [
+      1
+    ],
+    "member_ids": [
+      1
+    ],
+    "product_ids": [
+      1
+    ],
+    "ai_schema": "bia_8004a1add17a",
+    "status": "failed"
+  },
+  {
+    "run": "bia_a73d6bfd40fc",
+    "job_ids": [
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20
+    ],
+    "member_ids": [
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20
+    ],
+    "product_ids": [
+      6,
+      7
+    ],
+    "ai_schema": "bia_a73d6bfd40fc",
+    "status": "passed"
+  },
+  {
+    "run": "bia_c90ff82b31b1",
+    "job_ids": [],
+    "member_ids": [],
+    "product_ids": [],
+    "ai_schema": "bia_c90ff82b31b1",
+    "status": "failed"
+  },
+  {
+    "run": "bia_d986e9c43329",
+    "job_ids": [
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13
+    ],
+    "member_ids": [
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13
+    ],
+    "product_ids": [
+      4,
+      5
+    ],
+    "ai_schema": "bia_d986e9c43329",
+    "status": "passed"
+  },
+  {
+    "run": "bia_e5869066d94b",
+    "job_ids": [],
+    "member_ids": [],
+    "product_ids": [],
+    "ai_schema": "bia_e5869066d94b",
+    "status": "failed"
+  }
+]

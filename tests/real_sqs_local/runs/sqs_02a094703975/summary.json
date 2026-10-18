@@ -1,0 +1,30 @@
+{
+  "run": "sqs_02a094703975",
+  "status": "failed",
+  "stage": "preflight",
+  "checks": 2,
+  "checks_passed": 1,
+  "job_ids": [],
+  "processes": {},
+  "cleanup": {
+    "forced_deletes": [],
+    "remaining": [],
+    "foreign_messages_untouched": [],
+    "queue_errors": [],
+    "skipped": "no job created/no message sends possible"
+  },
+  "existing_files": {
+    "ai": {
+      "existing_files_checked": 587,
+      "changed": [],
+      "missing": [],
+      "head_unchanged": true
+    },
+    "be": {
+      "existing_files_checked": 793,
+      "changed": [],
+      "missing": [],
+      "head_unchanged": true
+    }
+  }
+}

@@ -1,0 +1,12 @@
+[
+  {
+    "check": "OS sandbox blocks nonlocal network",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "existing AI public data including usage/counters unchanged",
+    "passed": true,
+    "evidence": null
+  }
+]

@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/Users/ijaein/Documents/LooKDDak/ai/tests/local_be_ai/run.py", line 352, in main
+    if process.poll() is not None: raise RuntimeError("BE failed to start; inspect be-gradle.log")
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: BE failed to start; inspect be-gradle.log

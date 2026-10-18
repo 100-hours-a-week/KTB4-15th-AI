@@ -1,0 +1,23 @@
+{
+  "outbox": {
+    "id": 12,
+    "created_at": "2026-10-18T12:26:31.802882",
+    "updated_at": "2026-10-18T12:26:31.802882",
+    "aggregate_id": 12,
+    "claimed_by": null,
+    "event_type": "FITTING_REQUEST",
+    "last_error": null,
+    "lease_until": null,
+    "next_retry_at": "2026-10-18T12:26:31.802814",
+    "payload": "{\"fitting_job_id\":12,\"requested_at\":\"2026-10-18T12:26:31.801244Z\",\"user_image_key\":\"users/10/body.png\",\"products\":[{\"product_code\":\"800084004640\"}]}",
+    "published_at": null,
+    "retry_count": 0,
+    "status": "PENDING"
+  },
+  "product_id": 5,
+  "member_id": 12,
+  "created": {
+    "fittingJobId": 12,
+    "status": "PENDING"
+  }
+}

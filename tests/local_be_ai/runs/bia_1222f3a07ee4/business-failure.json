@@ -1,0 +1,97 @@
+{
+  "be": {
+    "query": {
+      "fittingJobId": 3,
+      "status": "FAILED",
+      "result": null
+    },
+    "job": {
+      "id": 3,
+      "created_at": "2026-10-18T12:24:22.461416",
+      "updated_at": "2026-10-18T12:24:22.7379",
+      "failure_code": "PRODUCT_NOT_FOUND",
+      "failure_message": "요청한 상품을 찾을 수 없습니다.",
+      "result_viewed_at": null,
+      "status": "FAILED",
+      "member_id": 3
+    },
+    "outbox": {
+      "id": 3,
+      "created_at": "2026-10-18T12:24:22.463039",
+      "updated_at": "2026-10-18T12:24:22.475569",
+      "aggregate_id": 3,
+      "claimed_by": null,
+      "event_type": "FITTING_REQUEST",
+      "last_error": null,
+      "lease_until": null,
+      "next_retry_at": "2026-10-18T12:24:22.462958",
+      "payload": "{\"fitting_job_id\":3,\"requested_at\":\"2026-10-18T12:24:22.461306Z\",\"user_image_key\":\"users/10/body.png\",\"products\":[{\"product_code\":\"800067049776\"}]}",
+      "published_at": "2026-10-18T12:24:22.475502",
+      "retry_count": 0,
+      "status": "PUBLISHED"
+    },
+    "results": [],
+    "notifications": [
+      {
+        "id": 2,
+        "created_at": "2026-10-18T12:24:22.734773",
+        "updated_at": "2026-10-18T12:24:22.734773",
+        "expires_at": "2026-10-25T12:24:22.734464",
+        "is_read": false,
+        "payload": "{}",
+        "target_id": 3,
+        "target_type": "FITTING_JOB",
+        "type": "FITTING_FAIL",
+        "member_id": 3
+      }
+    ],
+    "member": {
+      "id": 3,
+      "fitting_request_count": 1
+    }
+  },
+  "ai": {
+    "fitting_job_id": 3,
+    "request_fingerprint": "v1:e274e83793395e0594ef2210e9d1484afc5de48c80b57b38d20baa0ff1992a2a",
+    "user_image_key": "users/10/body.png",
+    "products": [
+      "800067049776"
+    ],
+    "task_uuid": null,
+    "async_image_key": null,
+    "result_image_key": null,
+    "status": "FAILED",
+    "requested_at": "2026-10-18 12:24:22.461306+00:00",
+    "created_at": "2026-10-18 12:24:22.478561+00:00",
+    "updated_at": "2026-10-18 12:24:22.723029+00:00",
+    "pruna_submit_started_at": null,
+    "runware_accepted_at": null,
+    "next_action": null,
+    "verified_image_key": null,
+    "image_verified_at": null,
+    "result_payload": {
+      "status": "FAILED",
+      "error_code": "PRODUCT_NOT_FOUND",
+      "error_message": "요청한 상품을 찾을 수 없습니다.",
+      "fitting_job_id": 3
+    },
+    "result_message_status": "PUBLISHED",
+    "result_message_attempt_count": 1,
+    "llm_generation_attempt_count": 0,
+    "fallback_attempt_count": 0,
+    "s3_check_attempt_count": 0,
+    "worker_lease_token": null,
+    "worker_lease_until": null,
+    "fallback_task_uuid": null,
+    "fallback_started_at": null,
+    "fallback_image_key": null,
+    "auth_hold_task_uuid": null,
+    "auth_hold_reason": null,
+    "auth_hold_at": null
+  },
+  "queue_live": {
+    "be-fitting-request": 1,
+    "ai-fitting-response": 0,
+    "be-fitting-response": 0
+  }
+}

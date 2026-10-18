@@ -1,0 +1,12 @@
+[
+  {
+    "check": "BE_FITTING_REQUEST: actual target account/region matches STS",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "BE_FITTING_REQUEST: no preexisting queued/inflight/delayed messages",
+    "passed": false,
+    "evidence": null
+  }
+]

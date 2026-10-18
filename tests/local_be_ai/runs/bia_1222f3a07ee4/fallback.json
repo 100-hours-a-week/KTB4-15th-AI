@@ -1,0 +1,122 @@
+{
+  "be": {
+    "query": {
+      "fittingJobId": 4,
+      "status": "COMPLETED",
+      "result": {
+        "resultImageUrl": "http://127.0.0.1:18761/objects/virtual-fitting/results/4/pruna-sync.jpg",
+        "outfitName": "편안한 데일리 캐주얼",
+        "comment": "네이비 티셔츠와 중청 데님이 어우러진 캐주얼한 코디입니다.\n편안한 데일리룩으로 잘 어울립니다.",
+        "products": [
+          {
+            "productId": 2,
+            "itemType": "TOP",
+            "productName": "테스트 상의",
+            "productImageUrl": "http://127.0.0.1:18761/product.jpg",
+            "purchaseUrl": "http://127.0.0.1:18761/product"
+          }
+        ]
+      }
+    },
+    "job": {
+      "id": 4,
+      "created_at": "2026-10-18T12:24:22.772945",
+      "updated_at": "2026-10-18T12:24:22.855717",
+      "failure_code": null,
+      "failure_message": null,
+      "result_viewed_at": null,
+      "status": "COMPLETED",
+      "member_id": 4
+    },
+    "outbox": {
+      "id": 4,
+      "created_at": "2026-10-18T12:24:22.774977",
+      "updated_at": "2026-10-18T12:24:22.788956",
+      "aggregate_id": 4,
+      "claimed_by": null,
+      "event_type": "FITTING_REQUEST",
+      "last_error": null,
+      "lease_until": null,
+      "next_retry_at": "2026-10-18T12:24:22.774869",
+      "payload": "{\"fitting_job_id\":4,\"requested_at\":\"2026-10-18T12:24:22.772770Z\",\"user_image_key\":\"users/10/body.png\",\"products\":[{\"product_code\":\"800067049775\"}]}",
+      "published_at": "2026-10-18T12:24:22.788831",
+      "retry_count": 0,
+      "status": "PUBLISHED"
+    },
+    "results": [
+      {
+        "id": 2,
+        "created_at": "2026-10-18T12:24:22.853154",
+        "updated_at": "2026-10-18T12:24:22.853154",
+        "ai_comment": "네이비 티셔츠와 중청 데님이 어우러진 캐주얼한 코디입니다.\n편안한 데일리룩으로 잘 어울립니다.",
+        "expires_at": "2026-10-25T12:24:22.853024",
+        "outfit_name": "편안한 데일리 캐주얼",
+        "result_image_key": "virtual-fitting/results/4/pruna-sync.jpg",
+        "fitting_job_id": 4
+      }
+    ],
+    "notifications": [
+      {
+        "id": 3,
+        "created_at": "2026-10-18T12:24:22.854374",
+        "updated_at": "2026-10-18T12:24:22.854374",
+        "expires_at": "2026-10-25T12:24:22.854292",
+        "is_read": false,
+        "payload": "{\"outfitName\": \"편안한 데일리 캐주얼\"}",
+        "target_id": 4,
+        "target_type": "FITTING_JOB",
+        "type": "FITTING_SUCCESS",
+        "member_id": 4
+      }
+    ],
+    "member": {
+      "id": 4,
+      "fitting_request_count": 1
+    }
+  },
+  "ai": {
+    "fitting_job_id": 4,
+    "request_fingerprint": "v1:9af1306345a00dc6e0709cb7d9c50353be3882e282ea6bb5c5048a38dcdcb205",
+    "user_image_key": "users/10/body.png",
+    "products": [
+      "800067049775"
+    ],
+    "task_uuid": "f43e8910-5d85-4f4e-8081-e6bbc674121b",
+    "async_image_key": "virtual-fitting/results/4/pruna-async.jpg",
+    "result_image_key": "virtual-fitting/results/4/pruna-sync.jpg",
+    "status": "COMPLETED",
+    "requested_at": "2026-10-18 12:24:22.772770+00:00",
+    "created_at": "2026-10-18 12:24:22.794249+00:00",
+    "updated_at": "2026-10-18 12:24:22.847290+00:00",
+    "pruna_submit_started_at": "2026-10-18 12:24:22.802753+00:00",
+    "runware_accepted_at": "2026-10-18 12:24:22.810770+00:00",
+    "next_action": null,
+    "verified_image_key": null,
+    "image_verified_at": null,
+    "result_payload": {
+      "status": "COMPLETED",
+      "llm_title": "편안한 데일리 캐주얼",
+      "llm_comment": "네이비 티셔츠와 중청 데님이 어우러진 캐주얼한 코디입니다.\n편안한 데일리룩으로 잘 어울립니다.",
+      "fitting_job_id": 4,
+      "result_image_key": "virtual-fitting/results/4/pruna-sync.jpg"
+    },
+    "result_message_status": "PUBLISHED",
+    "result_message_attempt_count": 1,
+    "llm_generation_attempt_count": 1,
+    "fallback_attempt_count": 1,
+    "s3_check_attempt_count": 0,
+    "worker_lease_token": null,
+    "worker_lease_until": null,
+    "fallback_task_uuid": "476e1c4e-67bf-4f8b-bb76-6581ca7fc1f8",
+    "fallback_started_at": "2026-10-18 12:24:22.827316+00:00",
+    "fallback_image_key": "virtual-fitting/results/4/pruna-sync.jpg",
+    "auth_hold_task_uuid": null,
+    "auth_hold_reason": null,
+    "auth_hold_at": null
+  },
+  "queue_live": {
+    "be-fitting-request": 1,
+    "ai-fitting-response": 0,
+    "be-fitting-response": 0
+  }
+}

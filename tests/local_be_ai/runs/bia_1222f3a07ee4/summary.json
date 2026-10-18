@@ -1,0 +1,14 @@
+{
+  "status": "passed",
+  "run": "bia_1222f3a07ee4",
+  "job_ids": [
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "checks": 48,
+  "passed": 48,
+  "resources_retained": true
+}

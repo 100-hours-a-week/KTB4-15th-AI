@@ -1,0 +1,26 @@
+[
+  {
+    "role": "BE_FITTING_REQUEST",
+    "counts": {
+      "ApproximateNumberOfMessages": 0,
+      "ApproximateNumberOfMessagesNotVisible": 1,
+      "ApproximateNumberOfMessagesDelayed": 0
+    }
+  },
+  {
+    "role": "AI_FITTING_RESPONSE",
+    "counts": {
+      "ApproximateNumberOfMessages": 0,
+      "ApproximateNumberOfMessagesNotVisible": 0,
+      "ApproximateNumberOfMessagesDelayed": 0
+    }
+  },
+  {
+    "role": "BE_FITTING_RESPONSE",
+    "counts": {
+      "ApproximateNumberOfMessages": 0,
+      "ApproximateNumberOfMessagesNotVisible": 0,
+      "ApproximateNumberOfMessagesDelayed": 0
+    }
+  }
+]

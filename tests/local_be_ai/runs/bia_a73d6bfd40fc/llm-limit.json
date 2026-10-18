@@ -1,0 +1,122 @@
+{
+  "be": {
+    "query": {
+      "fittingJobId": 18,
+      "status": "COMPLETED",
+      "result": {
+        "resultImageUrl": "http://127.0.0.1:18761/objects/virtual-fitting/results/18/pruna-async.jpg",
+        "outfitName": "가상 피팅 결과",
+        "comment": "선택하신 상품으로 완성한 가상 피팅 결과입니다.",
+        "products": [
+          {
+            "productId": 6,
+            "itemType": "TOP",
+            "productName": "테스트 상의",
+            "productImageUrl": "http://127.0.0.1:18761/product.jpg",
+            "purchaseUrl": "http://127.0.0.1:18761/product"
+          }
+        ]
+      }
+    },
+    "job": {
+      "id": 18,
+      "created_at": "2026-10-18T12:28:53.180349",
+      "updated_at": "2026-10-18T12:28:53.265792",
+      "failure_code": null,
+      "failure_message": null,
+      "result_viewed_at": null,
+      "status": "COMPLETED",
+      "member_id": 18
+    },
+    "outbox": {
+      "id": 18,
+      "created_at": "2026-10-18T12:28:53.18248",
+      "updated_at": "2026-10-18T12:28:53.198636",
+      "aggregate_id": 18,
+      "claimed_by": null,
+      "event_type": "FITTING_REQUEST",
+      "last_error": null,
+      "lease_until": null,
+      "next_retry_at": "2026-10-18T12:28:53.182375",
+      "payload": "{\"fitting_job_id\":18,\"requested_at\":\"2026-10-18T12:28:53.180241Z\",\"user_image_key\":\"users/10/body.png\",\"products\":[{\"product_code\":\"800016499632\"}]}",
+      "published_at": "2026-10-18T12:28:53.198541",
+      "retry_count": 0,
+      "status": "PUBLISHED"
+    },
+    "results": [
+      {
+        "id": 12,
+        "created_at": "2026-10-18T12:28:53.263608",
+        "updated_at": "2026-10-18T12:28:53.263608",
+        "ai_comment": "선택하신 상품으로 완성한 가상 피팅 결과입니다.",
+        "expires_at": "2026-10-25T12:28:53.263472",
+        "outfit_name": "가상 피팅 결과",
+        "result_image_key": "virtual-fitting/results/18/pruna-async.jpg",
+        "fitting_job_id": 18
+      }
+    ],
+    "notifications": [
+      {
+        "id": 15,
+        "created_at": "2026-10-18T12:28:53.264691",
+        "updated_at": "2026-10-18T12:28:53.264691",
+        "expires_at": "2026-10-25T12:28:53.264613",
+        "is_read": false,
+        "payload": "{\"outfitName\": \"가상 피팅 결과\"}",
+        "target_id": 18,
+        "target_type": "FITTING_JOB",
+        "type": "FITTING_SUCCESS",
+        "member_id": 18
+      }
+    ],
+    "member": {
+      "id": 18,
+      "fitting_request_count": 1
+    }
+  },
+  "ai": {
+    "fitting_job_id": 18,
+    "request_fingerprint": "v1:15441d62dfacbb9b940e57c499213698fd672a92d4bc6e3778adcdbcada8a4f5",
+    "user_image_key": "users/10/body.png",
+    "products": [
+      "800016499632"
+    ],
+    "task_uuid": "eb2b9a9c-c8be-4e0d-aa3c-74dc8d2b13d2",
+    "async_image_key": "virtual-fitting/results/18/pruna-async.jpg",
+    "result_image_key": "virtual-fitting/results/18/pruna-async.jpg",
+    "status": "COMPLETED",
+    "requested_at": "2026-10-18 12:28:53.180241+00:00",
+    "created_at": "2026-10-18 12:28:53.201766+00:00",
+    "updated_at": "2026-10-18 12:28:53.256010+00:00",
+    "pruna_submit_started_at": "2026-10-18 12:28:53.211558+00:00",
+    "runware_accepted_at": "2026-10-18 12:28:53.217851+00:00",
+    "next_action": null,
+    "verified_image_key": "virtual-fitting/results/18/pruna-async.jpg",
+    "image_verified_at": "2026-10-18 12:28:53.236732+00:00",
+    "result_payload": {
+      "status": "COMPLETED",
+      "llm_title": "가상 피팅 결과",
+      "llm_comment": "선택하신 상품으로 완성한 가상 피팅 결과입니다.",
+      "fitting_job_id": 18,
+      "result_image_key": "virtual-fitting/results/18/pruna-async.jpg"
+    },
+    "result_message_status": "PUBLISHED",
+    "result_message_attempt_count": 1,
+    "llm_generation_attempt_count": 3,
+    "fallback_attempt_count": 0,
+    "s3_check_attempt_count": 1,
+    "worker_lease_token": null,
+    "worker_lease_until": null,
+    "fallback_task_uuid": null,
+    "fallback_started_at": null,
+    "fallback_image_key": null,
+    "auth_hold_task_uuid": null,
+    "auth_hold_reason": null,
+    "auth_hold_at": null
+  },
+  "queue_live": {
+    "be-fitting-request": 1,
+    "ai-fitting-response": 0,
+    "be-fitting-response": 0
+  }
+}

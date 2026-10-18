@@ -1,0 +1,990 @@
+[
+  {
+    "check": "OS sandbox blocks nonlocal network",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "BE real Spring context connected to local MySQL",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "Java child OS sandbox blocks nonlocal network",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "success: real BE transaction saved PENDING job + outbox",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "7: BE outbox delivered exact payload to shared queue",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "7: requested_at, fitting_job_id, product codes preserved",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "success: AI WAITING_PRUNA while BE remains PENDING",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "duplicate request during generation: only one paid async submit",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "success: mock stores image and delivers actual webhook",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "generated image -> comment -> title using exact comment",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "BE actual MySQL INSERT failure rolls back and retains queue message",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "success: BE status query + durable result + single notification",
+    "passed": true,
+    "evidence": {
+      "be": {
+        "query": {
+          "fittingJobId": 7,
+          "status": "COMPLETED",
+          "result": {
+            "resultImageUrl": "http://127.0.0.1:18761/objects/virtual-fitting/results/7/pruna-async.jpg",
+            "outfitName": "편안한 데일리 캐주얼",
+            "comment": "네이비 티셔츠와 중청 데님이 어우러진 캐주얼한 코디입니다.\n편안한 데일리룩으로 잘 어울립니다.",
+            "products": [
+              {
+                "productId": 4,
+                "itemType": "TOP",
+                "productName": "테스트 상의",
+                "productImageUrl": "http://127.0.0.1:18761/product.jpg",
+                "purchaseUrl": "http://127.0.0.1:18761/product"
+              }
+            ]
+          }
+        },
+        "job": {
+          "id": 7,
+          "created_at": "2026-10-18T12:26:20.530992",
+          "updated_at": "2026-10-18T12:26:23.055873",
+          "failure_code": null,
+          "failure_message": null,
+          "result_viewed_at": null,
+          "status": "COMPLETED",
+          "member_id": 7
+        },
+        "outbox": {
+          "id": 7,
+          "created_at": "2026-10-18T12:26:20.543876",
+          "updated_at": "2026-10-18T12:26:20.609031",
+          "aggregate_id": 7,
+          "claimed_by": null,
+          "event_type": "FITTING_REQUEST",
+          "last_error": null,
+          "lease_until": null,
+          "next_retry_at": "2026-10-18T12:26:20.543618",
+          "payload": "{\"fitting_job_id\":7,\"requested_at\":\"2026-10-18T12:26:20.530722Z\",\"user_image_key\":\"users/10/body.png\",\"products\":[{\"product_code\":\"800084004639\"}]}",
+          "published_at": "2026-10-18T12:26:20.608923",
+          "retry_count": 0,
+          "status": "PUBLISHED"
+        },
+        "results": [
+          {
+            "id": 4,
+            "created_at": "2026-10-18T12:26:23.020314",
+            "updated_at": "2026-10-18T12:26:23.020314",
+            "ai_comment": "네이비 티셔츠와 중청 데님이 어우러진 캐주얼한 코디입니다.\n편안한 데일리룩으로 잘 어울립니다.",
+            "expires_at": "2026-10-25T12:26:23.019823",
+            "outfit_name": "편안한 데일리 캐주얼",
+            "result_image_key": "virtual-fitting/results/7/pruna-async.jpg",
+            "fitting_job_id": 7
+          }
+        ],
+        "notifications": [
+          {
+            "id": 5,
+            "created_at": "2026-10-18T12:26:23.026657",
+            "updated_at": "2026-10-18T12:26:23.026657",
+            "expires_at": "2026-10-25T12:26:23.025923",
+            "is_read": false,
+            "payload": "{\"outfitName\": \"편안한 데일리 캐주얼\"}",
+            "target_id": 7,
+            "target_type": "FITTING_JOB",
+            "type": "FITTING_SUCCESS",
+            "member_id": 7
+          }
+        ],
+        "member": {
+          "id": 7,
+          "fitting_request_count": 1
+        }
+      },
+      "ai": {
+        "fitting_job_id": 7,
+        "request_fingerprint": "v1:1b540ea57655129dd1c4412007f290f2bb2bfc6e84c7667a5cabafab0cdd4e95",
+        "user_image_key": "users/10/body.png",
+        "products": [
+          "800084004639"
+        ],
+        "task_uuid": "56f4adb0-72ed-4060-b658-daebaaf5c536",
+        "async_image_key": "virtual-fitting/results/7/pruna-async.jpg",
+        "result_image_key": "virtual-fitting/results/7/pruna-async.jpg",
+        "status": "COMPLETED",
+        "requested_at": "2026-10-18 12:26:20.530722+00:00",
+        "created_at": "2026-10-18 12:26:20.613275+00:00",
+        "updated_at": "2026-10-18 12:26:20.693994+00:00",
+        "pruna_submit_started_at": "2026-10-18 12:26:20.627400+00:00",
+        "runware_accepted_at": "2026-10-18 12:26:20.632621+00:00",
+        "next_action": null,
+        "verified_image_key": "virtual-fitting/results/7/pruna-async.jpg",
+        "image_verified_at": "2026-10-18 12:26:20.681573+00:00",
+        "result_payload": {
+          "status": "COMPLETED",
+          "llm_title": "편안한 데일리 캐주얼",
+          "llm_comment": "네이비 티셔츠와 중청 데님이 어우러진 캐주얼한 코디입니다.\n편안한 데일리룩으로 잘 어울립니다.",
+          "fitting_job_id": 7,
+          "result_image_key": "virtual-fitting/results/7/pruna-async.jpg"
+        },
+        "result_message_status": "PUBLISHED",
+        "result_message_attempt_count": 1,
+        "llm_generation_attempt_count": 1,
+        "fallback_attempt_count": 0,
+        "s3_check_attempt_count": 1,
+        "worker_lease_token": null,
+        "worker_lease_until": null,
+        "fallback_task_uuid": null,
+        "fallback_started_at": null,
+        "fallback_image_key": null,
+        "auth_hold_task_uuid": null,
+        "auth_hold_reason": null,
+        "auth_hold_at": null
+      },
+      "queue_live": {
+        "be-fitting-request": 0,
+        "ai-fitting-response": 0,
+        "be-fitting-response": 0
+      }
+    }
+  },
+  {
+    "check": "success: BE request counter increments once",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "success: result contract matches",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "BE recovers on actual redelivery",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "duplicate request/result/internal messages preserve AI counters and records",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "duplicate results preserve one BE result + notification + member counter",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "business-failure: real BE transaction saved PENDING job + outbox",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "8: BE outbox delivered exact payload to shared queue",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "8: requested_at, fitting_job_id, product codes preserved",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "business-failure: BE status query + durable result + single notification",
+    "passed": true,
+    "evidence": {
+      "be": {
+        "query": {
+          "fittingJobId": 8,
+          "status": "FAILED",
+          "result": null
+        },
+        "job": {
+          "id": 8,
+          "created_at": "2026-10-18T12:26:23.137978",
+          "updated_at": "2026-10-18T12:26:23.491379",
+          "failure_code": "PRODUCT_NOT_FOUND",
+          "failure_message": "요청한 상품을 찾을 수 없습니다.",
+          "result_viewed_at": null,
+          "status": "FAILED",
+          "member_id": 8
+        },
+        "outbox": {
+          "id": 8,
+          "created_at": "2026-10-18T12:26:23.139529",
+          "updated_at": "2026-10-18T12:26:23.150979",
+          "aggregate_id": 8,
+          "claimed_by": null,
+          "event_type": "FITTING_REQUEST",
+          "last_error": null,
+          "lease_until": null,
+          "next_retry_at": "2026-10-18T12:26:23.139465",
+          "payload": "{\"fitting_job_id\":8,\"requested_at\":\"2026-10-18T12:26:23.137867Z\",\"user_image_key\":\"users/10/body.png\",\"products\":[{\"product_code\":\"800084004640\"}]}",
+          "published_at": "2026-10-18T12:26:23.1509",
+          "retry_count": 0,
+          "status": "PUBLISHED"
+        },
+        "results": [],
+        "notifications": [
+          {
+            "id": 6,
+            "created_at": "2026-10-18T12:26:23.489065",
+            "updated_at": "2026-10-18T12:26:23.489065",
+            "expires_at": "2026-10-25T12:26:23.488791",
+            "is_read": false,
+            "payload": "{}",
+            "target_id": 8,
+            "target_type": "FITTING_JOB",
+            "type": "FITTING_FAIL",
+            "member_id": 8
+          }
+        ],
+        "member": {
+          "id": 8,
+          "fitting_request_count": 1
+        }
+      },
+      "ai": {
+        "fitting_job_id": 8,
+        "request_fingerprint": "v1:83ddaa7d534707a361687a7aa00598a6202210a6c79f770844ac5e9d313ddf72",
+        "user_image_key": "users/10/body.png",
+        "products": [
+          "800084004640"
+        ],
+        "task_uuid": null,
+        "async_image_key": null,
+        "result_image_key": null,
+        "status": "FAILED",
+        "requested_at": "2026-10-18 12:26:23.137867+00:00",
+        "created_at": "2026-10-18 12:26:23.153365+00:00",
+        "updated_at": "2026-10-18 12:26:23.470707+00:00",
+        "pruna_submit_started_at": null,
+        "runware_accepted_at": null,
+        "next_action": null,
+        "verified_image_key": null,
+        "image_verified_at": null,
+        "result_payload": {
+          "status": "FAILED",
+          "error_code": "PRODUCT_NOT_FOUND",
+          "error_message": "요청한 상품을 찾을 수 없습니다.",
+          "fitting_job_id": 8
+        },
+        "result_message_status": "PUBLISHED",
+        "result_message_attempt_count": 1,
+        "llm_generation_attempt_count": 0,
+        "fallback_attempt_count": 0,
+        "s3_check_attempt_count": 0,
+        "worker_lease_token": null,
+        "worker_lease_until": null,
+        "fallback_task_uuid": null,
+        "fallback_started_at": null,
+        "fallback_image_key": null,
+        "auth_hold_task_uuid": null,
+        "auth_hold_reason": null,
+        "auth_hold_at": null
+      },
+      "queue_live": {
+        "be-fitting-request": 1,
+        "ai-fitting-response": 0,
+        "be-fitting-response": 0
+      }
+    }
+  },
+  {
+    "check": "business-failure: BE request counter increments once",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "business-failure: result contract matches",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "business failure error code is PRODUCT_NOT_FOUND",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "fallback: real BE transaction saved PENDING job + outbox",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "9: BE outbox delivered exact payload to shared queue",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "9: requested_at, fitting_job_id, product codes preserved",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "fallback: BE status query + durable result + single notification",
+    "passed": true,
+    "evidence": {
+      "be": {
+        "query": {
+          "fittingJobId": 9,
+          "status": "COMPLETED",
+          "result": {
+            "resultImageUrl": "http://127.0.0.1:18761/objects/virtual-fitting/results/9/pruna-sync.jpg",
+            "outfitName": "편안한 데일리 캐주얼",
+            "comment": "네이비 티셔츠와 중청 데님이 어우러진 캐주얼한 코디입니다.\n편안한 데일리룩으로 잘 어울립니다.",
+            "products": [
+              {
+                "productId": 4,
+                "itemType": "TOP",
+                "productName": "테스트 상의",
+                "productImageUrl": "http://127.0.0.1:18761/product.jpg",
+                "purchaseUrl": "http://127.0.0.1:18761/product"
+              }
+            ]
+          }
+        },
+        "job": {
+          "id": 9,
+          "created_at": "2026-10-18T12:26:23.527763",
+          "updated_at": "2026-10-18T12:26:23.608937",
+          "failure_code": null,
+          "failure_message": null,
+          "result_viewed_at": null,
+          "status": "COMPLETED",
+          "member_id": 9
+        },
+        "outbox": {
+          "id": 9,
+          "created_at": "2026-10-18T12:26:23.529957",
+          "updated_at": "2026-10-18T12:26:23.543959",
+          "aggregate_id": 9,
+          "claimed_by": null,
+          "event_type": "FITTING_REQUEST",
+          "last_error": null,
+          "lease_until": null,
+          "next_retry_at": "2026-10-18T12:26:23.529864",
+          "payload": "{\"fitting_job_id\":9,\"requested_at\":\"2026-10-18T12:26:23.527634Z\",\"user_image_key\":\"users/10/body.png\",\"products\":[{\"product_code\":\"800084004639\"}]}",
+          "published_at": "2026-10-18T12:26:23.543863",
+          "retry_count": 0,
+          "status": "PUBLISHED"
+        },
+        "results": [
+          {
+            "id": 5,
+            "created_at": "2026-10-18T12:26:23.606578",
+            "updated_at": "2026-10-18T12:26:23.606578",
+            "ai_comment": "네이비 티셔츠와 중청 데님이 어우러진 캐주얼한 코디입니다.\n편안한 데일리룩으로 잘 어울립니다.",
+            "expires_at": "2026-10-25T12:26:23.606443",
+            "outfit_name": "편안한 데일리 캐주얼",
+            "result_image_key": "virtual-fitting/results/9/pruna-sync.jpg",
+            "fitting_job_id": 9
+          }
+        ],
+        "notifications": [
+          {
+            "id": 7,
+            "created_at": "2026-10-18T12:26:23.607865",
+            "updated_at": "2026-10-18T12:26:23.607865",
+            "expires_at": "2026-10-25T12:26:23.607789",
+            "is_read": false,
+            "payload": "{\"outfitName\": \"편안한 데일리 캐주얼\"}",
+            "target_id": 9,
+            "target_type": "FITTING_JOB",
+            "type": "FITTING_SUCCESS",
+            "member_id": 9
+          }
+        ],
+        "member": {
+          "id": 9,
+          "fitting_request_count": 1
+        }
+      },
+      "ai": {
+        "fitting_job_id": 9,
+        "request_fingerprint": "v1:1b540ea57655129dd1c4412007f290f2bb2bfc6e84c7667a5cabafab0cdd4e95",
+        "user_image_key": "users/10/body.png",
+        "products": [
+          "800084004639"
+        ],
+        "task_uuid": "a68d8952-6e10-43f4-896a-970e297ff5dc",
+        "async_image_key": "virtual-fitting/results/9/pruna-async.jpg",
+        "result_image_key": "virtual-fitting/results/9/pruna-sync.jpg",
+        "status": "COMPLETED",
+        "requested_at": "2026-10-18 12:26:23.527634+00:00",
+        "created_at": "2026-10-18 12:26:23.547608+00:00",
+        "updated_at": "2026-10-18 12:26:23.600259+00:00",
+        "pruna_submit_started_at": "2026-10-18 12:26:23.554601+00:00",
+        "runware_accepted_at": "2026-10-18 12:26:23.565256+00:00",
+        "next_action": null,
+        "verified_image_key": null,
+        "image_verified_at": null,
+        "result_payload": {
+          "status": "COMPLETED",
+          "llm_title": "편안한 데일리 캐주얼",
+          "llm_comment": "네이비 티셔츠와 중청 데님이 어우러진 캐주얼한 코디입니다.\n편안한 데일리룩으로 잘 어울립니다.",
+          "fitting_job_id": 9,
+          "result_image_key": "virtual-fitting/results/9/pruna-sync.jpg"
+        },
+        "result_message_status": "PUBLISHED",
+        "result_message_attempt_count": 1,
+        "llm_generation_attempt_count": 1,
+        "fallback_attempt_count": 1,
+        "s3_check_attempt_count": 0,
+        "worker_lease_token": null,
+        "worker_lease_until": null,
+        "fallback_task_uuid": "27ec2f2f-945a-40c1-9c41-4e5b9437d421",
+        "fallback_started_at": "2026-10-18 12:26:23.577907+00:00",
+        "fallback_image_key": "virtual-fitting/results/9/pruna-sync.jpg",
+        "auth_hold_task_uuid": null,
+        "auth_hold_reason": null,
+        "auth_hold_at": null
+      },
+      "queue_live": {
+        "be-fitting-request": 1,
+        "ai-fitting-response": 0,
+        "be-fitting-response": 0
+      }
+    }
+  },
+  {
+    "check": "fallback: BE request counter increments once",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "fallback: result contract matches",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "confirmed fallback generated once and BE stores fallback key",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "fallback duplicate preserves generation count, task IDs and prior counters",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "queue-retries: real BE transaction saved PENDING job + outbox",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "BE outbox publish failure retains event + retry counter",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "10: BE outbox delivered exact payload to shared queue",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "10: requested_at, fitting_job_id, product codes preserved",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "internal queue ambiguous publish reports retryable 503",
+    "passed": true,
+    "evidence": {
+      "code": "WEBHOOK_FOLLOW_UP_FAILED",
+      "data": null,
+      "message": "알림의 후속 작업을 등록하지 못했습니다."
+    }
+  },
+  {
+    "check": "webhook redelivery recovers internal publish",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "duplicate internal messages after publish timeout run LLM once",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "result publish failure preserves saved result + PENDING + attempt 1",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "queue-retries: BE status query + durable result + single notification",
+    "passed": true,
+    "evidence": {
+      "be": {
+        "query": {
+          "fittingJobId": 10,
+          "status": "COMPLETED",
+          "result": {
+            "resultImageUrl": "http://127.0.0.1:18761/objects/virtual-fitting/results/10/pruna-async.jpg",
+            "outfitName": "편안한 데일리 캐주얼",
+            "comment": "네이비 티셔츠와 중청 데님이 어우러진 캐주얼한 코디입니다.\n편안한 데일리룩으로 잘 어울립니다.",
+            "products": [
+              {
+                "productId": 4,
+                "itemType": "TOP",
+                "productName": "테스트 상의",
+                "productImageUrl": "http://127.0.0.1:18761/product.jpg",
+                "purchaseUrl": "http://127.0.0.1:18761/product"
+              }
+            ]
+          }
+        },
+        "job": {
+          "id": 10,
+          "created_at": "2026-10-18T12:26:23.889623",
+          "updated_at": "2026-10-18T12:26:31.592374",
+          "failure_code": null,
+          "failure_message": null,
+          "result_viewed_at": null,
+          "status": "COMPLETED",
+          "member_id": 10
+        },
+        "outbox": {
+          "id": 10,
+          "created_at": "2026-10-18T12:26:23.892212",
+          "updated_at": "2026-10-18T12:26:26.193029",
+          "aggregate_id": 10,
+          "claimed_by": null,
+          "event_type": "FITTING_REQUEST",
+          "last_error": null,
+          "lease_until": null,
+          "next_retry_at": "2026-10-18T12:26:24.909226",
+          "payload": "{\"fitting_job_id\":10,\"requested_at\":\"2026-10-18T12:26:23.889445Z\",\"user_image_key\":\"users/10/body.png\",\"products\":[{\"product_code\":\"800084004639\"}]}",
+          "published_at": "2026-10-18T12:26:26.192296",
+          "retry_count": 1,
+          "status": "PUBLISHED"
+        },
+        "results": [
+          {
+            "id": 6,
+            "created_at": "2026-10-18T12:26:31.583863",
+            "updated_at": "2026-10-18T12:26:31.583863",
+            "ai_comment": "네이비 티셔츠와 중청 데님이 어우러진 캐주얼한 코디입니다.\n편안한 데일리룩으로 잘 어울립니다.",
+            "expires_at": "2026-10-25T12:26:31.582864",
+            "outfit_name": "편안한 데일리 캐주얼",
+            "result_image_key": "virtual-fitting/results/10/pruna-async.jpg",
+            "fitting_job_id": 10
+          }
+        ],
+        "notifications": [
+          {
+            "id": 8,
+            "created_at": "2026-10-18T12:26:31.58842",
+            "updated_at": "2026-10-18T12:26:31.58842",
+            "expires_at": "2026-10-25T12:26:31.588179",
+            "is_read": false,
+            "payload": "{\"outfitName\": \"편안한 데일리 캐주얼\"}",
+            "target_id": 10,
+            "target_type": "FITTING_JOB",
+            "type": "FITTING_SUCCESS",
+            "member_id": 10
+          }
+        ],
+        "member": {
+          "id": 10,
+          "fitting_request_count": 1
+        }
+      },
+      "ai": {
+        "fitting_job_id": 10,
+        "request_fingerprint": "v1:1b540ea57655129dd1c4412007f290f2bb2bfc6e84c7667a5cabafab0cdd4e95",
+        "user_image_key": "users/10/body.png",
+        "products": [
+          "800084004639"
+        ],
+        "task_uuid": "47a10a4c-f2ca-44c6-9860-0c2a40fd285d",
+        "async_image_key": "virtual-fitting/results/10/pruna-async.jpg",
+        "result_image_key": "virtual-fitting/results/10/pruna-async.jpg",
+        "status": "COMPLETED",
+        "requested_at": "2026-10-18 12:26:23.889445+00:00",
+        "created_at": "2026-10-18 12:26:26.205921+00:00",
+        "updated_at": "2026-10-18 12:26:31.542020+00:00",
+        "pruna_submit_started_at": "2026-10-18 12:26:26.225122+00:00",
+        "runware_accepted_at": "2026-10-18 12:26:26.232597+00:00",
+        "next_action": null,
+        "verified_image_key": "virtual-fitting/results/10/pruna-async.jpg",
+        "image_verified_at": "2026-10-18 12:26:26.271688+00:00",
+        "result_payload": {
+          "status": "COMPLETED",
+          "llm_title": "편안한 데일리 캐주얼",
+          "llm_comment": "네이비 티셔츠와 중청 데님이 어우러진 캐주얼한 코디입니다.\n편안한 데일리룩으로 잘 어울립니다.",
+          "fitting_job_id": 10,
+          "result_image_key": "virtual-fitting/results/10/pruna-async.jpg"
+        },
+        "result_message_status": "PUBLISHED",
+        "result_message_attempt_count": 2,
+        "llm_generation_attempt_count": 1,
+        "fallback_attempt_count": 0,
+        "s3_check_attempt_count": 1,
+        "worker_lease_token": null,
+        "worker_lease_until": null,
+        "fallback_task_uuid": null,
+        "fallback_started_at": null,
+        "fallback_image_key": null,
+        "auth_hold_task_uuid": null,
+        "auth_hold_reason": null,
+        "auth_hold_at": null
+      },
+      "queue_live": {
+        "be-fitting-request": 1,
+        "ai-fitting-response": 0,
+        "be-fitting-response": 0
+      }
+    }
+  },
+  {
+    "check": "queue-retries: BE request counter increments once",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "queue-retries: result contract matches",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "result publish retry uses same payload and increments existing counter",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "llm-limit: real BE transaction saved PENDING job + outbox",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "11: BE outbox delivered exact payload to shared queue",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "11: requested_at, fitting_job_id, product codes preserved",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "LLM limit webhook accepted",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "llm-limit: BE status query + durable result + single notification",
+    "passed": true,
+    "evidence": {
+      "be": {
+        "query": {
+          "fittingJobId": 11,
+          "status": "COMPLETED",
+          "result": {
+            "resultImageUrl": "http://127.0.0.1:18761/objects/virtual-fitting/results/11/pruna-async.jpg",
+            "outfitName": "가상 피팅 결과",
+            "comment": "선택하신 상품으로 완성한 가상 피팅 결과입니다.",
+            "products": [
+              {
+                "productId": 4,
+                "itemType": "TOP",
+                "productName": "테스트 상의",
+                "productImageUrl": "http://127.0.0.1:18761/product.jpg",
+                "purchaseUrl": "http://127.0.0.1:18761/product"
+              }
+            ]
+          }
+        },
+        "job": {
+          "id": 11,
+          "created_at": "2026-10-18T12:26:31.662888",
+          "updated_at": "2026-10-18T12:26:31.748102",
+          "failure_code": null,
+          "failure_message": null,
+          "result_viewed_at": null,
+          "status": "COMPLETED",
+          "member_id": 11
+        },
+        "outbox": {
+          "id": 11,
+          "created_at": "2026-10-18T12:26:31.665152",
+          "updated_at": "2026-10-18T12:26:31.681733",
+          "aggregate_id": 11,
+          "claimed_by": null,
+          "event_type": "FITTING_REQUEST",
+          "last_error": null,
+          "lease_until": null,
+          "next_retry_at": "2026-10-18T12:26:31.665007",
+          "payload": "{\"fitting_job_id\":11,\"requested_at\":\"2026-10-18T12:26:31.662762Z\",\"user_image_key\":\"users/10/body.png\",\"products\":[{\"product_code\":\"800084004639\"}]}",
+          "published_at": "2026-10-18T12:26:31.681595",
+          "retry_count": 0,
+          "status": "PUBLISHED"
+        },
+        "results": [
+          {
+            "id": 7,
+            "created_at": "2026-10-18T12:26:31.746009",
+            "updated_at": "2026-10-18T12:26:31.746009",
+            "ai_comment": "선택하신 상품으로 완성한 가상 피팅 결과입니다.",
+            "expires_at": "2026-10-25T12:26:31.745878",
+            "outfit_name": "가상 피팅 결과",
+            "result_image_key": "virtual-fitting/results/11/pruna-async.jpg",
+            "fitting_job_id": 11
+          }
+        ],
+        "notifications": [
+          {
+            "id": 9,
+            "created_at": "2026-10-18T12:26:31.747003",
+            "updated_at": "2026-10-18T12:26:31.747003",
+            "expires_at": "2026-10-25T12:26:31.74692",
+            "is_read": false,
+            "payload": "{\"outfitName\": \"가상 피팅 결과\"}",
+            "target_id": 11,
+            "target_type": "FITTING_JOB",
+            "type": "FITTING_SUCCESS",
+            "member_id": 11
+          }
+        ],
+        "member": {
+          "id": 11,
+          "fitting_request_count": 1
+        }
+      },
+      "ai": {
+        "fitting_job_id": 11,
+        "request_fingerprint": "v1:1b540ea57655129dd1c4412007f290f2bb2bfc6e84c7667a5cabafab0cdd4e95",
+        "user_image_key": "users/10/body.png",
+        "products": [
+          "800084004639"
+        ],
+        "task_uuid": "75c5c89d-44ba-4c0b-b740-f1156c599c5b",
+        "async_image_key": "virtual-fitting/results/11/pruna-async.jpg",
+        "result_image_key": "virtual-fitting/results/11/pruna-async.jpg",
+        "status": "COMPLETED",
+        "requested_at": "2026-10-18 12:26:31.662762+00:00",
+        "created_at": "2026-10-18 12:26:31.686470+00:00",
+        "updated_at": "2026-10-18 12:26:31.739715+00:00",
+        "pruna_submit_started_at": "2026-10-18 12:26:31.694177+00:00",
+        "runware_accepted_at": "2026-10-18 12:26:31.699955+00:00",
+        "next_action": null,
+        "verified_image_key": "virtual-fitting/results/11/pruna-async.jpg",
+        "image_verified_at": "2026-10-18 12:26:31.719704+00:00",
+        "result_payload": {
+          "status": "COMPLETED",
+          "llm_title": "가상 피팅 결과",
+          "llm_comment": "선택하신 상품으로 완성한 가상 피팅 결과입니다.",
+          "fitting_job_id": 11,
+          "result_image_key": "virtual-fitting/results/11/pruna-async.jpg"
+        },
+        "result_message_status": "PUBLISHED",
+        "result_message_attempt_count": 1,
+        "llm_generation_attempt_count": 3,
+        "fallback_attempt_count": 0,
+        "s3_check_attempt_count": 1,
+        "worker_lease_token": null,
+        "worker_lease_until": null,
+        "fallback_task_uuid": null,
+        "fallback_started_at": null,
+        "fallback_image_key": null,
+        "auth_hold_task_uuid": null,
+        "auth_hold_reason": null,
+        "auth_hold_at": null
+      },
+      "queue_live": {
+        "be-fitting-request": 1,
+        "ai-fitting-response": 0,
+        "be-fitting-response": 0
+      }
+    }
+  },
+  {
+    "check": "llm-limit: BE request counter increments once",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "llm-limit: result contract matches",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "LLM ceiling is 3 pairs (6 HTTP calls), with successful image preserved",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "LLM exhausted counter survives pool/worker restart; no seventh call",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "result-limit: real BE transaction saved PENDING job + outbox",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "12: BE outbox delivered exact payload to shared queue",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "12: requested_at, fitting_job_id, product codes preserved",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "result send ceiling 3 survives reconstructed workers without counter reset",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "all jobs obey generation/LLM/result attempt ceilings",
+    "passed": true,
+    "evidence": [
+      [
+        7,
+        1,
+        1,
+        0,
+        1
+      ],
+      [
+        8,
+        0,
+        0,
+        0,
+        1
+      ],
+      [
+        9,
+        0,
+        1,
+        1,
+        1
+      ],
+      [
+        10,
+        1,
+        1,
+        0,
+        2
+      ],
+      [
+        11,
+        1,
+        3,
+        0,
+        1
+      ],
+      [
+        12,
+        0,
+        0,
+        0,
+        3
+      ]
+    ]
+  },
+  {
+    "check": "automatic-lifespan: real BE transaction saved PENDING job + outbox",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "automatic: exact BE metadata preserved",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "automatic: mock completion webhook accepted",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "automatic: Outbox scheduler -> AI lifespan workers -> BE consumer -> status query",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "automatic: exact result key/title/comment persisted in BE",
+    "passed": true,
+    "evidence": null
+  },
+  {
+    "check": "actual task-cost and usage repositories: unique tasks, exact costs, no duplicate billing",
+    "passed": true,
+    "evidence": {
+      "costs": [
+        [
+          "56f4adb0-72ed-4060-b658-daebaaf5c536",
+          7,
+          "0.023"
+        ],
+        [
+          "27ec2f2f-945a-40c1-9c41-4e5b9437d421",
+          9,
+          "0.015"
+        ],
+        [
+          "47a10a4c-f2ca-44c6-9860-0c2a40fd285d",
+          10,
+          "0.023"
+        ],
+        [
+          "75c5c89d-44ba-4c0b-b740-f1156c599c5b",
+          11,
+          "0.023"
+        ],
+        [
+          "33f8d16c-94a8-4151-bc42-cb112bcb4fad",
+          13,
+          "0.023"
+        ]
+      ],
+      "usage": [
+        [
+          "0.107",
+          "0",
+          "0.0",
+          "0.107"
+        ]
+      ]
+    }
+  },
+  {
+    "check": "existing AI public data including usage/counters unchanged",
+    "passed": true,
+    "evidence": null
+  }
+]

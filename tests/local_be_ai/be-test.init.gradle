@@ -1,0 +1,12 @@
+allprojects {
+    afterEvaluate {
+        if (plugins.hasPlugin('java')) {
+            sourceSets.test.java.srcDir(System.getenv('LOCAL_INTEGRATION_DIR') + '/java')
+            tasks.named('test') {
+                filter { includeTestsMatching 'com.ktb.lookddak.integration.LocalBeAiBridgeTest' }
+                outputs.upToDateWhen { false }
+                testLogging { events 'failed'; showStandardStreams = true }
+            }
+        }
+    }
+}
