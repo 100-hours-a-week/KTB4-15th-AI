@@ -424,11 +424,15 @@ class Watchdog:
         if hold is not None:
             # 자동 해제하지 않는다(수동 절차: virtual_fitting_pruna_limits.sql 주석).
             self._alert(f"send_hold_{hold}", "pruna_send_hold")
+        if self._should_stop():
+            return  # 종료 중에는 함께 멈추는 Worker 를 "중단"으로 알리지 않는다
         for name, worker in self._components().items():
             status = getattr(worker, "status", None)
             if worker is None or status is None:
                 continue
-            if not getattr(status, "running", False) or getattr(status, "crashed", False):
+            # Task 가 끝났거나(stopped) 비정상 종료(crashed)한 경우만. start() 직후 아직 돌기 전(running=False·stopped=False)은
+            # 멈춘 것이 아니다(16단계에서 재현한 시작 직후 오탐).
+            if getattr(status, "crashed", False) or getattr(status, "stopped", False):
                 self._alert("component_stopped", f"component_{name}")
 
     def inspect(self, job_id: int) -> CheckReport:
