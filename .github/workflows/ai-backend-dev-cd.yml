@@ -368,8 +368,9 @@ jobs:
 
           echo "image=$(jq -r '.containerDefinitions[0].image' "$TASKDEF")"
 
-      # revision 등록 → 서비스 갱신 → 안정화 대기
-      # 새 Task가 계속 실패하면 circuit breaker가 직전 revision으로 되돌린다.
+      # revision 등록 → 서비스 갱신만 한다. 안정화 대기는 끈다.
+      # 공식 액션(SDK waiter)의 대기는 wait-for-minutes보다 일찍 끝난 사례가 있어
+      # (20분 설정, 약 12분에 TIMEOUT), 대기 시간을 다음 단계에서 직접 통제한다.
       - name: ECS 배포
         id: deploy
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
@@ -377,14 +378,13 @@ jobs:
           task-definition: ${{ runner.temp }}/taskdef.json
           cluster: ${{ env.ECS_CLUSTER }}
           service: ${{ env.ECS_SERVICE }}
-          wait-for-service-stability: true
-          wait-for-minutes: 20
+          wait-for-service-stability: false
 
-      # 안정화 대기(services-stable)는 rolloutState가 아직 IN_PROGRESS일 때도 끝나고,
-      # circuit breaker가 롤백을 끝낸 경우에도 성공할 수 있다.
-      # 그래서 PRIMARY 배포가 이번 revision으로 COMPLETED가 될 때까지 따로 기다린다.
-      # - COMPLETED + 이번 revision → 성공
-      # - FAILED, PRIMARY가 다른 revision(롤백), 제한 시간 초과 → 실패
+      # 배포가 최종 상태가 될 때까지 직접 기다린다.
+      # - PRIMARY = 요청 revision, COMPLETED            → 성공
+      # - PRIMARY = 다른 revision(circuit breaker 롤백) → 롤백이 COMPLETED가 될 때까지 기다린 뒤 실패
+      # - 롤백 FAILED, 제한 시간 초과                    → 실패
+      # 조회 오류는 일시적일 수 있으므로 제한 시간 안에서는 다시 조회한다.
       - name: 배포 결과 확인
         if: ${{ always() && steps.meta.outcome == 'success' }}
         env:
@@ -394,7 +394,8 @@ jobs:
           TEMPLATE_VERSION: ${{ steps.template.outputs.version }}
           REQUESTED: ${{ steps.deploy.outputs.task-definition-arn }}
           DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
-          ROLLOUT_TIMEOUT: "600" # COMPLETED 대기 제한: 10분
+          ROLLOUT_TIMEOUT: "1800" # 최종 상태 대기 제한: 30분 (실측 롤백 약 10분)
+          POLL_INTERVAL: "15"
         run: |
           read_primary() {
             PRIMARY=$(aws ecs describe-services \
@@ -406,38 +407,53 @@ jobs:
             ROLLOUT_REASON=$(echo "$PRIMARY" | jq -r '.rolloutStateReason // ""')
           }
 
-          read_primary
+          RESULT="deploy-step-failed"
+          ACTUAL="unknown"
+          ROLLOUT="unknown"
+          ROLLOUT_REASON=""
+          REQUESTED_STATE=""
+
           if [[ "$DEPLOY_OUTCOME" == "success" && -n "$REQUESTED" ]]; then
             DEADLINE=$(( $(date +%s) + ROLLOUT_TIMEOUT ))
-            while [[ "$ACTUAL" == "$REQUESTED" && "$ROLLOUT" == "IN_PROGRESS" && "$(date +%s)" -lt "$DEADLINE" ]]; do
-              echo "$(date '+%T') rolloutState=${ROLLOUT} primary=${ACTUAL##*/}"
-              sleep 15
+            RESULT="timeout"
+            while true; do
               read_primary
+              echo "$(date '+%T') primary=${ACTUAL##*/} rolloutState=${ROLLOUT}"
+              if [[ "$ACTUAL" == "$REQUESTED" ]]; then
+                REQUESTED_STATE="${ROLLOUT} ${ROLLOUT_REASON}"
+                if [[ "$ROLLOUT" == "COMPLETED" ]]; then RESULT="success"; break; fi
+              elif [[ "$ACTUAL" != "unknown" ]]; then
+                if [[ "$ROLLOUT" == "COMPLETED" ]]; then RESULT="rolled-back"; break; fi
+                if [[ "$ROLLOUT" == "FAILED" ]]; then RESULT="rollback-failed"; break; fi
+              fi
+              if [[ "$(date +%s)" -ge "$DEADLINE" ]]; then break; fi
+              sleep "$POLL_INTERVAL"
             done
+          else
+            read_primary
           fi
 
+          case "$RESULT" in
+            success)            SUMMARY="성공" ;;
+            rolled-back)        SUMMARY="실패: circuit breaker 롤백 완료 (현재 ${ACTUAL##*/})" ;;
+            rollback-failed)    SUMMARY="실패: 롤백까지 실패. 즉시 수동 확인" ;;
+            timeout)            SUMMARY="실패: ${ROLLOUT_TIMEOUT}초 안에 최종 상태가 되지 않음" ;;
+            deploy-step-failed) SUMMARY="실패: ECS 배포 단계 실패 (outcome=${DEPLOY_OUTCOME})" ;;
+          esac
+
           {
-            echo "### AI dev V2(ECS) 배포 결과"
+            echo "### AI dev V2(ECS) 배포 결과: ${SUMMARY}"
             echo "- 이벤트: ${GITHUB_EVENT_NAME}"
             echo "- 태그: \`${TAG}\`"
             echo "- 사유: ${REASON}"
             echo "- digest: \`${DIGEST:-조회 실패}\`"
             echo "- 템플릿: \`${TEMPLATE_KEY}\` (S3 버전 \`${TEMPLATE_VERSION:-조회 실패}\`)"
-            echo "- 요청 revision: \`${REQUESTED:-등록 안 됨}\`"
-            echo "- 실제 PRIMARY revision: \`${ACTUAL}\`"
-            echo "- rolloutState: ${ROLLOUT} ${ROLLOUT_REASON}"
+            echo "- 요청 revision: \`${REQUESTED:-등록 안 됨}\` (마지막 상태: ${REQUESTED_STATE:-확인 안 됨})"
+            echo "- 현재 PRIMARY revision: \`${ACTUAL}\` (${ROLLOUT} ${ROLLOUT_REASON})"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [[ "$DEPLOY_OUTCOME" != "success" ]]; then
-            echo "::error::ECS 배포 단계 실패 (outcome=${DEPLOY_OUTCOME})"
-            exit 1
-          fi
-          if [[ -z "$REQUESTED" || "$ACTUAL" != "$REQUESTED" ]]; then
-            echo "::error::요청 revision이 실행 중이 아닙니다 (circuit breaker 롤백 가능성). 요청=${REQUESTED} 실제=${ACTUAL}"
-            exit 1
-          fi
-          if [[ "$ROLLOUT" != "COMPLETED" ]]; then
-            echo "::error::배포가 완료 상태가 아닙니다 (rolloutState=${ROLLOUT} ${ROLLOUT_REASON})"
+          if [[ "$RESULT" != "success" ]]; then
+            echo "::error::V2 배포 ${SUMMARY}"
             exit 1
           fi
           echo "V2 배포 성공: ${ACTUAL}"
