@@ -9,6 +9,7 @@ uvicorn 기본 LOGGING_CONFIG(uvicorn.config)와 같은 handler/logger 구성을
 
 import logging
 import logging.config
+import re
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -27,6 +28,24 @@ class _KstTimeMixin:
         return datetime.fromtimestamp(record.created, LOG_TIMEZONE).isoformat(
             timespec="milliseconds"
         )
+
+
+# URL query 의 비밀값(Webhook token 등). 접근 로그의 요청 줄에서 값만 가린다.
+_SECRET_QUERY = re.compile(r"([?&](?:token|webhook_token)=)[^&\s]*", re.IGNORECASE)
+
+
+def redact_query_secrets(text: str) -> str:
+    return _SECRET_QUERY.sub(r"\1<redacted>", text)
+
+
+class RedactQuerySecretsFilter(logging.Filter):
+    """uvicorn 접근 로그의 경로(args[2], query 포함)에서 token 값을 가린다. 로그 줄 자체는 남긴다."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            record.args = (*args[:2], redact_query_secrets(args[2]), *args[3:])
+        return True
 
 
 class KstDefaultFormatter(_KstTimeMixin, DefaultFormatter):
@@ -55,6 +74,7 @@ LOGGING_CONFIG: dict[str, Any] = {
             "use_colors": False,
         },
     },
+    "filters": {"redact_query_secrets": {"()": RedactQuerySecretsFilter}},
     "handlers": {
         "default": {
             "formatter": "default",
@@ -63,6 +83,7 @@ LOGGING_CONFIG: dict[str, Any] = {
         },
         "access": {
             "formatter": "access",
+            "filters": ["redact_query_secrets"],
             "class": "logging.StreamHandler",
             "stream": "ext://sys.stdout",
         },
