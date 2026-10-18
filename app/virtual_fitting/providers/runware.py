@@ -9,7 +9,6 @@ POST https://api.runware.ai/v1
 """
 
 import json
-import logging
 import os
 import uuid
 from collections.abc import Callable, Mapping
@@ -20,8 +19,6 @@ from urllib.request import Request, urlopen
 from app.virtual_fitting.exceptions import FittingModelError
 from app.virtual_fitting.providers.base import FittingInput, FittingResult
 from app.virtual_fitting.providers.http import send_request
-
-logger = logging.getLogger(__name__)
 
 RUNWARE_ENDPOINT = "https://api.runware.ai/v1"
 RUNWARE_MODEL = "prunaai:p-image@try-on"
@@ -82,12 +79,8 @@ def _parse_cost(item: dict) -> Decimal | None:
     return Decimal(str(cost))
 
 
-def parse_result(body: bytes, *, strict_cost: bool = True) -> FittingResult:
-    """Runware 원본 응답에서 결과 이미지 URL만 꺼내 내부 타입으로 변환한다.
-
-    strict_cost=False(V2 fallback)면 cost 를 해석하지 못해도 이미 받은 결과 이미지를 보존하고 cost=None 으로 둔다
-    (비용을 0 으로 보지 않는다). 기본값(V1)은 기존과 같이 예외를 낸다.
-    """
+def parse_result(body: bytes) -> FittingResult:
+    """Runware 원본 응답에서 결과 이미지 URL만 꺼내 내부 타입으로 변환한다."""
     try:
         data = json.loads(body)
     except (ValueError, UnicodeDecodeError) as error:
@@ -108,14 +101,7 @@ def parse_result(body: bytes, *, strict_cost: bool = True) -> FittingResult:
         raise FittingModelError("Runware 응답에 결과 이미지 URL(imageURL)이 없습니다.")
     # imageURL 은 Runware CDN URL 이라 장기 보관용이 아니다. VirtualFittingService 가 이 URL 의
     # 이미지를 내려받아 S3 에 저장하고, Backend 에는 URL 이 아니라 result_image_key 만 돌려준다.
-    if strict_cost:
-        return FittingResult(result_image_url=url, cost=_parse_cost(item))
-    try:
-        cost = _parse_cost(item)
-    except (ArithmeticError, ValueError, TypeError):
-        logger.warning("runware result cost could not be parsed; kept the image without cost")
-        cost = None
-    return FittingResult(result_image_url=url, cost=cost)
+    return FittingResult(result_image_url=url, cost=_parse_cost(item))
 
 
 class RunwarePrunaProvider:
@@ -134,27 +120,17 @@ class RunwarePrunaProvider:
         self.timeout = timeout
         self._opener = opener or urlopen
 
-    def try_on(
-        self, fitting_input: FittingInput, *, task_uuid: str | None = None, strict_cost: bool = True
-    ) -> FittingResult:
-        """동기 생성 요청을 **한 번** 보낸다(urllib, 자동 재시도 없음). timeout·응답 불명확이면 예외를 던지고 다시
-        보내지 않는다. 다시 보낼지는 호출하는 쪽이 정한다(V1 HTTP 는 다시 보내지 않고 V2 fallback 은 1회로 제한).
-
-        task_uuid 를 주면 그 값으로 보낸다(V2: 호출 전에 기록해 두고 작업별 비용 기록·이력 확인에 쓴다. 호출부가
-        이미 알고 있으므로 결과로 돌려주지 않는다). 없으면 새로 만든다(V1, 기존과 같음).
-        strict_cost=False 는 비용 해석 실패로 이미 받은 결과를 잃지 않게 한다(parse_result 참고, V2 fallback 용).
-        """
-        task = str(uuid.UUID(task_uuid)) if task_uuid is not None else str(uuid.uuid4())
+    def try_on(self, fitting_input: FittingInput) -> FittingResult:
         request = Request(
             self.endpoint,
-            data=json.dumps(build_payload(fitting_input, task)).encode("utf-8"),
+            data=json.dumps(build_payload(fitting_input, str(uuid.uuid4()))).encode("utf-8"),
             headers=self._headers(),
             method="POST",
         )
         body = send_request(
             request, opener=self._opener, timeout=self.timeout, service="Runware"
         )
-        return parse_result(body, strict_cost=strict_cost)
+        return parse_result(body)
 
     def _headers(self) -> Mapping[str, str]:
         return {

@@ -17,9 +17,8 @@ class FittingInput:
 
 @dataclass(frozen=True)
 class FittingResult:
-    # 외부(Runware CDN) 임시 URL. 저장·로그하지 않고 결과 이미지를 S3 로 옮길 때만 쓴다.
     result_image_url: str
-    # 이 호출로 차감된 금액(USD). 비용을 알려주지 않는 Provider 는 None 이다(0 으로 보지 않는다).
+    # 이 호출로 차감된 금액(USD). 비용을 알려주지 않는 Provider 는 None 이다.
     cost: Decimal | None = None
 
 

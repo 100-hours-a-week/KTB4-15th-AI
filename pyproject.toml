@@ -13,6 +13,3 @@ line-length = 100
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-# 테스트 하나가 이 시간(초)을 넘기면 모든 thread 의 stack 을 출력한다(멈춘 위치 확인용, 테스트를 실패시키지는 않음).
-# 진행 위치는 `pytest -v` 로 테스트 이름을 남겨 확인한다.
-faulthandler_timeout = 120
