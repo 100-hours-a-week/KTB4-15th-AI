@@ -40,6 +40,8 @@ from app.virtual_fitting.repositories.async_job_state import (
 MIGRATION = (
     Path(__file__).resolve().parents[1] / "scripts" / "db" / "virtual_fitting_async_jobs.sql"
 )
+# 13단계 변경 SQL(fallback 진행 기록 컬럼). 신규 생성 SQL 뒤에 적용한다(배포 순서와 같음).
+FALLBACK_MIGRATION = MIGRATION.with_name("virtual_fitting_fallback.sql")
 KST = timezone(timedelta(hours=9))
 JOB = 3
 TASK = "a770f077-f413-47de-9dac-be0b26a35da6"
@@ -89,6 +91,7 @@ def pg():
     options = f"-c search_path={schema}"
     with psycopg.connect(url, autocommit=True, options=options) as connection:
         connection.execute(MIGRATION.read_text(encoding="utf-8"))
+        connection.execute(FALLBACK_MIGRATION.read_text(encoding="utf-8"))
     pool = ConnectionPool(url, min_size=1, max_size=20, kwargs={"options": options}, open=True)
 
     def sql(statement, params=None):

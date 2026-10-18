@@ -394,13 +394,36 @@ def test_unknown_job_and_task_mismatch_are_kept_without_changes(db):  # noqa: F8
     assert handler.calls == [] and job(db) == before
 
 
+class SendingSqs(FakeSqs):
+    """FakeSqs + send_json(내부 큐 발행). outcomes 를 차례로 돌려준다."""
+
+    def __init__(self, *outcomes):
+        super().__init__()
+        self.outcomes, self.sent = list(outcomes), []
+
+    def send_json(self, queue, payload):
+        self.sent.append((queue, dict(payload)))
+        outcome = self.outcomes.pop(0) if self.outcomes else SqsOutcome.SUCCEEDED
+        return SqsResult(SqsOperation.SEND, queue, outcome, "ok")
+
+
 def test_stale_postprocess_message_does_not_disturb_a_fallback(db):  # noqa: F811
     task = falling_back(db)
     before = job(db)
     handler = Handler()
-    result = processor(db, PostprocessHandlers(handler, handler)).process(item(JOB, task))
-    assert (result.action, result.delete) == ("state_mismatch", False)
-    assert handler.calls == [] and job(db) == before
+    # RUN_FALLBACK 핸들러가 없으면 넘길 곳이 없으므로 그대로 남긴다.
+    kept = processor(db, PostprocessHandlers(handler)).process(item(JOB, task))
+    assert (kept.action, kept.delete) == ("republished_target_not_connected_kept", False)
+    # RUN_FALLBACK 핸들러가 있으면 RUN_FALLBACK 메시지를 다시 발행하고, 발행이 확인되면 이 메시지를 지운다(13단계).
+    sqs = SendingSqs(SqsOutcome.UNKNOWN)
+    failed = processor(db, PostprocessHandlers(handler, handler), sqs=sqs).process(item(JOB, task))
+    assert (failed.action, failed.delete) == ("republished_publish_failed_kept", False)
+    done = processor(db, PostprocessHandlers(handler, handler), sqs=sqs).process(item(JOB, task))
+    assert (done.action, done.delete) == ("republished_deleted", True)
+    assert [payload for _, payload in sqs.sent] == [
+        {"fitting_job_id": JOB, "task_uuid": task, "action": "RUN_FALLBACK"}
+    ] * 2
+    assert handler.calls == [] and job(db) == before  # 상태·기록은 바꾸지 않는다
 
 
 def test_published_duplicate_is_deleted_without_running(db):  # noqa: F811
@@ -693,15 +716,17 @@ def test_settings_are_range_checked(monkeypatch, name, value):
         pw.postprocess_settings()
 
 
-def test_real_assembly_has_no_handlers_and_refuses_to_build():
-    # 11단계: POSTPROCESS 는 연결됐지만 RUN_FALLBACK(13단계)이 없어 여전히 조립·수신하지 않는다.
+def test_real_assembly_has_both_handlers_but_incomplete_ones_refuse_to_build():
+    # 13단계: 두 핸들러가 모두 연결됐다. 핸들러가 빠진 조립은 여전히 만들지 않는다(not_ready 보호).
+    from app.virtual_fitting.fallback_handler import RunFallbackHandler
     from app.virtual_fitting.postprocess_handler import PostprocessHandler
 
     handlers = pw.connected_postprocess_handlers()
     assert isinstance(handlers.postprocess, PostprocessHandler)
-    assert handlers.missing() == ["run_fallback"]
+    assert isinstance(handlers.run_fallback, RunFallbackHandler)
+    assert handlers.missing() == []
     with pytest.raises(ValueError):
-        pw.create_postprocess_worker(handlers)
+        pw.create_postprocess_worker(PostprocessHandlers(postprocess=handlers.postprocess))
 
 
 class FakeBoto:
@@ -795,6 +820,12 @@ def test_enabled_without_handlers_does_not_start_receiving(app_env, monkeypatch,
         raise AssertionError("핸들러가 없으면 수신을 시작하지 않는다")
 
     monkeypatch.setattr(settings, "VIRTUAL_FITTING_POSTPROCESS_WORKER_ENABLED", True)
+    # 실제 조립은 13단계부터 두 핸들러가 다 있다. 한쪽이 빠진 조립을 주입해 not_ready 보호를 확인한다.
+    monkeypatch.setattr(
+        app_env,
+        "connected_postprocess_handlers",
+        lambda: PostprocessHandlers(postprocess=Handler()),
+    )
     monkeypatch.setattr(app_env, "create_postprocess_worker", forbidden)
     monkeypatch.setattr("app.clients.sqs.get_sqs_client", forbidden)
     with caplog.at_level(logging.WARNING), TestClient(app_env.app) as client:

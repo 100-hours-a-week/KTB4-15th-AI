@@ -125,25 +125,20 @@ class PostprocessHandler:
             verified, stop = self._verify_image(deps, job, token, context)
             if stop is not None:
                 return stop
-        title, comment, stop = self._title_and_comment(deps, job, token, context, verified)
+        title, comment, stop = title_and_comment(
+            deps,
+            job,
+            token,
+            context,
+            verified,
+            stage_ok=postprocess_stage(verified),
+            expires_in=self._expires,
+        )
         if stop is not None:
             return stop
         if not context.may_continue():
             return HandlerResult(HandlerStatus.DEFERRED, "stopped_before_save")
-        payload = {
-            "fitting_job_id": job_id,
-            "status": "COMPLETED",
-            "result_image_key": verified,
-            "llm_title": title,
-            "llm_comment": comment,
-        }
-        saved = deps.state.save_final_result(job_id, token, payload, verified)
-        if saved.applied or saved.reason is ChangeReason.ALREADY_RECORDED:
-            return HandlerResult(HandlerStatus.DONE, "result_saved")
-        logger.warning(
-            "postprocess result not saved fitting_job_id=%s reason=%s", job_id, saved.reason.value
-        )
-        return HandlerResult(HandlerStatus.DEFERRED, f"save_{saved.reason.value}")
+        return save_completed(deps.state, job_id, token, verified, title, comment)
 
     # --- 1. S3 확인 ---
 
@@ -222,8 +217,10 @@ class PostprocessHandler:
                         )
                     moved = deps.state.move_to_fallback(job_id, token, final_s3_check=last.state)
                     if moved.applied:
-                        # DB 전환만 한다. RUN_FALLBACK 실행·인계는 13단계에서 연결한다.
-                        return None, HandlerResult(HandlerStatus.DONE, "moved_to_fallback")
+                        # DB 를 RUN_FALLBACK 으로 넘겼다. RUN_FALLBACK 메시지 발행은 Worker 가 한다(handoff).
+                        return None, HandlerResult(
+                            HandlerStatus.DONE, "moved_to_fallback", NextAction.RUN_FALLBACK
+                        )
                     return None, HandlerResult(
                         HandlerStatus.DEFERRED, f"fallback_{moved.reason.value}"
                     )
@@ -231,92 +228,132 @@ class PostprocessHandler:
                 return None, HandlerResult(HandlerStatus.DEFERRED, "s3_unconfirmed_transient")
             # 첫 묶음 실패 → 같은 실행 안에서 두 번째 묶음.
 
-    # --- 2. 제목·코멘트 ---
 
-    def _summaries(self, deps, job) -> list[str]:
-        """V1 과 같이 상품 설명 요약을 보조 근거로 쓴다(요청 순서). 상품 DB 의 product_code 는 정수다."""
-        codes = [code for code in (job.products or ()) if code.isdigit()]
-        found = {product.product_code: product for product in deps.products.find_by_codes(codes)}
-        summaries = []
-        for code in codes:
-            summary = getattr(found.get(str(int(code))), "description_summary", None)
-            if isinstance(summary, str) and summary.strip():
-                summaries.append(summary)
-        return summaries
+# --- 2. 제목·코멘트 (POSTPROCESS·RUN_FALLBACK 공용) ---
 
-    def _title_and_comment(self, deps, job, token, context, key):
-        job_id = job.fitting_job_id
-        summaries = self._summaries(deps, job)
-        if not summaries:
-            logger.warning(
-                "postprocess has no product description summaries fitting_job_id=%s; default text",
-                job_id,
+
+def postprocess_stage(key: str) -> Callable[[AsyncFittingJob], bool]:
+    """POSTPROCESS 단계가 그대로인지(같은 S3 확인 이미지)."""
+    return lambda latest: (
+        latest.status is AsyncJobStatus.POSTPROCESSING
+        and latest.next_action is NextAction.POSTPROCESS
+        and latest.verified_image_key == key
+    )
+
+
+def product_summaries(products: Any, job: AsyncFittingJob) -> list[str]:
+    """V1 과 같이 상품 설명 요약을 보조 근거로 쓴다(요청 순서). 상품 DB 의 product_code 는 정수다."""
+    codes = [code for code in (job.products or ()) if code.isdigit()]
+    found = {product.product_code: product for product in products.find_by_codes(codes)}
+    summaries = []
+    for code in codes:
+        summary = getattr(found.get(str(int(code))), "description_summary", None)
+        if isinstance(summary, str) and summary.strip():
+            summaries.append(summary)
+    return summaries
+
+
+def title_and_comment(
+    deps: Any,
+    job: AsyncFittingJob,
+    token: str,
+    context: HandlerContext,
+    key: str,
+    *,
+    stage_ok: Callable[[AsyncFittingJob], bool],
+    expires_in: int | None = None,
+) -> tuple[str | None, str | None, HandlerResult | None]:
+    """확인한 이미지 key 로 제목·코멘트를 만든다(comment + title 한 쌍 = 1회, 최초 포함 최대 3회, 소진 시 V1 기본 문구).
+
+    deps 는 jobs·state·products·storage·comments 를 가진다. stage_ok 는 최신 기록이 아직 이 단계(POSTPROCESS 또는
+    RUN_FALLBACK, 같은 이미지)인지 본다. 반환: (제목, 코멘트, None) 또는 (None, None, 멈출 때의 HandlerResult).
+    """
+    job_id = job.fitting_job_id
+    summaries = product_summaries(deps.products, job)
+    if not summaries:
+        logger.warning(
+            "postprocess has no product description summaries fitting_job_id=%s; default text",
+            job_id,
+        )
+        return FALLBACK_TITLE, FALLBACK_COMMENT, None
+    from app.virtual_fitting.async_storage import result_image_get_url
+
+    while True:
+        if not context.may_continue():
+            return None, None, HandlerResult(HandlerStatus.DEFERRED, "stopped_before_llm")
+        # a. 최신 기록 확인(불필요한 URL 서명을 줄이기 위한 확인, 최종 판단은 d 의 조건부 확보).
+        latest = deps.jobs.find_by_fitting_job_id(job_id)
+        if latest is None:
+            return None, None, HandlerResult(HandlerStatus.DEFERRED, "job_missing")
+        if latest.result_payload is not None:
+            return None, None, HandlerResult(HandlerStatus.DONE, "result_already_saved")
+        if not stage_ok(latest):
+            return None, None, HandlerResult(HandlerStatus.DEFERRED, "llm_state_changed")
+        if not deps.state.holds_lease(job_id, token):
+            return None, None, HandlerResult(HandlerStatus.DEFERRED, "llm_lease_lost")
+        # b. 이미 한도면 URL 을 만들지 않는다.
+        if latest.llm_generation_attempt_count >= LLM_GENERATION_LIMIT:
+            logger.info(
+                "postprocess llm attempts exhausted fitting_job_id=%s; default text", job_id
             )
             return FALLBACK_TITLE, FALLBACK_COMMENT, None
-        from app.virtual_fitting.async_storage import result_image_get_url
-
-        while True:
-            if not context.may_continue():
-                return None, None, HandlerResult(HandlerStatus.DEFERRED, "stopped_before_llm")
-            # a. 최신 기록 확인(불필요한 URL 서명을 줄이기 위한 확인, 최종 판단은 d 의 조건부 확보).
-            latest = deps.jobs.find_by_fitting_job_id(job_id)
-            if latest is None:
-                return None, None, HandlerResult(HandlerStatus.DEFERRED, "job_missing")
-            if latest.result_payload is not None:
-                return None, None, HandlerResult(HandlerStatus.DONE, "result_already_saved")
-            if (
-                latest.status is not AsyncJobStatus.POSTPROCESSING
-                or latest.next_action is not NextAction.POSTPROCESS
-                or latest.verified_image_key != key
-            ):
-                return None, None, HandlerResult(HandlerStatus.DEFERRED, "llm_state_changed")
-            if not deps.state.holds_lease(job_id, token):
-                return None, None, HandlerResult(HandlerStatus.DEFERRED, "llm_lease_lost")
-            # b. 이미 한도면 URL 을 만들지 않는다.
-            if latest.llm_generation_attempt_count >= LLM_GENERATION_LIMIT:
+        # c. 남은 횟수가 있을 때만 새 URL.
+        try:
+            url = result_image_get_url(deps.storage, key, expires_in=expires_in)
+        except ImageStorageError:
+            # S3 서명 설정 문제(LLM 오류와 구분). 시도 횟수를 쓰지 않고 보류한다.
+            logger.exception("postprocess result image url failed fitting_job_id=%s", job_id)
+            return None, None, HandlerResult(HandlerStatus.DEFERRED, "s3_presign_failed")
+        # d. 실행 권한·상태·한도를 원자적으로 다시 확인하고 횟수를 확보한다(호출 허용의 최종 판단).
+        claim = deps.state.claim_llm_generation_attempt(job_id, token)
+        if not claim.applied:
+            if claim.reason is ChangeReason.LIMIT_REACHED:
                 logger.info(
                     "postprocess llm attempts exhausted fitting_job_id=%s; default text", job_id
                 )
                 return FALLBACK_TITLE, FALLBACK_COMMENT, None
-            # c. 남은 횟수가 있을 때만 새 URL.
-            try:
-                url = result_image_get_url(deps.storage, key, expires_in=self._expires)
-            except ImageStorageError:
-                # S3 서명 설정 문제(LLM 오류와 구분). 시도 횟수를 쓰지 않고 보류한다.
-                logger.exception("postprocess result image url failed fitting_job_id=%s", job_id)
-                return None, None, HandlerResult(HandlerStatus.DEFERRED, "s3_presign_failed")
-            # d. 실행 권한·상태·한도를 원자적으로 다시 확인하고 횟수를 확보한다(호출 허용의 최종 판단).
-            claim = deps.state.claim_llm_generation_attempt(job_id, token)
-            if not claim.applied:
-                if claim.reason is ChangeReason.LIMIT_REACHED:
-                    logger.info(
-                        "postprocess llm attempts exhausted fitting_job_id=%s; default text", job_id
-                    )
-                    return FALLBACK_TITLE, FALLBACK_COMMENT, None
-                return (
-                    None,
-                    None,
-                    HandlerResult(HandlerStatus.DEFERRED, f"llm_claim_{claim.reason.value}"),
-                )
-            attempt = claim.job.llm_generation_attempt_count
-            try:
-                comment = deps.comments.generate_comment(url, summaries)
-                if not context.may_continue():
-                    return None, None, HandlerResult(HandlerStatus.DEFERRED, "stopped_between_llm")
-                title = deps.comments.generate_title(comment)
-            except (FittingPostprocessError, ValueError) as error:
-                logger.warning(
-                    "postprocess llm attempt failed fitting_job_id=%s attempt=%s error=%s",
-                    job_id,
-                    attempt,
-                    type(error).__name__,
-                )
-                continue
-            if _usable(title) and _usable(comment):
-                return title.strip(), comment.strip(), None
-            logger.warning(
-                "postprocess llm returned empty text fitting_job_id=%s attempt=%s", job_id, attempt
+            return (
+                None,
+                None,
+                HandlerResult(HandlerStatus.DEFERRED, f"llm_claim_{claim.reason.value}"),
             )
+        attempt = claim.job.llm_generation_attempt_count
+        try:
+            comment = deps.comments.generate_comment(url, summaries)
+            if not context.may_continue():
+                return None, None, HandlerResult(HandlerStatus.DEFERRED, "stopped_between_llm")
+            title = deps.comments.generate_title(comment)
+        except (FittingPostprocessError, ValueError) as error:
+            logger.warning(
+                "postprocess llm attempt failed fitting_job_id=%s attempt=%s error=%s",
+                job_id,
+                attempt,
+                type(error).__name__,
+            )
+            continue
+        if _usable(title) and _usable(comment):
+            return title.strip(), comment.strip(), None
+        logger.warning(
+            "postprocess llm returned empty text fitting_job_id=%s attempt=%s", job_id, attempt
+        )
+
+
+def save_completed(
+    state: Any, job_id: int, token: str, key: str, title: str, comment: str
+) -> HandlerResult:
+    """COMPLETED V2 결과(result_image_key = 확인한 이미지)와 PUBLISH_RESULT 를 저장한다. 기존 결과는 덮어쓰지 않는다."""
+    payload = {
+        "fitting_job_id": job_id,
+        "status": "COMPLETED",
+        "result_image_key": key,
+        "llm_title": title,
+        "llm_comment": comment,
+    }
+    saved = state.save_final_result(job_id, token, payload, key)
+    if saved.applied or saved.reason is ChangeReason.ALREADY_RECORDED:
+        return HandlerResult(HandlerStatus.DONE, "result_saved")
+    logger.warning("result not saved fitting_job_id=%s reason=%s", job_id, saved.reason.value)
+    return HandlerResult(HandlerStatus.DEFERRED, f"save_{saved.reason.value}")
 
 
 def _usable(text: Any) -> bool:

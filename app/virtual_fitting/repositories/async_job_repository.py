@@ -83,6 +83,10 @@ class AsyncFittingJob:
     s3_check_attempt_count: int
     worker_lease_token: str | None
     worker_lease_until: datetime | None
+    # fallback(13단계, scripts/db/virtual_fitting_fallback.sql). 비동기 task_uuid 와 별개인 생성 시도 기록.
+    fallback_task_uuid: str | None
+    fallback_started_at: datetime | None
+    fallback_image_key: str | None
 
 
 @dataclass(frozen=True)
@@ -157,10 +161,13 @@ def _row_to_job(row: Sequence[Any]) -> AsyncFittingJob:
         "runware_accepted_at",
         "image_verified_at",
         "worker_lease_until",
+        "fallback_started_at",
     ):
         data[name] = _utc(data[name])
     data["products"] = tuple(data["products"]) if data["products"] is not None else None
     data["task_uuid"] = str(data["task_uuid"]) if data["task_uuid"] is not None else None
+    fallback_task = data["fallback_task_uuid"]
+    data["fallback_task_uuid"] = str(fallback_task) if fallback_task is not None else None
     data["status"] = AsyncJobStatus(data["status"])
     data["next_action"] = NextAction(data["next_action"]) if data["next_action"] else None
     data["result_message_status"] = ResultMessageStatus(data["result_message_status"])

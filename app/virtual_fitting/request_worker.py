@@ -346,8 +346,11 @@ class RequestProcessor:
         on_conflict: ConflictAlert = log_conflict,
         should_stop: Callable[[], bool] = lambda: False,
         follow_up: FollowUpPaths | None = None,
+        follow_up_queue: Any = None,
     ):
         self._jobs, self._state, self._precheck, self._sqs = jobs, state, precheck, sqs
+        # RUN_FALLBACK 을 기다리는 작업의 재수신 때 내부 큐 발행을 다시 시도한다(SqsQueueClient). 없으면 하지 않는다.
+        self._follow_up_queue = follow_up_queue
         # 이미 진행된 작업의 중복 메시지를 지워도 되는지(이어 갈 실제 경로가 있는지). 기본은 "없음".
         self._follow_up = follow_up or NoFollowUpPaths()
         self._lease_seconds = lease_seconds
@@ -423,6 +426,19 @@ class RequestProcessor:
             # 결과 발행까지 끝난 작업의 중복 메시지. 다시 할 일이 없으므로 삭제해도 잃는 것이 없다.
             return outcome("already_published_deleted", delete=True)
         if job.next_action is not NextAction.SUBMIT_PRUNA:
+            from app.virtual_fitting.follow_up_queue import publish_follow_up, waiting_for_fallback
+
+            latest = self._jobs.find_by_fitting_job_id(job_id)
+            if waiting_for_fallback(latest) and self._follow_up_queue is not None:
+                # 제출 거절로 RUN_FALLBACK 이 됐는데 발행이 실패했거나 발행 전에 멈췄다. Pruna 제출·사전 검증은 다시 하지
+                # 않고 RUN_FALLBACK 발행만 다시 한다. 등록이 확인될 때만 요청 메시지를 지운다.
+                published = publish_follow_up(
+                    self._follow_up_queue, latest, NextAction.RUN_FALLBACK
+                ).succeeded
+                return outcome(
+                    "run_fallback_published" if published else "run_fallback_publish_failed_kept",
+                    delete=published,
+                )
             # 실패 결과 저장 뒤(PUBLISH_RESULT)나 Pruna 이후 단계. 이어서 할 처리는 해당 단계가 맡는다.
             # 그 일을 이어 갈 실제 경로가 있을 때만 메시지를 지운다(최신 기록으로 판단).
             return outcome(
@@ -708,6 +724,7 @@ def create_request_worker() -> RequestWorker:
         budget=budget,
         balance=balance,
         webhook_url=settings.VIRTUAL_FITTING_RUNWARE_WEBHOOK_URL,
+        follow_up_queue=sqs,
         should_stop=lambda: worker.stopping,
         keepalive_seconds=settings.VIRTUAL_FITTING_REQUEST_LEASE_SECONDS / 3,
     )
@@ -721,6 +738,7 @@ def create_request_worker() -> RequestWorker:
         visibility_seconds=settings.VIRTUAL_FITTING_REQUEST_VISIBILITY_SECONDS,
         should_stop=lambda: worker.stopping,
         submit=submitter,
+        follow_up_queue=sqs,
     )
     worker = RequestWorker(
         lambda: receive_fitting_requests(

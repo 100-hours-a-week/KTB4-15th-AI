@@ -295,12 +295,13 @@ def test_v1_store_remote_image_still_uses_a_new_name():
 # --- Worker 연결 상태 유지 ---
 
 
-def test_run_fallback_is_still_not_connected():
+def test_worker_stays_disabled_and_follow_up_paths_not_ready():
+    # 13단계에서 RUN_FALLBACK 이 연결됐지만 활성화·결과 발행·복구 경로는 그대로다.
     from app.config import settings
     from app.virtual_fitting import postprocess_worker as pw
     from app.virtual_fitting.pruna_submitter import NextStep, NoFollowUpPaths
 
-    assert pw.connected_postprocess_handlers().missing() == ["run_fallback"]
+    assert pw.connected_postprocess_handlers().missing() == []
     assert not any(NoFollowUpPaths().ready_for(None, step) for step in NextStep)
     assert settings.VIRTUAL_FITTING_POSTPROCESS_WORKER_ENABLED is False
     assert settings.VIRTUAL_FITTING_REQUEST_WORKER_ENABLED is False

@@ -150,6 +150,38 @@ def _classify(message: ReceivedMessage) -> ValidFollowUp | InvalidFollowUp:
         )
 
 
+def waiting_for_fallback(job: Any) -> bool:
+    """DB 가 RUN_FALLBACK 실행을 기다린다(FALLBACK_RUNNING / RUN_FALLBACK, 결과 없음)."""
+    from app.virtual_fitting.repositories.async_job_repository import AsyncJobStatus
+
+    return (
+        job is not None
+        and job.status is AsyncJobStatus.FALLBACK_RUNNING
+        and job.next_action is NextAction.RUN_FALLBACK
+        and job.result_payload is None
+    )
+
+
+def publish_follow_up(sqs: SqsQueueClient, job: Any, action: NextAction) -> SqsResult:
+    """ai-fitting-response 에 다음 action 을 발행한다(9단계 follow_up_message 형식, 비동기 task_uuid).
+
+    DB 트랜잭션 밖에서 부른다. SUCCEEDED 만 등록 근거다(FAILED·UNKNOWN 이면 호출부가 원래 메시지를 남긴다).
+    중복 발행은 허용한다(생성 1회는 DB 의 fallback 기록이 막는다).
+    """
+    from app.virtual_fitting.runware_webhook import follow_up_message
+
+    result = sqs.send_json(FittingQueue.AI_FITTING_RESPONSE, follow_up_message(job, action))
+    if not result.succeeded:
+        logger.error(
+            "follow-up not published fitting_job_id=%s action=%s outcome=%s reason=%s",
+            job.fitting_job_id,
+            action.value,
+            result.outcome.value,
+            result.reason,
+        )
+    return result
+
+
 def receive_follow_ups(
     sqs: SqsQueueClient,
     *,

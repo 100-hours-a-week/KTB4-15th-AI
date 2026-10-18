@@ -45,6 +45,18 @@ LLM_GENERATION_LIMIT = 3
 FALLBACK_LIMIT = 1
 RESULT_MESSAGE_LIMIT = 3
 MAX_LEASE_SECONDS = 3600
+# 행 잠금 대기 제한(초). Pruna limiter 와 같은 5초. 트랜잭션 범위로만 건다(set_config(..., true) — 트랜잭션이 끝나면
+# 사라져 pool 의 다음 사용자에게 남지 않는다). 메시지 처리 전체·외부 HTTP timeout 과는 별개다.
+DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
+_SET_LOCK_TIMEOUT = "SELECT set_config('lock_timeout', %(lock_timeout)s, true)"
+
+
+def lock_timeout_setting(seconds: float) -> str:
+    """PostgreSQL lock_timeout 값(밀리초 문자열). 0 은 '무한 대기'라 받지 않는다."""
+    if isinstance(seconds, bool) or not isinstance(seconds, int | float) or not 0 < seconds <= 60:
+        raise ValueError("lock_timeout_seconds 는 0 초과 60 이하여야 합니다.")
+    return f"{max(1, round(seconds * 1000))}ms"
+
 
 _TERMINAL = [AsyncJobStatus.COMPLETED.value, AsyncJobStatus.FAILED.value]
 _NOW = "statement_timestamp()"
@@ -141,8 +153,11 @@ def _check_result_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
 class AsyncJobStateRepository:
     """작업별 상태 변경 메서드. 쓸 때만 pool 에서 connection 을 빌리고 즉시 반환한다."""
 
-    def __init__(self, connection_pool: Any):
+    def __init__(
+        self, connection_pool: Any, *, lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS
+    ):
         self._connection_pool = connection_pool
+        self._lock_timeout = lock_timeout_setting(lock_timeout_seconds)
 
     # --- 실행 권한(lease) ---
 
@@ -401,15 +416,23 @@ class AsyncJobStateRepository:
         )
 
     def claim_llm_generation_attempt(self, fitting_job_id: int, token: str) -> StateChange:
-        """확인한 이미지로 제목·코멘트를 생성하기 직전에 횟수를 확보한다. 최초 포함 최대 3회."""
+        """확인한 이미지로 제목·코멘트를 생성하기 직전에 횟수를 확보한다. 최초 포함 최대 3회.
+
+        이미지가 있는 두 경로만 허용한다: POSTPROCESS(S3 에서 확인한 verified_image_key) 또는 RUN_FALLBACK(13단계,
+        저장을 확인한 fallback_image_key). 같은 llm_generation_attempt_count 를 쓰므로 fallback 으로 넘어가도 초기화되지 않는다.
+        """
         return self._claim(
             fitting_job_id,
             token,
             "llm_generation_attempt_count",
             LLM_GENERATION_LIMIT,
             """
-            status = 'POSTPROCESSING' AND next_action = 'POSTPROCESS'
-            AND verified_image_key IS NOT NULL AND result_payload IS NULL
+            result_payload IS NULL AND (
+                (status = 'POSTPROCESSING' AND next_action = 'POSTPROCESS'
+                 AND verified_image_key IS NOT NULL)
+                OR (status = 'FALLBACK_RUNNING' AND next_action = 'RUN_FALLBACK'
+                    AND fallback_image_key IS NOT NULL)
+            )
             """,
             lambda job: job.llm_generation_attempt_count,
             lambda job: job.result_payload is not None,
@@ -448,6 +471,53 @@ class AsyncJobStateRepository:
             lambda job, now: (
                 ChangeReason.LIMIT_REACHED
                 if job.fallback_attempt_count >= FALLBACK_LIMIT
+                else ChangeReason.STATE_MISMATCH
+            ),
+        )
+
+    def prepare_fallback(
+        self, fitting_job_id: int, token: str, fallback_task_uuid: str
+    ) -> StateChange:
+        """fallback 생성 요청의 taskUUID 를 외부 호출 전에 저장한다. 이미 있으면 바꾸지 않는다(재수신 때 재사용).
+
+        비동기 task_uuid 는 그대로 둔다(늦은 Webhook·작업 조회용). FALLBACK_RUNNING / RUN_FALLBACK, 결과 없음, 유효한 lease.
+        """
+        return self._update(
+            fitting_job_id,
+            "fallback_task_uuid = %(fallback_task)s",
+            """
+            status = 'FALLBACK_RUNNING' AND next_action = 'RUN_FALLBACK'
+            AND result_payload IS NULL AND fallback_task_uuid IS NULL
+            AND (task_uuid IS NULL OR task_uuid <> %(fallback_task)s)
+            """,
+            {
+                "token": token,
+                "fallback_task": _check_uuid(fallback_task_uuid, "fallback_task_uuid"),
+            },
+            lambda job, now: (
+                ChangeReason.ALREADY_RECORDED
+                if job.fallback_task_uuid is not None
+                else ChangeReason.STATE_MISMATCH
+            ),
+        )
+
+    def record_fallback_image(self, fitting_job_id: int, token: str, image_key: str) -> StateChange:
+        """fallback 생성 결과를 S3 에 저장했다는 기록. 이 값이 있으면 생성·저장은 끝났다(제목·코멘트부터 이어 간다).
+
+        생성 요청을 시작한 기록(fallback_started_at)이 있어야 하고, 이미 있으면 바꾸지 않는다(ALREADY_RECORDED).
+        """
+        return self._update(
+            fitting_job_id,
+            "fallback_image_key = %(key)s",
+            """
+            status = 'FALLBACK_RUNNING' AND next_action = 'RUN_FALLBACK'
+            AND result_payload IS NULL AND fallback_started_at IS NOT NULL
+            AND fallback_image_key IS NULL
+            """,
+            {"token": token, "key": validate_s3_key(image_key)},
+            lambda job, now: (
+                ChangeReason.ALREADY_RECORDED
+                if job.fallback_image_key is not None
                 else ChangeReason.STATE_MISMATCH
             ),
         )
@@ -658,11 +728,16 @@ class AsyncJobStateRepository:
         params: dict[str, Any],
         reason: Callable[[AsyncFittingJob, Any], ChangeReason],
     ) -> StateChange:
-        """한 트랜잭션: 행 잠금(여기서 대기) → 잠금을 쥔 채 실제 시각으로 조건부 UPDATE → 실패 이유 조회."""
+        """한 트랜잭션: 행 잠금(여기서 대기) → 잠금을 쥔 채 실제 시각으로 조건부 UPDATE → 실패 이유 조회.
+
+        잠금 대기는 lock_timeout(기본 5초, 이 트랜잭션에만)으로 제한한다. 넘으면 PostgreSQL 이 트랜잭션을 되돌리고
+        (아무것도 바뀌지 않음) FittingDatabaseError 로 올린다. 여기서 다시 시도하지 않는다(재수신 때 최신 기록으로 이어 간다).
+        """
         try:
             with self._connection_pool.connection() as connection:
                 connection.autocommit = True
                 with connection.transaction(), connection.cursor() as cursor:
+                    cursor.execute(_SET_LOCK_TIMEOUT, {"lock_timeout": self._lock_timeout})
                     cursor.execute(lock_sql, params)
                     locked = cursor.fetchone()
                     if locked is None:

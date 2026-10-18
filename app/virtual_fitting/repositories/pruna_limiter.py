@@ -59,6 +59,9 @@ class SubmissionReason(str, Enum):
     INTERVAL_WAIT = "interval_wait"
     # 표현할 수 없게 긴 대기 안내로 새 생성 요청을 보류 중이다(자동 해제 없음).
     SEND_HOLD = "send_hold"
+    # fallback: 이미 1회를 썼다 / 같은 작업 번호의 자리를 다른 생성 시도가 쥐고 있다.
+    FALLBACK_LIMIT_REACHED = "fallback_limit_reached"
+    OTHER_ATTEMPT_IN_FLIGHT = "other_attempt_in_flight"
     SENDS_FULL = "sends_full"
 
 
@@ -122,46 +125,9 @@ class PrunaLimiter:
             if status != "RECEIVED" or next_action != "SUBMIT_PRUNA" or job_task != task:
                 return SubmissionGrant(False, SubmissionReason.STATE_MISMATCH)
 
-            cursor.execute(
-                f"SELECT count(*) FILTER (WHERE fitting_job_id <> %s), "
-                f"coalesce(bool_or(fitting_job_id = %s), false) FROM {IN_FLIGHT}",
-                (job_id, job_id),
-            )
-            others, holds = cursor.fetchone()
-            if not holds and others >= self.max_in_flight:
-                return SubmissionGrant(False, SubmissionReason.IN_FLIGHT_FULL)
-            (hold_reason,) = limiter
-            if hold_reason is not None:
-                return SubmissionGrant(False, SubmissionReason.SEND_HOLD)
-            # 남은 대기는 DB 에서 초로 계산한다. 아주 먼 next_send_at(9999년 이후)은 Python datetime 으로 읽을 수 없다.
-            cursor.execute(
-                f"SELECT EXTRACT(EPOCH FROM next_send_at - %s) FROM {LIMITER} WHERE id = 1", (now,)
-            )
-            (remaining,) = cursor.fetchone()
-            if remaining > 0:
-                return SubmissionGrant(
-                    False, SubmissionReason.INTERVAL_WAIT, wait_seconds=float(remaining)
-                )
-            cursor.execute(f"DELETE FROM {SENDS} WHERE held_until <= %s", (now,))
-            cursor.execute(f"SELECT count(*) FROM {SENDS} WHERE fitting_job_id <> %s", (job_id,))
-            if cursor.fetchone()[0] >= self.max_concurrent_sends:
-                return SubmissionGrant(False, SubmissionReason.SENDS_FULL)
-
-            cursor.execute(
-                f"INSERT INTO {IN_FLIGHT} (fitting_job_id, task_uuid, acquired_at) VALUES (%s, %s, %s) "
-                "ON CONFLICT (fitting_job_id) DO NOTHING",
-                (job_id, task, now),
-            )
-            cursor.execute(
-                f"INSERT INTO {SENDS} (fitting_job_id, held_until) "
-                "VALUES (%s, %s + make_interval(secs => %s)) "
-                "ON CONFLICT (fitting_job_id) DO UPDATE SET held_until = EXCLUDED.held_until",
-                (job_id, now, self.send_hold_seconds),
-            )
-            cursor.execute(
-                f"UPDATE {LIMITER} SET next_send_at = %s + make_interval(secs => %s) WHERE id = 1",
-                (now, self.min_send_interval_seconds),
-            )
+            refused = self._take_slot(cursor, job_id, task, now, limiter[0])
+            if refused is not None:
+                return refused
             cursor.execute(
                 f"UPDATE {JOBS} SET pruna_submit_started_at = %s, updated_at = %s "
                 "WHERE fitting_job_id = %s",
@@ -170,6 +136,127 @@ class PrunaLimiter:
             return SubmissionGrant(True, SubmissionReason.GRANTED, started_at=now)
 
         return self._transaction(work, "Pruna 생성 요청 자리 확보")
+
+    def begin_fallback(
+        self, fitting_job_id: int, token: str, fallback_task_uuid: str
+    ) -> SubmissionGrant:
+        """V1 fallback 생성 요청(13단계)의 자리 확보. begin_submission 과 같은 공유 제한(진행 중·동시 전송·간격·보류)을
+        같은 순서로 적용하고, 자리 확보·간격 갱신과 fallback 1회 확보(fallback_attempt_count + 1)·시작 기록
+        (fallback_started_at)을 한 트랜잭션으로 커밋한다. 외부 호출·대기는 하지 않는다.
+
+        조건(잠금 뒤 DB 시각): 유효한 lease, FALLBACK_RUNNING / RUN_FALLBACK, 결과 없음, 저장된 fallback_task_uuid 와 같음,
+        시작 기록 없음, fallback_attempt_count < 1. 기다리기만 하면(INTERVAL_WAIT 등) 횟수를 쓰지 않는다.
+        같은 작업 번호의 자리를 다른 생성 시도(비동기 task 등)가 쥐고 있으면 덮어쓰지 않고 거절한다.
+        """
+        from app.virtual_fitting.repositories.async_job_state import FALLBACK_LIMIT
+
+        job_id = _check_job_id(fitting_job_id)
+        task = uuid.UUID(fallback_task_uuid)
+
+        def work(cursor) -> SubmissionGrant:
+            cursor.execute(f"SELECT send_hold_reason FROM {LIMITER} WHERE id = 1 FOR UPDATE")
+            limiter = cursor.fetchone()
+            if limiter is None:
+                raise FittingDatabaseError("Pruna 제한 상태 행이 없습니다(마이그레이션 확인).")
+            cursor.execute(
+                f"""
+                SELECT status, next_action, fallback_task_uuid, fallback_started_at,
+                       fallback_attempt_count, result_payload IS NULL,
+                       worker_lease_token, worker_lease_until
+                FROM {JOBS} WHERE fitting_job_id = %s FOR UPDATE
+                """,
+                (job_id,),
+            )
+            job = cursor.fetchone()
+            if job is None:
+                return SubmissionGrant(False, SubmissionReason.NOT_FOUND)
+            cursor.execute("SELECT statement_timestamp()")
+            (now,) = cursor.fetchone()
+            (
+                status,
+                next_action,
+                job_task,
+                started,
+                attempts,
+                no_result,
+                lease_token,
+                lease_until,
+            ) = job
+            if lease_token != token or lease_until is None or lease_until <= now:
+                return SubmissionGrant(False, SubmissionReason.LEASE_INVALID)
+            if started is not None:
+                return SubmissionGrant(False, SubmissionReason.ALREADY_STARTED)
+            if attempts >= FALLBACK_LIMIT:
+                return SubmissionGrant(False, SubmissionReason.FALLBACK_LIMIT_REACHED)
+            if (
+                status != "FALLBACK_RUNNING"
+                or next_action != "RUN_FALLBACK"
+                or not no_result
+                or job_task != task
+            ):
+                return SubmissionGrant(False, SubmissionReason.STATE_MISMATCH)
+            cursor.execute(
+                f"SELECT task_uuid FROM {IN_FLIGHT} WHERE fitting_job_id = %s", (job_id,)
+            )
+            held = cursor.fetchone()
+            if held is not None and held[0] != task:
+                return SubmissionGrant(False, SubmissionReason.OTHER_ATTEMPT_IN_FLIGHT)
+            refused = self._take_slot(cursor, job_id, task, now, limiter[0])
+            if refused is not None:
+                return refused
+            cursor.execute(
+                f"UPDATE {JOBS} SET fallback_attempt_count = fallback_attempt_count + 1, "
+                "fallback_started_at = %s, updated_at = %s "
+                "WHERE fitting_job_id = %s AND fallback_attempt_count < %s",
+                (now, now, job_id, FALLBACK_LIMIT),
+            )
+            return SubmissionGrant(True, SubmissionReason.GRANTED, started_at=now)
+
+        return self._transaction(work, "Pruna fallback 자리 확보")
+
+    def _take_slot(
+        self, cursor, job_id: int, task: uuid.UUID, now, hold_reason
+    ) -> SubmissionGrant | None:
+        """잠금을 쥔 트랜잭션 안에서 진행 중·보류·간격·동시 전송을 확인하고 자리를 잡는다. 거절이면 그 Grant, 잡았으면 None."""
+        cursor.execute(
+            f"SELECT count(*) FILTER (WHERE fitting_job_id <> %s), "
+            f"coalesce(bool_or(fitting_job_id = %s), false) FROM {IN_FLIGHT}",
+            (job_id, job_id),
+        )
+        others, holds = cursor.fetchone()
+        if not holds and others >= self.max_in_flight:
+            return SubmissionGrant(False, SubmissionReason.IN_FLIGHT_FULL)
+        if hold_reason is not None:
+            return SubmissionGrant(False, SubmissionReason.SEND_HOLD)
+        # 남은 대기는 DB 에서 초로 계산한다. 아주 먼 next_send_at(9999년 이후)은 Python datetime 으로 읽을 수 없다.
+        cursor.execute(
+            f"SELECT EXTRACT(EPOCH FROM next_send_at - %s) FROM {LIMITER} WHERE id = 1", (now,)
+        )
+        (remaining,) = cursor.fetchone()
+        if remaining > 0:
+            return SubmissionGrant(
+                False, SubmissionReason.INTERVAL_WAIT, wait_seconds=float(remaining)
+            )
+        cursor.execute(f"DELETE FROM {SENDS} WHERE held_until <= %s", (now,))
+        cursor.execute(f"SELECT count(*) FROM {SENDS} WHERE fitting_job_id <> %s", (job_id,))
+        if cursor.fetchone()[0] >= self.max_concurrent_sends:
+            return SubmissionGrant(False, SubmissionReason.SENDS_FULL)
+        cursor.execute(
+            f"INSERT INTO {IN_FLIGHT} (fitting_job_id, task_uuid, acquired_at) VALUES (%s, %s, %s) "
+            "ON CONFLICT (fitting_job_id) DO NOTHING",
+            (job_id, task, now),
+        )
+        cursor.execute(
+            f"INSERT INTO {SENDS} (fitting_job_id, held_until) "
+            "VALUES (%s, %s + make_interval(secs => %s)) "
+            "ON CONFLICT (fitting_job_id) DO UPDATE SET held_until = EXCLUDED.held_until",
+            (job_id, now, self.send_hold_seconds),
+        )
+        cursor.execute(
+            f"UPDATE {LIMITER} SET next_send_at = %s + make_interval(secs => %s) WHERE id = 1",
+            (now, self.min_send_interval_seconds),
+        )
+        return None
 
     def finish_send(self, fitting_job_id: int) -> None:
         """HTTP 전송이 끝났다(결과와 관계없이). 동시 전송 자리만 놓는다. 진행 중 자리는 그대로다."""
@@ -306,6 +393,8 @@ class TaskCostRepository:
             with self._pool.connection() as connection:
                 connection.autocommit = True
                 with connection.transaction(), connection.cursor() as cursor:
+                    # usage_amount 행 잠금(UPSERT) 대기도 limiter 와 같이 이 트랜잭션에서만 제한한다.
+                    cursor.execute(_LOCK_TIMEOUT)
                     cursor.execute(
                         f"INSERT INTO {COSTS} (task_uuid, fitting_job_id, cost, usage_date) "
                         "VALUES (%s, %s, %s, %s) ON CONFLICT (task_uuid) DO NOTHING RETURNING task_uuid",

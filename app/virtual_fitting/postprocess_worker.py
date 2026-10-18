@@ -1,8 +1,8 @@
 """가상피팅 V2 AI 후처리 Worker (ai-fitting-response, 10단계).
 
 FastAPI lifespan 이 시작·종료한다(별도 실행 명령 없음). VIRTUAL_FITTING_POSTPROCESS_WORKER_ENABLED 기본 꺼짐.
-켜도 POSTPROCESS(11단계, 연결됨)·RUN_FALLBACK(13단계, 미연결) 핸들러가 모두 연결돼 있지 않으면 수신을 시작하지 않는다
-(not_ready).
+켜도 POSTPROCESS·RUN_FALLBACK 핸들러가 모두 연결돼 있지 않으면 수신을 시작하지 않는다(not_ready). 13단계부터 둘 다
+연결돼 있다(결과 발행 14단계·복구 15단계는 미구현).
 미구현 단계 때문에 실제 큐 메시지를 받기만 하고 지우지 못해 DLQ 로 보내는 일을 막는다.
 
 메시지 하나 처리(FollowUpProcessor.process):
@@ -13,7 +13,7 @@ FastAPI lifespan 이 시작·종료한다(별도 실행 명령 없음). VIRTUAL_
 
 | action       | 실행 대상(status / next_action)        | 핸들러(연결 단계) |
 | POSTPROCESS  | POSTPROCESSING / POSTPROCESS           | 11단계(연결됨)    |
-| RUN_FALLBACK | FALLBACK_RUNNING / RUN_FALLBACK        | 13단계            |
+| RUN_FALLBACK | FALLBACK_RUNNING / RUN_FALLBACK        | 13단계(연결됨)    |
 
 삭제는 (1) 결과 발행까지 끝난 같은 작업의 중복(COMPLETED/FAILED + PUBLISHED), 또는 (2) 핸들러가 완료를 알렸고
 DB 기록상 그 단계가 끝났으며 남은 일의 실제 경로가 있을 때(deletion_allowed + FollowUpPaths)만 한다. 메시지 수신·실행 권한
@@ -73,6 +73,9 @@ class HandlerStatus(str, Enum):
 class HandlerResult:
     status: HandlerStatus
     reason: str = ""
+    # 이 단계를 다른 action 의 처리로 넘겼다(예: POSTPROCESS 의 S3 확인 실패 → RUN_FALLBACK). Worker 가 그 action 의
+    # 내부 큐 메시지를 발행하고, 발행이 확인되고 그 핸들러가 연결돼 있을 때만 현재 메시지를 지운다.
+    handoff: NextAction | None = None
 
 
 @dataclass
@@ -125,14 +128,16 @@ class PostprocessHandlers:
 
 
 def connected_postprocess_handlers() -> PostprocessHandlers:
-    """실제 조립에 연결된 핸들러. POSTPROCESS 는 11단계 PostprocessHandler, RUN_FALLBACK 은 13단계 전까지 없음.
+    """실제 조립에 연결된 핸들러: POSTPROCESS(11단계 PostprocessHandler)와 RUN_FALLBACK(13단계 RunFallbackHandler).
 
-    두 핸들러가 모두 있어야 Worker 가 수신을 시작하므로 지금은 not_ready:run_fallback 이다(한쪽만으로 실제 큐를
-    소비하지 않는다). 설정값으로 채우지 않는다. PostprocessHandler 는 처음 불릴 때 DB·S3·LLM client 를 만든다.
+    두 핸들러가 모두 연결돼 not_ready 는 풀린다. 그래도 Worker 는 VIRTUAL_FITTING_POSTPROCESS_WORKER_ENABLED(기본 false)로만
+    켜지고, 결과 발행(14단계)·복구(15단계) 경로는 여전히 없다(FollowUpPaths 미준비 → 결과를 저장해도 메시지를 지우지 않음).
+    설정값으로 채우지 않는다. 두 핸들러는 처음 불릴 때 DB·S3·Runware client 를 만든다.
     """
+    from app.virtual_fitting.fallback_handler import RunFallbackHandler
     from app.virtual_fitting.postprocess_handler import PostprocessHandler
 
-    return PostprocessHandlers(postprocess=PostprocessHandler())
+    return PostprocessHandlers(postprocess=PostprocessHandler(), run_fallback=RunFallbackHandler())
 
 
 # --- 메시지 하나 처리 ---
@@ -199,6 +204,25 @@ class FollowUpProcessor:
             )
             return RequestOutcome(item.message_id, item.message.fitting_job_id, "error_kept")
 
+    def _hand_off(self, job: AsyncFittingJob, action: NextAction, name: str) -> tuple[str, bool]:
+        """다음 action 의 내부 큐 메시지를 발행한다(9단계와 같은 형식·비동기 task_uuid). DB 트랜잭션 밖에서 한다.
+
+        그 action 의 핸들러가 연결돼 있고 발행이 SUCCEEDED 일 때만 현재 메시지를 지운다. 실패·UNKNOWN 이면 남겨 두고
+        재수신 때 다시 발행한다(중복 발행 허용, 생성 1회는 DB 의 fallback 기록이 막는다).
+        """
+        if self._handlers.for_action(action) is None:
+            logger.warning(
+                "postprocess hand-off target not connected fitting_job_id=%s action=%s",
+                job.fitting_job_id,
+                action.value,
+            )
+            return f"{name}_target_not_connected_kept", False
+        from app.virtual_fitting.follow_up_queue import publish_follow_up
+
+        if not publish_follow_up(self._sqs, job, action).succeeded:
+            return f"{name}_publish_failed_kept", False
+        return f"{name}_deleted", True
+
     def _valid(self, item: ValidFollowUp) -> RequestOutcome:
         message = item.message
         job_id, action = message.fitting_job_id, message.action
@@ -232,6 +256,9 @@ class FollowUpProcessor:
         if _published(job):
             return outcome("already_published_deleted", delete=True)
         if not _waiting_for(job, action):
+            if action is NextAction.POSTPROCESS and _waiting_for(job, NextAction.RUN_FALLBACK):
+                # POSTPROCESS 가 RUN_FALLBACK 으로 넘긴 뒤의 재수신(예: 이전 발행 실패). 다음 메시지를 다시 발행한다.
+                return outcome(*self._hand_off(job, NextAction.RUN_FALLBACK, "republished"))
             # 오래된 메시지 등. 상태가 다르다고 완료로 단정하지 않는다(남은 일의 실제 경로가 있을 때만 삭제).
             return outcome("state_mismatch", delete=deletion_allowed(job, self._follow_up))
         handler = self._handlers.for_action(action)
@@ -300,6 +327,8 @@ class FollowUpProcessor:
             if latest is None or (_waiting_for(latest, action) and not _published(latest)):
                 # 핸들러는 완료라고 했지만 DB 에는 그 단계가 그대로 남아 있다.
                 return outcome("handler_done_not_recorded_kept")
+            if result.handoff is not None and _waiting_for(latest, result.handoff):
+                return outcome(*self._hand_off(latest, result.handoff, "handed_off"))
             return outcome(
                 "handler_done",
                 delete=_published(latest) or deletion_allowed(latest, self._follow_up),

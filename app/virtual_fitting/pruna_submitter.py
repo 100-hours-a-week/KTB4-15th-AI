@@ -176,6 +176,7 @@ class PrunaSubmitter:
         balance: Any,
         webhook_url: str,
         follow_up: FollowUpPaths | None = None,
+        follow_up_queue: Any = None,
         should_stop: Callable[[], bool] = lambda: False,
         max_wait_seconds: float = 60.0,
         poll_seconds: float = 2.0,
@@ -190,6 +191,8 @@ class PrunaSubmitter:
         self._budget, self._balance = budget, balance
         self._webhook_url = webhook_url
         self._follow_up = follow_up or NoFollowUpPaths()
+        # 제출 거절(재시도 가능 코드)로 RUN_FALLBACK 이 된 작업의 내부 큐 발행에 쓴다(SqsQueueClient). 없으면 발행하지 않는다.
+        self._follow_up_queue = follow_up_queue
         self._should_stop = should_stop
         self._max_wait, self._poll = max_wait_seconds, poll_seconds
         self._recheck_after, self._keepalive = recheck_after_seconds, keepalive_seconds
@@ -399,7 +402,19 @@ class PrunaSubmitter:
         )
 
     def _decide(self, job_id: int) -> bool:
+        from app.virtual_fitting.follow_up_queue import publish_follow_up, waiting_for_fallback
+
         latest = self._jobs.find_by_fitting_job_id(job_id)
+        if waiting_for_fallback(latest) and self._follow_up_queue is not None:
+            # 거절로 RUN_FALLBACK 이 됐다. DB 커밋 뒤(트랜잭션 밖) RUN_FALLBACK 을 발행하고, 등록이 확인될 때만 요청 메시지를
+            # 지운다(다음 실행 경로 확보). 실패·UNKNOWN 이면 남겨 두고 재수신 때 다시 발행한다.
+            published = publish_follow_up(
+                self._follow_up_queue, latest, NextAction.RUN_FALLBACK
+            ).succeeded
+            logger.info(
+                "pruna submit fallback hand-off fitting_job_id=%s published=%s", job_id, published
+            )
+            return published
         allowed = deletion_allowed(latest, self._follow_up)
         logger.info(
             "pruna submit message decision fitting_job_id=%s next_step=%s delete=%s",

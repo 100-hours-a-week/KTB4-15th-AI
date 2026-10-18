@@ -528,14 +528,17 @@ def test_db_error_does_not_reset_or_add_attempts(db, monkeypatch):  # noqa: F811
     assert counts(db)[1] == 3 and len(comments.comment_calls) == 2  # 남은 2회만, 한도 그대로
 
 
-def test_real_assembly_with_only_postprocess_is_not_ready():
+def test_postprocess_alone_is_still_not_ready():
     from app.virtual_fitting import postprocess_worker as pw
 
     handlers = pw.connected_postprocess_handlers()
     assert isinstance(handlers.postprocess, PostprocessHandler)
-    assert handlers.missing() == ["run_fallback"]
+    alone = PostprocessHandlers(
+        postprocess=handlers.postprocess
+    )  # 한쪽만으로 실제 큐를 소비하지 않는다
+    assert alone.missing() == ["run_fallback"]
     with pytest.raises(ValueError):
-        pw.create_postprocess_worker(handlers)
+        pw.create_postprocess_worker(alone)
 
 
 # --- 코멘트는 성공, 제목만 실패 ---

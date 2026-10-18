@@ -32,6 +32,8 @@ from app.virtual_fitting.repositories.async_job_repository import (
 MIGRATION = (
     Path(__file__).resolve().parents[1] / "scripts" / "db" / "virtual_fitting_async_jobs.sql"
 )
+# 13단계 변경 SQL(fallback 진행 기록 컬럼). 신규 생성 SQL 뒤에 적용한다(배포 순서와 같음).
+FALLBACK_MIGRATION = MIGRATION.with_name("virtual_fitting_fallback.sql")
 KST = timezone(timedelta(hours=9))
 REQUESTED_AT = datetime(2026, 10, 13, 9, 30, tzinfo=KST)  # = 2026-10-13 00:30 UTC
 TASK_UUID = "a770f077-f413-47de-9dac-be0b26a35da6"
@@ -113,9 +115,10 @@ def test_insert_never_overwrites_an_existing_job():
 
 
 def _migration_columns():
+    """신규 생성 SQL 의 컬럼 뒤에 변경 SQL(13단계 fallback)이 ADD COLUMN 으로 붙이는 컬럼을 순서대로 잇는다."""
     text = MIGRATION.read_text(encoding="utf-8")
     body = text[text.index("CREATE TABLE") :]
-    return [
+    created = [
         match.group(1)
         for match in re.finditer(
             r"^\s{4}([a-z0-9_]+)\s+(?:bigint|text|uuid|timestamptz|jsonb|integer)",
@@ -123,6 +126,10 @@ def _migration_columns():
             re.MULTILINE,
         )
     ]
+    added = re.findall(
+        r"ADD COLUMN IF NOT EXISTS ([a-z0-9_]+)\s", FALLBACK_MIGRATION.read_text(encoding="utf-8")
+    )
+    return created + added
 
 
 def test_model_columns_match_migration_file():
@@ -150,6 +157,7 @@ def pg():
     options = f"-c search_path={schema} -c TimeZone=America/Los_Angeles"
     with psycopg.connect(url, autocommit=True, options=options) as connection:
         connection.execute(MIGRATION.read_text(encoding="utf-8"))
+        connection.execute(FALLBACK_MIGRATION.read_text(encoding="utf-8"))
     pool = ConnectionPool(url, min_size=1, max_size=2, kwargs={"options": options}, open=True)
 
     def sql(statement, params=None):
@@ -540,6 +548,9 @@ EXPECTED_COLUMNS = {
     "s3_check_attempt_count": ("integer", "NO"),
     "worker_lease_token": ("text", "YES"),
     "worker_lease_until": ("timestamp with time zone", "YES"),
+    "fallback_task_uuid": ("uuid", "YES"),
+    "fallback_started_at": ("timestamp with time zone", "YES"),
+    "fallback_image_key": ("text", "YES"),
 }
 
 
@@ -573,4 +584,5 @@ def test_migration_can_run_again(pg):
     AsyncJobRepository(pg["pool"]).create(_new_job())
     with psycopg.connect(pg["url"], autocommit=True, options=pg["options"]) as connection:
         connection.execute(MIGRATION.read_text(encoding="utf-8"))
+        connection.execute(FALLBACK_MIGRATION.read_text(encoding="utf-8"))
     assert pg["sql"]("SELECT count(*) FROM virtual_fitting_async_jobs") == [(1,)]
