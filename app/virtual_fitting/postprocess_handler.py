@@ -13,17 +13,14 @@ Presigned 발급 뒤 LLM 호출, 저장) 직전마다 context.may_continue() 로
    - 이 핸들러가 두 번째 묶음을 현재 lease 로 끝까지 돌렸고 마지막 HEAD 가 NOT_FOUND 일 때만 move_to_fallback.
      마지막이 일시 오류면 객체가 없다고 단정하지 않고 보류한다.
    - 횟수를 이미 다 썼는데(이전 Worker 가 두 번째 묶음 도중 멈췄을 수 있음) 확인 결과를 모르면 보류한다(15단계 복구 대상).
-2. 제목·코멘트 (확인한 이미지로만, S3 확인으로 되돌아가지 않음)
-   - 시도 1회 = V1 RunwareCommentProvider 의 comment + title 한 쌍(HTTP 2번, 내부 재시도 없음).
-   - 매 시도(반복):
-     a. DB 의 최신 작업 기록을 읽는다. 결과가 이미 있으면 덮어쓰지 않고 끝내고, 상태(POSTPROCESSING / POSTPROCESS,
-        같은 확인 이미지)나 실행 권한(holds_lease)이 유효하지 않으면 보류한다.
-     b. llm_generation_attempt_count 가 이미 한도(3)면 URL 을 만들지 않고 V1 기본 문구로 저장한다.
-     c. 남은 횟수가 있으면 확인한 Key 로 Presigned GET 을 새로 발급한다(만료 VIRTUAL_FITTING_RESULT_IMAGE_URL_EXPIRES_SECONDS).
-        서명 실패는 S3 오류로 보류하고 LLM 시도를 쓰지 않는다. URL 은 저장·로그하지 않는다.
-     d. claim_llm_generation_attempt(최초 포함 최대 3회, < 3, 되돌리지 않음)로 실행 권한·상태·한도를 원자적으로 다시
-        확인하고 횟수를 확보한다. a·b 는 불필요한 서명을 줄이기 위한 확인이고, 호출 허용은 이 조건부 확보가 최종 판단한다.
-     e. 확보했을 때만 comment → 그 comment 로 title. 실패(FittingPostprocessError·잘못된 응답)면 a 부터 다시.
+2. 코멘트·제목 (확인한 이미지로만, S3 확인으로 되돌아가지 않음) — title_and_comment
+   - V1 RunwareCommentProvider 를 쓴다(호출 1번 = HTTP 1번, 내부 재시도 없음). 재시도는 이 함수 한 곳에서만 한다.
+   - 코멘트: 최초 1회 + 재시도 1회. 두 번 모두 실패하면 제목은 부르지 않고 기본 코멘트 + 기본 제목.
+   - 제목: 성공한 코멘트로 최초 1회 + 재시도 1회(재시도에도 같은 코멘트). 두 번 모두 실패하면 생성 코멘트 + 기본 제목.
+     앞뒤 공백 제거 후 1~100자만 통과(초과는 실패, 잘라서 저장하지 않음).
+   - 호출마다: 최신 기록·상태·실행 권한 확인 → (코멘트만) 확인한 Key 로 새 Presigned GET → claim_llm_generation_attempt
+     (호출 1번 = 1, 최대 코멘트 2 + 제목 2 = 4, 되돌리지 않음)로 원자적으로 횟수 확보 → 호출. 서명 실패는 S3 오류로 보류하고
+     횟수를 쓰지 않는다. 종료·실행 권한 상실·상태 변경은 보류(기본 문구로 성공 처리하지 않음), DB 오류는 그대로 올린다.
 3. 저장: save_final_result 로 COMPLETED 결과(result_image_key = 확인한 이미지 Key)와 PUBLISH_RESULT 를 함께 저장한다.
    이미 결과가 있으면 덮어쓰지 않는다. 결과 발행·최종 상태 확정(14단계)은 하지 않는다.
 LLM 이 실패해도 이미지 생성 성공은 유지한다(기본 문구로 COMPLETED, fallback·Pruna 재생성 없음).
@@ -43,10 +40,21 @@ from app.virtual_fitting.repositories.async_job_repository import (
     AsyncJobStatus,
     NextAction,
 )
-from app.virtual_fitting.repositories.async_job_state import LLM_GENERATION_LIMIT, ChangeReason
+from app.virtual_fitting.repositories.async_job_state import (
+    LLM_COMMENT_ATTEMPT_LIMIT,
+    LLM_GENERATION_LIMIT,
+    LLM_TITLE_ATTEMPT_LIMIT,
+    ChangeReason,
+)
 from app.virtual_fitting.service import FALLBACK_COMMENT, FALLBACK_TITLE
 
 logger = logging.getLogger(__name__)
+
+COMMENT_ATTEMPT_LIMIT = LLM_COMMENT_ATTEMPT_LIMIT  # 최초 1회 + 재시도 1회
+TITLE_ATTEMPT_LIMIT = LLM_TITLE_ATTEMPT_LIMIT  # 최초 1회 + 재시도 1회(같은 코멘트로)
+# 저장할 제목의 최대 길이(앞뒤 공백 제거 후). BE fitting_temp_result.outfit_name(varchar 100)과 같다.
+# 프롬프트의 목표(10~20자)를 벗어났다는 이유로는 실패시키지 않는다.
+TITLE_MAX_LENGTH = 100
 
 # 한 묶음 안에서 HEAD 를 보내는 시점(묶음 시작 기준, 초).
 S3_CHECK_OFFSETS = (0.0, 2.0, 7.0)
@@ -263,8 +271,15 @@ def title_and_comment(
     stage_ok: Callable[[AsyncFittingJob], bool],
     expires_in: int | None = None,
 ) -> tuple[str | None, str | None, HandlerResult | None]:
-    """확인한 이미지 key 로 제목·코멘트를 만든다(comment + title 한 쌍 = 1회, 최초 포함 최대 3회, 소진 시 V1 기본 문구).
+    """확인한 이미지 key 로 코멘트 → 제목을 만든다. 항목별 최초 1회 + 재시도 1회(각 최대 2회).
 
+    - 코멘트가 두 번 모두 실패하면 제목은 부르지 않고 기본 코멘트 + 기본 제목.
+    - 코멘트가 성공하면 그 코멘트로 제목을 최대 2회(재시도에도 같은 코멘트, 코멘트를 다시 만들지 않음).
+      제목이 두 번 모두 실패하면 생성 코멘트 + 기본 제목.
+    - 실패: FittingPostprocessError(HTTP 오류·timeout·잘린 응답·빈 응답·콘텐츠 필터 등 Provider 판단)·ValueError·빈 문자열,
+      제목은 앞뒤 공백 제거 후 TITLE_MAX_LENGTH 자 초과도 실패(잘라서 저장하지 않음).
+    - 호출마다 직전에 claim_llm_generation_attempt 로 DB 횟수를 확보한다(재수신·재시작에도 초기화하지 않는 호출 한도).
+    - 종료·실행 권한 상실·상태 변경·DB 오류는 기본 문구로 성공 처리하지 않는다(보류하거나 예외를 그대로 올림).
     deps 는 jobs·state·products·storage·comments 를 가진다. stage_ok 는 최신 기록이 아직 이 단계(POSTPROCESS 또는
     RUN_FALLBACK, 같은 이미지)인지 본다. 반환: (제목, 코멘트, None) 또는 (None, None, 멈출 때의 HandlerResult).
     """
@@ -278,64 +293,103 @@ def title_and_comment(
         return FALLBACK_TITLE, FALLBACK_COMMENT, None
     from app.virtual_fitting.async_storage import result_image_get_url
 
-    while True:
+    def gate(where: str) -> tuple[AsyncFittingJob | None, HandlerResult | None]:
+        """호출 직전 확인(URL 서명·횟수 확보 전). 최종 허용 판단은 claim 의 조건부 확보다."""
         if not context.may_continue():
-            return None, None, HandlerResult(HandlerStatus.DEFERRED, "stopped_before_llm")
-        # a. 최신 기록 확인(불필요한 URL 서명을 줄이기 위한 확인, 최종 판단은 d 의 조건부 확보).
+            return None, HandlerResult(HandlerStatus.DEFERRED, f"stopped_before_{where}")
         latest = deps.jobs.find_by_fitting_job_id(job_id)
         if latest is None:
-            return None, None, HandlerResult(HandlerStatus.DEFERRED, "job_missing")
+            return None, HandlerResult(HandlerStatus.DEFERRED, "job_missing")
         if latest.result_payload is not None:
-            return None, None, HandlerResult(HandlerStatus.DONE, "result_already_saved")
+            return None, HandlerResult(HandlerStatus.DONE, "result_already_saved")
         if not stage_ok(latest):
-            return None, None, HandlerResult(HandlerStatus.DEFERRED, "llm_state_changed")
+            return None, HandlerResult(HandlerStatus.DEFERRED, "llm_state_changed")
         if not deps.state.holds_lease(job_id, token):
-            return None, None, HandlerResult(HandlerStatus.DEFERRED, "llm_lease_lost")
-        # b. 이미 한도면 URL 을 만들지 않는다.
+            return None, HandlerResult(HandlerStatus.DEFERRED, "llm_lease_lost")
+        return latest, None
+
+    def claim() -> tuple[bool, HandlerResult | None]:
+        """(확보됨, 멈출 결과). 한도 소진이면 (False, None) — 그 항목은 기본 문구로."""
+        change = deps.state.claim_llm_generation_attempt(job_id, token)
+        if change.applied:
+            return True, None
+        if change.reason is ChangeReason.LIMIT_REACHED:
+            logger.info("postprocess llm call budget exhausted fitting_job_id=%s", job_id)
+            return False, None
+        return False, HandlerResult(HandlerStatus.DEFERRED, f"llm_claim_{change.reason.value}")
+
+    def failed(item: str, attempt: int, reason: str) -> None:
+        logger.warning(
+            "postprocess llm %s attempt failed fitting_job_id=%s attempt=%s/%s reason=%s",
+            item,
+            job_id,
+            attempt,
+            COMMENT_ATTEMPT_LIMIT if item == "comment" else TITLE_ATTEMPT_LIMIT,
+            reason,
+        )
+
+    # 1. 코멘트(최대 2회)
+    comment: str | None = None
+    for attempt in range(1, COMMENT_ATTEMPT_LIMIT + 1):
+        latest, stop = gate("llm")
+        if stop is not None:
+            return None, None, stop
         if latest.llm_generation_attempt_count >= LLM_GENERATION_LIMIT:
-            logger.info(
-                "postprocess llm attempts exhausted fitting_job_id=%s; default text", job_id
-            )
-            return FALLBACK_TITLE, FALLBACK_COMMENT, None
-        # c. 남은 횟수가 있을 때만 새 URL.
+            break  # 이미 한도면 URL 을 만들지 않는다(쓰지 않을 서명 없음)
         try:
+            # 남은 횟수가 있을 때만 새 URL 을 만든다(한도 확인은 claim 이 최종 판단, URL 은 저장·로그하지 않음).
             url = result_image_get_url(deps.storage, key, expires_in=expires_in)
         except ImageStorageError:
             # S3 서명 설정 문제(LLM 오류와 구분). 시도 횟수를 쓰지 않고 보류한다.
             logger.exception("postprocess result image url failed fitting_job_id=%s", job_id)
             return None, None, HandlerResult(HandlerStatus.DEFERRED, "s3_presign_failed")
-        # d. 실행 권한·상태·한도를 원자적으로 다시 확인하고 횟수를 확보한다(호출 허용의 최종 판단).
-        claim = deps.state.claim_llm_generation_attempt(job_id, token)
-        if not claim.applied:
-            if claim.reason is ChangeReason.LIMIT_REACHED:
-                logger.info(
-                    "postprocess llm attempts exhausted fitting_job_id=%s; default text", job_id
-                )
-                return FALLBACK_TITLE, FALLBACK_COMMENT, None
-            return (
-                None,
-                None,
-                HandlerResult(HandlerStatus.DEFERRED, f"llm_claim_{claim.reason.value}"),
-            )
-        attempt = claim.job.llm_generation_attempt_count
+        claimed, stop = claim()
+        if stop is not None:
+            return None, None, stop
+        if not claimed:
+            break
         try:
-            comment = deps.comments.generate_comment(url, summaries)
-            if not context.may_continue():
-                return None, None, HandlerResult(HandlerStatus.DEFERRED, "stopped_between_llm")
-            title = deps.comments.generate_title(comment)
+            text = deps.comments.generate_comment(url, summaries)
         except (FittingPostprocessError, ValueError) as error:
-            logger.warning(
-                "postprocess llm attempt failed fitting_job_id=%s attempt=%s error=%s",
-                job_id,
-                attempt,
-                type(error).__name__,
-            )
+            failed("comment", attempt, type(error).__name__)
             continue
-        if _usable(title) and _usable(comment):
-            return title.strip(), comment.strip(), None
-        logger.warning(
-            "postprocess llm returned empty text fitting_job_id=%s attempt=%s", job_id, attempt
+        if _usable(text):
+            comment = text.strip()
+            break
+        failed("comment", attempt, "empty")
+    if comment is None:
+        logger.info(
+            "postprocess comment failed fitting_job_id=%s; default comment and title", job_id
         )
+        return FALLBACK_TITLE, FALLBACK_COMMENT, None
+
+    # 2. 제목(같은 코멘트로 최대 2회)
+    for attempt in range(1, TITLE_ATTEMPT_LIMIT + 1):
+        _, stop = gate("title")
+        if stop is not None:
+            return None, None, stop
+        claimed, stop = claim()
+        if stop is not None:
+            return None, None, stop
+        if not claimed:
+            break
+        try:
+            text = deps.comments.generate_title(comment)
+        except (FittingPostprocessError, ValueError) as error:
+            failed("title", attempt, type(error).__name__)
+            continue
+        if not _usable(text):
+            failed("title", attempt, "empty")
+            continue
+        title = text.strip()
+        if len(title) > TITLE_MAX_LENGTH:
+            failed("title", attempt, "too_long")  # 잘라서 저장하지 않는다
+            continue
+        return title, comment, None
+    logger.info(
+        "postprocess title failed fitting_job_id=%s; generated comment + default title", job_id
+    )
+    return FALLBACK_TITLE, comment, None
 
 
 def save_completed(

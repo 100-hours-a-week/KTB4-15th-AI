@@ -158,7 +158,8 @@ def test_success_saves_verified_image_result_and_publish_result(db):  # noqa: F8
     assert current.next_action is NextAction.PUBLISH_RESULT
     assert current.status is AsyncJobStatus.POSTPROCESSING  # 최종 상태 확정은 14단계
     assert current.result_message_status.value == "PENDING"
-    assert counts(db) == (1, 1, 0, 0)
+    assert counts(db) == (1, 2, 0, 0)  # LLM 호출 2번(코멘트 1·제목 1)
+    assert len(e.llm.comment_calls) == 1 and len(e.llm.title_calls) == 1
     assert e.storage.heads == [(KEY, 0.0)]  # async_image_key 로 HEAD 한 번
     # LLM 에는 확인한 결과 이미지의 새 Presigned GET URL 과 상품 설명 요약이 들어간다.
     ((url, summaries),) = e.llm.comment_calls
@@ -239,7 +240,7 @@ def test_verified_image_is_reused_without_head(db):  # noqa: F811
     e = env(db)
     run(db, e)
     assert e.storage.heads == [] and job(db).result_payload == success_payload()
-    assert counts(db) == (1, 1, 0, 0)
+    assert counts(db) == (1, 2, 0, 0)
 
 
 def test_exhausted_s3_checks_with_a_verified_image_still_run_llm(db):  # noqa: F811
@@ -309,28 +310,33 @@ def test_concurrent_claims_never_exceed_two_bundles(db):  # noqa: F811
 # --- LLM ---
 
 
-def test_llm_failures_retry_with_new_urls_without_s3_again(db):  # noqa: F811
+def test_comment_and_title_each_retry_once_with_new_urls_without_s3_again(db):  # noqa: F811
     postprocessing(db)
     comments = FakeComments(
-        comments=(FittingPostprocessError("x"), "코멘트 두 번째", "코멘트 세 번째"),
-        titles=(FittingPostprocessError("y"), "제목 세 번째"),
+        comments=(FittingPostprocessError("x"), "코멘트 두 번째", "쓰이지 않음"),
+        titles=(FittingPostprocessError("y"), "제목 두 번째", "쓰이지 않음"),
     )
     e = env(db, [EXISTS], comments=comments)
     run(db, e)
     assert len(e.storage.heads) == 1  # S3 확인은 처음 한 번만
-    assert [key for key, _ in e.storage.urls] == [KEY, KEY, KEY]  # 같은 Key, 시도마다 새 URL
+    assert [key for key, _ in e.storage.urls] == [KEY, KEY]  # 같은 Key, 코멘트 시도마다 새 URL
     urls = [url for url, _ in comments.comment_calls]
-    assert len(set(urls)) == 3
-    assert counts(db)[1] == 3
-    assert job(db).result_payload == success_payload("제목 세 번째", "코멘트 세 번째")
+    assert len(urls) == len(set(urls)) == 2  # 코멘트 2회
+    assert comments.title_calls == [
+        "코멘트 두 번째",
+        "코멘트 두 번째",
+    ]  # 제목 2회, 같은 성공 코멘트로
+    assert counts(db)[1] == 4
+    assert job(db).result_payload == success_payload("제목 두 번째", "코멘트 두 번째")
 
 
-def test_three_failures_use_default_text_and_keep_the_image_success(db):  # noqa: F811
+def test_comment_failing_twice_uses_defaults_without_a_title_call(db):  # noqa: F811
     postprocessing(db)
     comments = FakeComments(comments=[FittingPostprocessError("x")] * 5)
     e = env(db, [EXISTS], comments=comments)
     run(db, e)
-    assert len(comments.comment_calls) == 3 and counts(db)[1] == 3  # 4번째 호출 없음
+    assert len(comments.comment_calls) == 2 and counts(db)[1] == 2  # 3번째 호출 없음
+    assert comments.title_calls == []  # 코멘트가 없으면 제목을 부르지 않는다
     current = job(db)
     assert current.result_payload == success_payload(FALLBACK_TITLE, FALLBACK_COMMENT)
     assert (
@@ -344,43 +350,44 @@ def test_already_exhausted_llm_attempts_use_default_text_without_calls(db):  # n
     postprocessing(db)
     verified(db)
     db["sql"](
-        "UPDATE virtual_fitting_async_jobs SET llm_generation_attempt_count = 3 WHERE fitting_job_id = %s",
+        "UPDATE virtual_fitting_async_jobs SET llm_generation_attempt_count = 4 WHERE fitting_job_id = %s",
         (JOB,),
     )
     e = env(db)
     run(db, e)
     assert e.llm.comment_calls == [] and e.storage.heads == [] and e.storage.urls == []
     assert job(db).result_payload == success_payload(FALLBACK_TITLE, FALLBACK_COMMENT)
-    assert counts(db)[1] == 3
+    assert counts(db)[1] == 4
 
 
 def test_redelivery_uses_only_the_remaining_llm_attempts(db):  # noqa: F811
     postprocessing(db)
     verified(db)
     db["sql"](
-        "UPDATE virtual_fitting_async_jobs SET llm_generation_attempt_count = 2 WHERE fitting_job_id = %s",
+        "UPDATE virtual_fitting_async_jobs SET llm_generation_attempt_count = 3 WHERE fitting_job_id = %s",
         (JOB,),
     )
-    comments = FakeComments(comments=[FittingPostprocessError("x")] * 5)
+    comments = FakeComments(comments=["남은 한 번으로 만든 코멘트"])
     e = env(db, comments=comments)
     run(db, e)
-    assert len(comments.comment_calls) == 1 and counts(db)[1] == 3
-    assert len(e.storage.urls) == 1  # 남은 한 쌍에 필요한 URL 만
-    assert job(db).result_payload["llm_title"] == FALLBACK_TITLE
+    # 호출 한도(4)가 1번만 남았다: 코멘트 1번으로 다 쓰고, 제목은 부르지 않고 기본 제목(초기화 없음).
+    assert len(comments.comment_calls) == 1 and comments.title_calls == [] and counts(db)[1] == 4
+    assert len(e.storage.urls) == 1
+    assert job(db).result_payload == success_payload(FALLBACK_TITLE, "남은 한 번으로 만든 코멘트")
 
 
 @pytest.mark.parametrize("bad", ["", "   "])
 def test_empty_llm_text_is_not_a_success(db, bad):  # noqa: F811
     postprocessing(db)
-    comments = FakeComments(comments=[bad, "정상 코멘트"], titles=["무시됨", "정상 제목"])
+    comments = FakeComments(comments=[bad, "정상 코멘트"], titles=["정상 제목"])
     e = env(db, [EXISTS], comments=comments)
     run(db, e)
-    assert counts(db)[1] == 2
+    assert counts(db)[1] == 3 and comments.title_calls == ["정상 코멘트"]
     assert job(db).result_payload == success_payload("정상 제목", "정상 코멘트")
 
 
-def test_real_provider_makes_at_most_two_http_requests_per_attempt(db):  # noqa: F811
-    """V1 Provider 를 그대로 쓴다. urllib 한 번씩이라 SDK 내부 재시도가 없다(3회 → 최대 6요청)."""
+def test_real_provider_makes_one_http_request_per_attempt(db):  # noqa: F811
+    """V1 Provider 를 그대로 쓴다. urllib 한 번씩이라 내부 재시도가 없다(코멘트 2회 실패 → 요청 2번, 제목 없음)."""
     postprocessing(db)
     requests = []
 
@@ -391,7 +398,7 @@ def test_real_provider_makes_at_most_two_http_requests_per_attempt(db):  # noqa:
     provider = RunwareCommentProvider("k", opener=opener)
     e = env(db, [EXISTS], comments=provider)
     run(db, e)
-    assert len(requests) == 3  # comment 가 매번 실패해 title 은 부르지 않았다
+    assert len(requests) == 2  # comment 가 두 번 모두 실패해 title 은 부르지 않았다
     assert all(timeout == 30.0 for _, timeout in requests)
     assert job(db).result_payload["llm_comment"] == FALLBACK_COMMENT
 
@@ -521,11 +528,12 @@ def test_db_error_does_not_reset_or_add_attempts(db, monkeypatch):  # noqa: F811
 
     monkeypatch.setattr(db["state"], "save_final_result", broken)
     first = run(db, env(db))
-    assert first.action == "handler_error_kept" and counts(db)[1] == 1
+    assert first.action == "handler_error_kept" and counts(db)[1] == 2  # 코멘트 1·제목 1 호출
     monkeypatch.setattr(db["state"], "save_final_result", real)
     comments = FakeComments(comments=[FittingPostprocessError("x")] * 5)
     run(db, env(db, comments=comments))
-    assert counts(db)[1] == 3 and len(comments.comment_calls) == 2  # 남은 2회만, 한도 그대로
+    assert counts(db)[1] == 4 and len(comments.comment_calls) == 2  # 남은 2번만, 한도 그대로
+    assert job(db).result_payload == success_payload(FALLBACK_TITLE, FALLBACK_COMMENT)
 
 
 def test_postprocess_alone_is_still_not_ready():
@@ -544,30 +552,24 @@ def test_postprocess_alone_is_still_not_ready():
 # --- 코멘트는 성공, 제목만 실패 ---
 
 
-def test_title_only_failures_count_pairs_and_stop_after_three(db):  # noqa: F811
+def test_title_failing_twice_keeps_the_generated_comment_with_the_default_title(db):  # noqa: F811
     postprocessing(db)
     comments = FakeComments(
-        comments=("코멘트 1", "코멘트 2", "코멘트 3", "코멘트 4"),
+        comments=("코멘트 1", "코멘트 2", "코멘트 3"),
         titles=[FittingPostprocessError("title failed")] * 4,
     )
     e = env(db, [EXISTS], comments=comments)
     outcome = run(db, e)
 
-    # 시도 1회 = comment + title 한 쌍. 3회까지만, 4번째 시도 없음.
-    assert len(comments.comment_calls) == 3 and len(comments.title_calls) == 3
+    # 코멘트는 첫 시도에 성공했으므로 다시 만들지 않는다. 제목만 같은 코멘트로 최대 2회.
+    assert len(comments.comment_calls) == 1
+    assert comments.title_calls == ["코멘트 1", "코멘트 1"]
     assert counts(db)[1] == 3
-    # 각 제목 생성에는 그 시도에서 만든 코멘트를 쓴다.
-    assert comments.title_calls == ["코멘트 1", "코멘트 2", "코멘트 3"]
-    # 시도마다 새 URL(같은 Key). 횟수를 다 쓴 뒤에는 URL 을 만들지 않는다(쓰지 않는 서명 없음).
-    assert [key for key, _ in e.storage.urls] == [KEY, KEY, KEY]
-    used = [url for url, _ in comments.comment_calls]
-    assert used == [
-        f"https://bucket.s3.ap-northeast-2.amazonaws.com/{KEY}?X-Amz-Signature=SIG{n}"
-        for n in range(1, 4)
-    ]
-    # 3회 모두 제목 실패 → 기본 제목·코멘트(성공한 코멘트도 쓰지 않음), 이미지 성공 유지
+    # 이미지 URL 은 코멘트 시도에만(제목에는 이미지가 필요 없다).
+    assert [key for key, _ in e.storage.urls] == [KEY]
+    # 제목 2회 모두 실패 → 생성 코멘트 유지 + 기본 제목, 이미지 성공 유지
     current = job(db)
-    assert current.result_payload == success_payload(FALLBACK_TITLE, FALLBACK_COMMENT)
+    assert current.result_payload == success_payload(FALLBACK_TITLE, "코멘트 1")
     assert current.result_payload["status"] == "COMPLETED"
     assert current.result_image_key == KEY and current.verified_image_key == KEY
     assert current.next_action is NextAction.PUBLISH_RESULT
@@ -606,15 +608,237 @@ def test_title_only_failures_through_the_real_v1_provider_http_calls(db):  # noq
     e = env(db, [EXISTS], comments=provider)
     run(db, e)
 
-    assert [kind for kind, _ in requests] == ["comment", "title"] * 3  # 실제 HTTP 6번, 7번째 없음
-    # 각 title 요청에는 같은 시도의 comment 응답이 들어간다(V1 build_title_request 형식).
-    assert [text for kind, text in requests if kind == "title"] == [
-        "코디 설명: 코멘트 1",
-        "코디 설명: 코멘트 2",
-        "코디 설명: 코멘트 3",
-    ]
+    assert [kind for kind, _ in requests] == [
+        "comment",
+        "title",
+        "title",
+    ]  # 실제 HTTP 3번, 4번째 없음
+    # 제목 재시도에도 같은 성공 코멘트(V1 build_title_request 형식), 코멘트는 다시 만들지 않는다.
+    assert [text for kind, text in requests if kind == "title"] == ["코디 설명: 코멘트 1"] * 2
     assert counts(db)[1] == 3
+    assert job(db).result_payload == success_payload(FALLBACK_TITLE, "코멘트 1")
+
+
+@pytest.mark.parametrize("title_failure", ["length", "http_400"])
+def test_title_token_limit_failures_use_two_title_attempts_then_the_default_title(
+    db,  # noqa: F811
+    title_failure,
+):
+    """제목이 출력 한도로 실패하는 두 형태(HTTP 200 finish_reason=length, HTTP 400)를 실제 V1 Provider 로."""
+    import io
+    import json
+    from urllib.error import HTTPError
+
+    postprocessing(db)
+    sent = []
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    def opener(request, timeout):
+        payload = json.loads(request.data)
+        user = payload["messages"][1]["content"]
+        kind = "comment" if isinstance(user, list) else "title"
+        sent.append((kind, payload["max_completion_tokens"], user if kind == "title" else None))
+        if kind == "comment":
+            n = sum(1 for k, *_ in sent if k == "comment")
+            body = {"choices": [{"message": {"content": f"코멘트 {n}"}, "finish_reason": "stop"}]}
+            return Response(json.dumps(body).encode())
+        if title_failure == "length":
+            body = {"choices": [{"message": {"content": "잘린"}, "finish_reason": "length"}]}
+            return Response(json.dumps(body).encode())
+        raise HTTPError(
+            request.full_url, 400, "bad request", {}, io.BytesIO(b'{"error": {"message": "limit"}}')
+        )
+
+    e = env(db, [EXISTS], comments=RunwareCommentProvider("k", opener=opener))
+    run(db, e)
+
+    # 재시도에도 같은 토큰 한도(코멘트 512·제목 1024), 제목 재시도는 같은 성공 코멘트로
+    assert [(kind, limit) for kind, limit, _ in sent] == [
+        ("comment", 512),
+        ("title", 1024),
+        ("title", 1024),
+    ]
+    assert [text for kind, _, text in sent if kind == "title"] == ["코디 설명: 코멘트 1"] * 2
+    current = job(db)
+    assert current.result_payload == success_payload(FALLBACK_TITLE, "코멘트 1")
+    assert current.verified_image_key == KEY and current.next_action is NextAction.PUBLISH_RESULT
+    assert counts(db) == (1, 3, 0, 0)  # S3 확인 1회 유지, LLM 호출 3번, fallback·결과 전송 0
+    assert len(e.storage.heads) == 1  # 이미지 재확인·재생성 없음
+    run(db, e)  # 재수신: 결과가 있어 추가 호출 없음
+    assert len(sent) == 3 and counts(db) == (1, 3, 0, 0)
+
+
+# --- 항목별 재시도 정책(코멘트·제목 각각 최초 1회 + 재시도 1회) ---
+
+
+def test_title_retry_succeeds_with_the_same_first_comment(db):  # noqa: F811
+    postprocessing(db)
+    comments = FakeComments(
+        comments=["첫 코멘트", "쓰이지 않음"], titles=[FittingPostprocessError("x"), "두 번째 제목"]
+    )
+    e = env(db, [EXISTS], comments=comments)
+    run(db, e)
+    assert len(comments.comment_calls) == 1  # 제목 실패로 코멘트를 다시 만들지 않는다
+    assert comments.title_calls == ["첫 코멘트", "첫 코멘트"]
+    assert job(db).result_payload == success_payload("두 번째 제목", "첫 코멘트")
+    assert counts(db) == (1, 3, 0, 0)
+
+
+FAILURE_KINDS = ["http_500", "timeout", "length", "content_filter", "empty"]
+
+
+def _scripted_provider(failures):
+    """실제 RunwareCommentProvider 에 HTTP 계층만 가짜. failures: {"comment": [...], "title": [...]} 차례로 쓰는 응답 종류."""
+    import io
+    import json
+    from urllib.error import HTTPError
+
+    sent = []
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    def reply(content, finish_reason="stop"):
+        return Response(
+            json.dumps(
+                {"choices": [{"message": {"content": content}, "finish_reason": finish_reason}]}
+            ).encode()
+        )
+
+    def opener(request, timeout):
+        payload = json.loads(request.data)
+        user = payload["messages"][1]["content"]
+        kind = "comment" if isinstance(user, list) else "title"
+        sent.append((kind, payload["max_completion_tokens"], user if kind == "title" else None))
+        mode = failures[kind].pop(0) if failures[kind] else "ok"
+        if mode == "http_500":
+            raise HTTPError(request.full_url, 500, "x", {}, io.BytesIO(b"{}"))
+        if mode == "timeout":
+            raise TimeoutError()
+        if mode == "length":
+            return reply("잘린", finish_reason="length")
+        if mode == "content_filter":
+            return reply("차단", finish_reason="content_filter")
+        if mode == "empty":
+            return reply("   ")
+        if isinstance(mode, str) and mode.startswith("text:"):
+            return reply(mode[5:])
+        return reply("생성 코멘트" if kind == "comment" else "생성 제목")
+
+    return RunwareCommentProvider("k", opener=opener), sent
+
+
+@pytest.mark.parametrize("failure", FAILURE_KINDS)
+def test_each_failure_kind_gets_one_retry_per_item(db, failure):  # noqa: F811
+    postprocessing(db)
+    provider, sent = _scripted_provider({"comment": [failure], "title": [failure]})
+    e = env(db, [EXISTS], comments=provider)
+    run(db, e)
+    assert [(kind, limit) for kind, limit, _ in sent] == [
+        ("comment", 512),
+        ("comment", 512),
+        ("title", 1024),
+        ("title", 1024),
+    ]  # 항목별 2번, 재시도도 같은 토큰 한도, Provider 내부 재시도 없음
+    assert [text for kind, _, text in sent if kind == "title"] == ["코디 설명: 생성 코멘트"] * 2
+    assert job(db).result_payload == success_payload("생성 제목", "생성 코멘트")
+
+
+@pytest.mark.parametrize("failure", FAILURE_KINDS)
+def test_title_failing_twice_with_each_kind_keeps_the_comment(db, failure):  # noqa: F811
+    postprocessing(db)
+    provider, sent = _scripted_provider({"comment": [], "title": [failure, failure]})
+    run(db, env(db, [EXISTS], comments=provider))
+    assert [kind for kind, _, _ in sent] == ["comment", "title", "title"]
+    assert job(db).result_payload == success_payload(FALLBACK_TITLE, "생성 코멘트")
+
+
+@pytest.mark.parametrize("failure", FAILURE_KINDS)
+def test_comment_failing_twice_with_each_kind_skips_the_title(db, failure):  # noqa: F811
+    postprocessing(db)
+    provider, sent = _scripted_provider({"comment": [failure, failure], "title": []})
+    run(db, env(db, [EXISTS], comments=provider))
+    assert [kind for kind, _, _ in sent] == ["comment", "comment"]  # 제목 호출 없음
     assert job(db).result_payload == success_payload(FALLBACK_TITLE, FALLBACK_COMMENT)
+
+
+def test_title_length_boundary_100_passes_and_101_fails(db):  # noqa: F811
+    postprocessing(db)
+    exactly_100 = "가" * 100
+    provider, sent = _scripted_provider(
+        {"comment": [], "title": ["text:" + "가" * 101, f"text:  {exactly_100}  "]}
+    )
+    run(db, env(db, [EXISTS], comments=provider))
+    assert [kind for kind, _, _ in sent] == ["comment", "title", "title"]  # 101자는 실패 → 재시도
+    assert job(db).result_payload == success_payload(
+        exactly_100, "생성 코멘트"
+    )  # 공백 제거 후 100자 통과
+
+
+def test_title_too_long_twice_uses_the_default_title_without_truncating(db):  # noqa: F811
+    postprocessing(db)
+    long_title = "나" * 150
+    provider, sent = _scripted_provider({"comment": [], "title": ["text:" + long_title] * 2})
+    e = env(db, [EXISTS], comments=provider)
+    run(db, e)
+    payload = job(db).result_payload
+    assert [kind for kind, _, _ in sent] == ["comment", "title", "title"]
+    assert payload == success_payload(FALLBACK_TITLE, "생성 코멘트")
+    assert long_title[:100] not in payload["llm_title"]  # 잘라서 저장하지 않는다
+    # 텍스트 실패로 이미지 재확인·fallback 없음, 정상 이미지로 완료
+    assert counts(db) == (1, 3, 0, 0) and len(e.storage.heads) == 1
+    assert job(db).next_action is NextAction.PUBLISH_RESULT and job(db).verified_image_key == KEY
+
+
+def test_short_titles_outside_the_prompt_target_are_accepted(db):  # noqa: F811
+    postprocessing(db)
+    provider, _ = _scripted_provider({"comment": [], "title": ["text:룩", "text:" + "다" * 60]})
+    run(db, env(db, [EXISTS], comments=provider))
+    assert job(db).result_payload == success_payload(
+        "룩", "생성 코멘트"
+    )  # 10~20자 목표 밖이어도 통과
+
+
+def test_stop_between_comment_and_title_defers_without_default_text(db):  # noqa: F811
+    postprocessing(db)
+    comments = FakeComments(comments=["코멘트"], titles=["제목"])
+    e = env(db, [EXISTS], comments=comments)
+    stop = {"now": False}
+    original = comments.generate_comment
+
+    def comment_then_stop(url, summaries):
+        value = original(url, summaries)
+        stop["now"] = True  # 코멘트 직후 종료 요청
+        return value
+
+    comments.generate_comment = comment_then_stop
+    outcome = run(db, e, should_stop=lambda: stop["now"])
+    assert outcome.delete is False and comments.title_calls == []
+    assert job(db).result_payload is None  # 기본 문구로 성공 처리하지 않는다
+    assert counts(db)[1] == 1
+
+
+def test_completed_job_redelivery_makes_no_calls_or_saves(db):  # noqa: F811
+    postprocessing(db)
+    comments = FakeComments(comments=[FittingPostprocessError("x"), "코멘트"], titles=["제목"])
+    e = env(db, [EXISTS], comments=comments)
+    run(db, e)
+    saved = job(db)
+    assert saved.result_payload == success_payload("제목", "코멘트")
+    calls = (len(comments.comment_calls), len(comments.title_calls), len(e.storage.urls))
+    run(db, e)  # 같은 메시지 재전달
+    assert (len(comments.comment_calls), len(comments.title_calls), len(e.storage.urls)) == calls
+    assert job(db) == saved  # 결과·횟수·updated_at 그대로
 
 
 # --- URL 생성과 횟수 확보의 순서 ---
@@ -625,11 +849,11 @@ def _context():
 
 
 def test_claim_rejected_after_url_by_the_limit_makes_no_llm_call(db):  # noqa: F811
-    """앞의 조회(횟수 2)와 확보 사이에 다른 Worker 가 마지막 시도를 가져갔다 → 확보가 거절돼 호출 없음."""
+    """앞의 조회(횟수 3)와 확보 사이에 다른 Worker 가 마지막 호출을 가져갔다 → 확보가 거절돼 호출 없음."""
     postprocessing(db)
     verified(db)
     db["sql"](
-        "UPDATE virtual_fitting_async_jobs SET llm_generation_attempt_count = 2 WHERE fitting_job_id = %s",
+        "UPDATE virtual_fitting_async_jobs SET llm_generation_attempt_count = 3 WHERE fitting_job_id = %s",
         (JOB,),
     )
     e = env(db)
@@ -638,7 +862,7 @@ def test_claim_rejected_after_url_by_the_limit_makes_no_llm_call(db):  # noqa: F
     def presign_then_race(key, *, expires_in):
         url = original(key, expires_in=expires_in)
         db["sql"](
-            "UPDATE virtual_fitting_async_jobs SET llm_generation_attempt_count = 3 "
+            "UPDATE virtual_fitting_async_jobs SET llm_generation_attempt_count = 4 "
             "WHERE fitting_job_id = %s",
             (JOB,),
         )
@@ -647,7 +871,7 @@ def test_claim_rejected_after_url_by_the_limit_makes_no_llm_call(db):  # noqa: F
     e.storage.presigned_get_url = presign_then_race
     run(db, e)
     assert len(e.storage.urls) == 1 and e.llm.comment_calls == [] and e.llm.title_calls == []
-    assert counts(db)[1] == 3  # 조건부 확보가 한도를 지켰다(4가 되지 않음)
+    assert counts(db)[1] == 4  # 조건부 확보가 한도를 지켰다(5가 되지 않음)
     assert job(db).result_payload == success_payload(FALLBACK_TITLE, FALLBACK_COMMENT)
 
 
@@ -721,5 +945,5 @@ def test_result_saved_between_attempts_stops_the_loop_without_overwrite(db):  # 
     e = env(db, comments=comments)
     result = e.handler(job(db), token, _context())
     assert result == HandlerResult(HandlerStatus.DONE, "result_already_saved")
-    assert len(e.storage.urls) == 1 and counts(db)[1] == 1  # 다음 시도의 URL·호출 없음
+    assert len(e.storage.urls) == 1 and counts(db)[1] == 2  # 제목 재시도 호출 없음
     assert job(db).result_payload == other

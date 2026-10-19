@@ -558,6 +558,9 @@ def test_counts_carry_over_to_the_next_worker(pg):
         pg["state"].claim_llm_generation_attempt(JOB, second).job.llm_generation_attempt_count == 3
     )
     assert (
+        pg["state"].claim_llm_generation_attempt(JOB, second).job.llm_generation_attempt_count == 4
+    )  # LLM 호출 한도: 코멘트 2 + 제목 2
+    assert (
         pg["state"].claim_llm_generation_attempt(JOB, second).reason is ChangeReason.LIMIT_REACHED
     )
 

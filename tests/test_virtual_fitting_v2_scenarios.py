@@ -28,6 +28,7 @@ from app.virtual_fitting.repositories.async_job_repository import (
 )
 from app.virtual_fitting.repositories.async_job_state import AsyncJobStateRepository
 from tests.v2_integration_harness import (
+    COMMENT,
     TITLE,
     Stack,
     close_env,
@@ -252,7 +253,7 @@ def test_webhook_before_the_accept_response(env, code):
 # --- E. LLM 실패 ---
 
 
-def test_comment_failures_use_default_text_after_three_pairs(env):
+def test_comment_failing_twice_uses_default_text_without_a_title_call(env):
     for _ in range(5):
         env.runware.comment_modes.append(("http", 500))
     stack = Stack(env).mark_running()
@@ -260,17 +261,17 @@ def test_comment_failures_use_default_text_after_three_pairs(env):
     post_webhook(client(), env.runware.complete(task))
     stack.postprocess_once()
     current = row(env)
-    assert current.llm_generation_attempt_count == 3
-    assert env.runware.count("llm_comment") == 3 and env.runware.count("llm_title") == 0
+    assert current.llm_generation_attempt_count == 2
+    assert env.runware.count("llm_comment") == 2 and env.runware.count("llm_title") == 0
     assert current.result_payload["status"] == "COMPLETED"  # 이미지 성공 유지(기본 문구)
     assert current.result_payload["result_image_key"] == ASYNC_KEY
     presigned = len(env.s3.presigned)
     env.sqs.expire_visibility("ai-fitting-response")
-    stack.postprocess_once()  # 소진 뒤 재수신: URL 발급·LLM 호출 없음
-    assert len(env.s3.presigned) == presigned and env.runware.count("llm_comment") == 3
+    stack.postprocess_once()  # 결과 저장 뒤 재수신: URL 발급·LLM 호출 없음
+    assert len(env.s3.presigned) == presigned and env.runware.count("llm_comment") == 2
 
 
-def test_title_only_failures_make_at_most_six_calls(env):
+def test_title_only_failures_make_one_comment_and_two_title_calls(env):
     for _ in range(5):
         env.runware.title_modes.append(("http", 500))
     stack = Stack(env).mark_running()
@@ -278,8 +279,9 @@ def test_title_only_failures_make_at_most_six_calls(env):
     post_webhook(client(), env.runware.complete(task))
     stack.postprocess_once()
     payload = row(env).result_payload
-    assert env.runware.count("llm_comment") == 3 and env.runware.count("llm_title") == 3
+    assert env.runware.count("llm_comment") == 1 and env.runware.count("llm_title") == 2
     assert payload["status"] == "COMPLETED" and payload["llm_title"] != TITLE
+    assert payload["llm_comment"] == COMMENT  # 생성 코멘트 유지 + 기본 제목
 
 
 # --- F. 업무 실패 ---

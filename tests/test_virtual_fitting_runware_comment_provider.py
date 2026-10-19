@@ -387,3 +387,47 @@ def test_blank_comment_is_rejected_before_any_request(comment):
         _provider(opener).generate_title(comment)
 
     assert opener.calls == []
+
+
+# --- 제목 생성 토큰 한도(제목 128 → 1024, 코멘트 512 유지) ---
+
+
+def test_title_and_comment_token_limits():
+    assert build_title_request(COMMENT)["max_completion_tokens"] == 1024
+    assert build_comment_request(RUNWARE_URL, SUMMARIES)["max_completion_tokens"] == 512
+    opener = FakeOpener(_ok(COMMENT), _ok("네이비 데일리 캐주얼"))
+    provider = _provider(opener)
+    provider.generate_title(provider.generate_comment(RUNWARE_URL, SUMMARIES))
+    (_, comment_payload), (_, title_payload) = _sent(opener, 0), _sent(opener, 1)
+    assert comment_payload["max_completion_tokens"] == 512
+    assert title_payload["max_completion_tokens"] == 1024
+
+
+def test_title_cut_off_by_the_output_limit_is_a_failure_without_retry():
+    # 실제로 관찰된 형태: HTTP 200, finish_reason="length"(completionTokens 가 한도에 도달)
+    cut = _ok("편안한 데일리", finish_reason="length")
+    cut["usage"] = {"completion_tokens": 1024}
+    opener = FakeOpener(cut)
+
+    with pytest.raises(FittingPostprocessError):
+        _provider(opener).generate_title(COMMENT)
+
+    assert len(opener.calls) == 1
+
+
+def test_title_http_400_for_the_output_limit_is_a_postprocess_failure_without_retry():
+    body = json.dumps(
+        {
+            "error": {
+                "message": "max_tokens or model output limit was reached",
+                "type": "invalid_request_error",
+            }
+        }
+    ).encode()
+    opener = FakeOpener(error=_http_error(400, body))
+
+    with pytest.raises(FittingPostprocessError) as error:
+        _provider(opener).generate_title(COMMENT)
+
+    assert error.value.code == "FITTING_POSTPROCESS_FAILED"
+    assert len(opener.calls) == 1
