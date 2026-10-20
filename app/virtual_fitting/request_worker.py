@@ -36,6 +36,7 @@ from anyio import CapacityLimiter, to_thread
 
 from app.clients.s3 import S3ObjectState
 from app.clients.sqs import FittingQueue, SqsQueueClient, SqsResult
+from app.virtual_fitting import diagnostics as diag
 from app.virtual_fitting.async_request import (
     FittingRequest,
     InvalidRequestMessage,
@@ -45,6 +46,7 @@ from app.virtual_fitting.async_request import (
 from app.virtual_fitting.exceptions import (
     FittingBalanceExhaustedError,
     FittingDailyBudgetExceededError,
+    FittingDatabaseError,
     InvalidFittingCombinationError,
     ProductImageMissingError,
     ProductNotFoundError,
@@ -199,8 +201,66 @@ class RequestPrecheck:
             codes = list(request.product_codes)
             not_numeric = [code for code in codes if not code.isdigit()]
             if not_numeric:  # 상품 DB 의 product_code 는 정수다. 숫자가 아닌 코드는 없는 상품이다.
+                diag.event(
+                    "product_lookup",
+                    component="request_worker",
+                    fitting_job_id=request.fitting_job_id,
+                    result="invalid_code",
+                    requested_count=len(codes),
+                    invalid_count=len(not_numeric),
+                )
                 raise ProductNotFoundError(not_numeric)
-            products = select_fitting_products(codes, self._products)
+            lookup_started = time.monotonic()
+            try:
+                products = select_fitting_products(codes, self._products)
+            except ProductNotFoundError as error:
+                # 기존 조회 결과(누락 코드)만 쓴다. 로그를 위한 추가 조회는 하지 않는다.
+                missing = [str(code) for code in error.product_codes]
+                diag.event(
+                    "product_lookup",
+                    component="request_worker",
+                    fitting_job_id=request.fitting_job_id,
+                    result="missing",
+                    requested=diag.codes(codes),
+                    found=diag.codes(c for c in codes if c not in missing),
+                    missing=diag.codes(missing),
+                    elapsed_ms=diag.elapsed_ms(lookup_started),
+                )
+                raise
+            except FittingDatabaseError as error:
+                diag.event(
+                    "product_lookup_failed",
+                    logging.ERROR,
+                    component="request_worker",
+                    fitting_job_id=request.fitting_job_id,
+                    result="db_error",
+                    error_code=error.code,
+                    cause_type=type(error.__cause__).__name__ if error.__cause__ else "none",
+                    requested=diag.codes(codes),
+                    elapsed_ms=diag.elapsed_ms(lookup_started),
+                )
+                raise
+            except VirtualFittingError as error:
+                diag.event(
+                    "product_lookup",
+                    component="request_worker",
+                    fitting_job_id=request.fitting_job_id,
+                    result="rejected",
+                    error_code=error.code,
+                    requested=diag.codes(codes),
+                    elapsed_ms=diag.elapsed_ms(lookup_started),
+                )
+                raise
+            diag.event(
+                "product_lookup",
+                component="request_worker",
+                fitting_job_id=request.fitting_job_id,
+                result="found",
+                requested=diag.codes(codes),
+                found=diag.codes(p.product_code for p in products),
+                missing="empty",
+                elapsed_ms=diag.elapsed_ms(lookup_started),
+            )
             build_fitting_prompt(products)  # 지원하지 않는 세부 분류면 UnsupportedSubCategoryError
 
             if not before_step():
@@ -395,6 +455,8 @@ class RequestProcessor:
         request = item.request
         job_id = request.fitting_job_id
 
+        started = time.monotonic()
+
         def outcome(action: str, delete: bool = False) -> RequestOutcome:
             logger.info(
                 "be-fitting-request processed fitting_job_id=%s message_id=%s action=%s delete=%s",
@@ -403,19 +465,57 @@ class RequestProcessor:
                 action,
                 delete,
             )
+            diag.event(
+                "request_decision",
+                component="request_worker",
+                fitting_job_id=job_id,
+                message_id=item.message_id,
+                action=action,
+                delete_decided=delete,
+                elapsed_ms=diag.elapsed_ms(started),
+            )
             return RequestOutcome(item.message_id, job_id, action, delete)
 
         fingerprint = request_fingerprint(request.user_image_key, request.product_codes)
-        created = self._jobs.create(
-            NewAsyncFittingJob(
-                fitting_job_id=job_id,
-                request_fingerprint=fingerprint,
-                user_image_key=request.user_image_key,
-                products=request.product_codes,
-                requested_at=request.requested_at,
-            )
+        diag.event(
+            "job_save_started",
+            component="request_worker",
+            fitting_job_id=job_id,
+            message_id=item.message_id,
         )
+        try:
+            created = self._jobs.create(
+                NewAsyncFittingJob(
+                    fitting_job_id=job_id,
+                    request_fingerprint=fingerprint,
+                    user_image_key=request.user_image_key,
+                    products=request.product_codes,
+                    requested_at=request.requested_at,
+                )
+            )
+        except Exception as error:
+            diag.event(
+                "job_save_failed",
+                logging.ERROR,
+                component="request_worker",
+                fitting_job_id=job_id,
+                message_id=item.message_id,
+                error_type=type(error).__name__,
+                error_code=getattr(error, "code", "none"),
+            )
+            raise
         job = created.job
+        # create 는 INSERT·기존 행 조회를 한 트랜잭션으로 끝낸 뒤 돌아온다(여기서는 이미 commit 됐다).
+        diag.event(
+            "job_saved" if created.created else "job_existing",
+            component="request_worker",
+            fitting_job_id=job_id,
+            message_id=item.message_id,
+            status=job.status.value,
+            next_action=job.next_action.value if job.next_action else "none",
+            result_message_status=job.result_message_status.value,
+            fingerprint_match=job.request_fingerprint == fingerprint,
+        )
         if not created.created and job.request_fingerprint != fingerprint:
             self._on_conflict(job, request, item.message_id)
             return outcome("input_conflict_kept")
@@ -478,11 +578,43 @@ class RequestProcessor:
             if check.status is PrecheckStatus.RETRY:
                 return outcome(f"retry_{check.reason}")
             if check.status is PrecheckStatus.FAILED:
-                saved = self._state.save_final_result(
-                    job_id, token, failure_payload(job_id, check.error_code, check.error_message)
-                )
+                try:
+                    saved = self._state.save_final_result(
+                        job_id,
+                        token,
+                        failure_payload(job_id, check.error_code, check.error_message),
+                    )
+                except Exception as error:
+                    diag.event(
+                        "failure_result_save_failed",
+                        logging.ERROR,
+                        component="request_worker",
+                        fitting_job_id=job_id,
+                        message_id=item.message_id,
+                        error_code=check.error_code,
+                        error_type=type(error).__name__,
+                    )
+                    raise
                 if saved.reason not in (ChangeReason.APPLIED, ChangeReason.ALREADY_RECORDED):
+                    diag.event(
+                        "failure_result_not_saved",
+                        logging.WARNING,
+                        component="request_worker",
+                        fitting_job_id=job_id,
+                        message_id=item.message_id,
+                        error_code=check.error_code,
+                        reason=saved.reason.value,
+                    )
                     return outcome(f"failure_not_saved_{saved.reason.value}")
+                # save_final_result 는 commit 뒤 돌아온다. 저장만 했고 결과 큐 발행은 결과 전송 루프가 따로 한다.
+                diag.event(
+                    "failure_result_saved",
+                    component="request_worker",
+                    fitting_job_id=job_id,
+                    message_id=item.message_id,
+                    error_code=check.error_code,
+                    change=saved.reason.value,
+                )
                 # 결과 발행(14단계)이 아직 없다. 저장만으로 삭제하지 않는다.
                 return outcome(f"failure_saved_{check.error_code}")
             if self._submit is None:
@@ -591,6 +723,12 @@ class RequestWorker:
             self.status.crashed = True
             self.status.last_error = type(error).__name__
             logger.error("%s worker crashed", self.name, exc_info=error)
+            diag.event(
+                "component_crashed",
+                logging.ERROR,
+                component=f"{self.name}_worker",
+                error_type=type(error).__name__,
+            )
         else:
             self.status.stopped = True
 
@@ -609,6 +747,7 @@ class RequestWorker:
     async def _run(self) -> None:
         self.status.running = True
         logger.info("%s worker started", self.name)
+        diag.event("component_started", component=f"{self.name}_worker")
         while not self._stop.is_set():
             try:
                 # long polling 은 thread 에서 기다린다. 종료 때 이 대기는 버릴 수 있다(받은 메시지는 지우지 않으므로
@@ -646,12 +785,21 @@ class RequestWorker:
                 self.status.received += 1
                 result = await to_thread.run_sync(self._process, item, limiter=self._limiter)
                 self.status.outcomes[result.action] = self.status.outcomes.get(result.action, 0) + 1
+                fields = {
+                    "component": f"{self.name}_worker",
+                    # 진단 값이 없어도 루프는 계속돼야 한다(로그만을 위해 처리 흐름을 바꾸지 않음).
+                    "fitting_job_id": getattr(result, "fitting_job_id", None),
+                    "message_id": getattr(item, "message_id", None),
+                    "action": getattr(result, "action", None),
+                }
                 if result.delete:
                     deleted = await to_thread.run_sync(
                         self._delete, item.receipt_handle, limiter=self._limiter
                     )
                     if deleted.succeeded:
                         self.status.deleted += 1
+                        # SQS DeleteMessage 응답을 받았다는 뜻이다(중복 재전달이 없다는 보장은 아니다).
+                        diag.event("message_deleted", **fields, sqs_result="succeeded")
                     else:
                         logger.warning(
                             "%s worker delete failed message_id=%s reason=%s",
@@ -659,7 +807,17 @@ class RequestWorker:
                             item.message_id,
                             deleted.reason,
                         )
+                        diag.event(
+                            "message_delete_failed",
+                            logging.WARNING,
+                            **fields,
+                            sqs_result=deleted.outcome.value,
+                            reason=deleted.reason,
+                        )
+                else:
+                    diag.event("message_kept", **fields)
         logger.info("%s worker stopped", self.name)
+        diag.event("component_stopped", component=f"{self.name}_worker")
 
 
 def create_request_worker() -> RequestWorker:

@@ -21,8 +21,9 @@ prepare_fitting(상품 검증·입력), RunwarePrunaProvider.try_on(task_uuid=�
      - 401·403: 자리 반환, 결과 저장 없이 운영 확인으로 보류(8단계 정책과 같음).
      - 그 밖의 명확한 4xx 거절: 자리 반환, FITTING_MODEL_FAILED 실패 결과.
      - timeout·연결 오류·5xx·429·응답 해석 실패·그 밖의 예외: 결과 불명확. 진행 중 자리를 유지하고 보류(다시 보내지 않음).
-  4. 저장한 fallback 이미지로 11단계 제목·코멘트(comment + title 한 쌍, 같은 llm_generation_attempt_count 로 최대 3회,
-     소진 시 V1 기본 문구) → save_final_result(COMPLETED, result_image_key = fallback 이미지 Key) + PUBLISH_RESULT.
+  4. 저장한 fallback 이미지로 11단계와 같은 코멘트·제목(title_and_comment: 항목별 최대 2회, 같은
+     llm_generation_attempt_count 로 호출 합계 최대 4번, 실패 시 V1 기본 문구) → save_final_result(COMPLETED,
+     result_image_key = fallback 이미지 Key) + PUBLISH_RESULT.
 결과 발행·최종 상태 확정은 14단계, 중단된 시도 복구는 15단계다. Presigned URL·Runware 결과 URL 은 저장·로그하지 않는다.
 """
 

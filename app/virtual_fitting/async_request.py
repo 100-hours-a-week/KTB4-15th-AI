@@ -20,6 +20,7 @@ from typing import Any
 
 from app.clients.s3 import InvalidS3KeyError, validate_s3_key
 from app.clients.sqs import FittingQueue, ReceivedMessage, SqsQueueClient, SqsResult
+from app.virtual_fitting import diagnostics as diag
 from app.virtual_fitting.repositories.async_job_repository import MAX_PRODUCTS, _check_job_id
 
 logger = logging.getLogger(__name__)
@@ -238,6 +239,32 @@ def receive_fitting_requests(
         return RequestBatch(receive_result=result)
     messages = tuple(_classify(message) for message in result.messages)
     for item in messages:
+        # 수신 직후(작업 저장 전). 수신 횟수는 SQS 의 ApproximateReceiveCount, 없으면 unknown.
+        count = item.approximate_receive_count
+        diag.event(
+            "request_received",
+            component="request_worker",
+            message_id=item.message_id,
+            receive_count=count if count is not None else "unknown",
+        )
+        if isinstance(item, ValidRequestMessage):
+            diag.event(
+                "request_validated",
+                component="request_worker",
+                message_id=item.message_id,
+                fitting_job_id=item.request.fitting_job_id,
+                product_codes=diag.codes(item.request.product_codes),
+            )
+        else:
+            diag.event(
+                "request_invalid",
+                logging.WARNING,
+                component="request_worker",
+                message_id=item.message_id,
+                fitting_job_id=item.fitting_job_id,
+                error_kind=item.error.kind.value,
+                field=item.error.field,
+            )
         if isinstance(item, InvalidRequestMessage):
             logger.warning(
                 "be-fitting-request invalid message_id=%s fitting_job_id=%s kind=%s field=%s "

@@ -42,7 +42,10 @@ from app.virtual_fitting.repositories.async_job_repository import (
 
 # 최초 포함 최대 시도 횟수. S3 는 HEAD 한 번이 아니라 0·2·7초 확인 한 묶음이 1회다.
 S3_CHECK_LIMIT = 2
-LLM_GENERATION_LIMIT = 3
+# V2 코멘트·제목: 항목별 최초 1회 + 재시도 1회. llm_generation_attempt_count 는 LLM 호출 1번마다 1씩(코멘트·제목 합계).
+LLM_COMMENT_ATTEMPT_LIMIT = 2
+LLM_TITLE_ATTEMPT_LIMIT = 2
+LLM_GENERATION_LIMIT = LLM_COMMENT_ATTEMPT_LIMIT + LLM_TITLE_ATTEMPT_LIMIT
 FALLBACK_LIMIT = 1
 RESULT_MESSAGE_LIMIT = 3
 MAX_LEASE_SECONDS = 3600
@@ -446,7 +449,8 @@ class AsyncJobStateRepository:
         )
 
     def claim_llm_generation_attempt(self, fitting_job_id: int, token: str) -> StateChange:
-        """확인한 이미지로 제목·코멘트를 생성하기 직전에 횟수를 확보한다. 최초 포함 최대 3회.
+        """확인한 이미지로 코멘트 또는 제목을 생성하기(LLM 호출 1번) 직전에 횟수를 확보한다. 합계 최대 4번
+        (코멘트 2 + 제목 2, 항목별 한도는 호출하는 쪽 title_and_comment 가 지킨다). 되돌리지 않는다.
 
         이미지가 있는 두 경로만 허용한다: POSTPROCESS(S3 에서 확인한 verified_image_key) 또는 RUN_FALLBACK(13단계,
         저장을 확인한 fallback_image_key). 같은 llm_generation_attempt_count 를 쓰므로 fallback 으로 넘어가도 초기화되지 않는다.

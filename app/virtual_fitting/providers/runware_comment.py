@@ -89,7 +89,7 @@ def build_title_request(comment: str) -> dict:
             {"role": "system", "content": TITLE_SYSTEM_PROMPT},
             {"role": "user", "content": f"코디 설명: {comment}"},
         ],
-        "max_completion_tokens": 128,
+        "max_completion_tokens": 1024,
         "stream": False,
     }
 

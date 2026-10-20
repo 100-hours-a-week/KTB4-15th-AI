@@ -233,7 +233,7 @@ def test_fallback_generates_once_stores_fixed_key_and_saves_the_result(db):  # n
     assert current.result_payload == completed() and current.result_image_key == KEY
     assert current.next_action is NextAction.PUBLISH_RESULT
     assert current.status is AsyncJobStatus.FALLBACK_RUNNING  # 최종 상태 확정은 14단계
-    assert counts(db) == (0, 1, 1, 0)
+    assert counts(db) == (0, 2, 1, 0)  # LLM 호출 2번(코멘트 1·제목 1)
     # LLM 은 저장한 fallback 이미지의 새 URL 로 만든다(원본 사진·비동기 이미지가 아님).
     ((llm_url, _),) = e.comments.comment_calls
     assert f"/{KEY}?" in llm_url and e.storage.presigned[-1] == KEY
@@ -548,7 +548,7 @@ def test_recorded_fallback_image_resumes_from_llm_without_generation(db):  # noq
     fallback_job(db)
     db["sql"](
         "UPDATE virtual_fitting_async_jobs SET fallback_task_uuid = %s, fallback_started_at = now(), "
-        "fallback_attempt_count = 1, fallback_image_key = %s, llm_generation_attempt_count = 2 "
+        "fallback_attempt_count = 1, fallback_image_key = %s, llm_generation_attempt_count = 3 "
         "WHERE fitting_job_id = %s",
         (str(uuid.uuid4()), KEY, JOB),
     )
@@ -556,18 +556,19 @@ def test_recorded_fallback_image_resumes_from_llm_without_generation(db):  # noq
     e = env(db, comments=comments)
     run(db, e)
     assert e.opener.requests == [] and e.storage.heads == []
-    assert len(comments.comment_calls) == 1  # 남은 1회만(POSTPROCESS 에서 쓴 2회 유지)
+    assert len(comments.comment_calls) == 1  # 남은 1번만(POSTPROCESS 에서 쓴 3번 유지, 초기화 없음)
+    assert comments.title_calls == []
     assert job(db).result_payload == completed(FALLBACK_TITLE, FALLBACK_COMMENT)
-    assert counts(db) == (0, 3, 1, 0)
+    assert counts(db) == (0, 4, 1, 0)
 
 
-def test_llm_three_failures_use_default_text_and_keep_the_image(db):  # noqa: F811
+def test_title_failing_twice_keeps_the_comment_and_the_fallback_image(db):  # noqa: F811
     fallback_job(db)
     comments = FakeComments(comments=["코멘트"] * 4, titles=[FittingPostprocessError("x")] * 4)
     e = env(db, comments=comments)
     run(db, e)
-    assert len(comments.comment_calls) == 3 and len(comments.title_calls) == 3
-    assert job(db).result_payload == completed(FALLBACK_TITLE, FALLBACK_COMMENT)
+    assert len(comments.comment_calls) == 1 and comments.title_calls == ["코멘트", "코멘트"]
+    assert job(db).result_payload == completed(FALLBACK_TITLE, "코멘트")
     assert len(e.opener.requests) == 1  # LLM 실패로 다시 생성하지 않는다
 
 

@@ -48,8 +48,35 @@ class RedactQuerySecretsFilter(logging.Filter):
         return True
 
 
+# 최종 출력(메시지·예외 traceback 포함)에서 비밀이 될 수 있는 부분을 가린다. 스택 구조와 예외 종류는 남긴다.
+_REDACTIONS = (
+    (
+        re.compile(r"\b(postgres(?:ql)?|mysql)(\+\w+)?://[^\s'\"<>]+", re.IGNORECASE),
+        r"\1://<redacted>",
+    ),
+    (re.compile(r"(https?://[^\s?'\"<>]+)\?[^\s'\"<>]*", re.IGNORECASE), r"\1?<redacted>"),
+    (re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=\-]+", re.IGNORECASE), "Bearer <redacted>"),
+    (
+        re.compile(
+            r"\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key)"
+            r"(\s*[=:]\s*)[^\s,'\"&;]+",
+            re.IGNORECASE,
+        ),
+        r"\1\2<redacted>",
+    ),
+    (re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b"), "<redacted-aws-key>"),
+)
+
+
+def redact_secrets(text: str) -> str:
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 class KstDefaultFormatter(_KstTimeMixin, DefaultFormatter):
-    pass
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_secrets(super().format(record))
 
 
 class KstAccessFormatter(_KstTimeMixin, AccessFormatter):

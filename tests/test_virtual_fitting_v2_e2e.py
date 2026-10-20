@@ -155,7 +155,7 @@ def test_normal_flow_through_the_real_lifespan_loops(env, monkeypatch):
     assert title_request["messages"][1]["content"] == f"코디 설명: {COMMENT}"
     # 비용·횟수·자리·실행 권한
     assert costs(env) == [(task, JOB, Decimal("0.023"))]
-    assert counts(env) == (1, 1, 0, 1, None)
+    assert counts(env) == (1, 2, 0, 1, None)
     assert in_flight(env) == []
     assert env.runware.count("async_submit") == 1 and env.runware.count("sync_generate") == 0
     assert env.network_attempts == []  # 실제 네트워크로 나간 시도 없음
@@ -177,7 +177,7 @@ def test_restart_between_accept_and_webhook_continues_from_db(env, monkeypatch):
         wait_until(lambda: row(env).result_message_status is ResultMessageStatus.PUBLISHED)
     assert env.runware.count("async_submit") == 1  # 재시작해도 다시 생성하지 않음
     assert len(env.sqs.bodies("be-fitting-response")) == 1
-    assert row(env).task_uuid == task and counts(env) == (1, 1, 0, 1, None)
+    assert row(env).task_uuid == task and counts(env) == (1, 2, 0, 1, None)
 
 
 def test_fallback_flow_through_the_real_loops_and_a_late_async_webhook(env, monkeypatch):

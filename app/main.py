@@ -21,6 +21,7 @@ from app.config.checkpointer import checkpointer_scope
 from app.config.database import close_async_pool, close_connection_pool, open_async_pool
 from app.config.logging_config import LOGGING_CONFIG, configure_logging
 from app.errors import register_error_handlers
+from app.virtual_fitting import diagnostics as vf_diag
 from app.virtual_fitting import router as virtual_fitting_router
 from app.virtual_fitting import webhook_router as virtual_fitting_webhook_router
 from app.virtual_fitting.concurrency import create_fitting_limiters
@@ -62,6 +63,14 @@ async def lifespan(app: FastAPI):
     app.state.result_publisher = None
     # V2 Watchdog(15단계)도 켰을 때만 돈다. 켜져 있어야 할 Worker·결과 전송 루프가 멈추면 알린다.
     app.state.watchdog = None
+    # 설정상 활성화 여부(꺼져 있어도 남긴다). 실제 루프 시작은 각 루프의 component_started 로 따로 남는다.
+    flags = {
+        "request_worker": settings.VIRTUAL_FITTING_REQUEST_WORKER_ENABLED,
+        "postprocess_worker": settings.VIRTUAL_FITTING_POSTPROCESS_WORKER_ENABLED,
+        "result_publisher": settings.VIRTUAL_FITTING_RESULT_PUBLISHER_ENABLED,
+        "watchdog": settings.VIRTUAL_FITTING_WATCHDOG_ENABLED,
+    }
+    vf_diag.app_start(flags)
     try:
         await open_async_pool()
         if settings.VIRTUAL_FITTING_RESULT_PUBLISHER_ENABLED:
@@ -89,6 +98,12 @@ async def lifespan(app: FastAPI):
             missing = handlers.missing()
             if missing:
                 app.state.postprocess_worker_status = f"not_ready:{','.join(missing)}"
+                vf_diag.event(
+                    "component_not_started",
+                    logging.WARNING,
+                    component="postprocess_worker",
+                    reason="handlers_not_connected",
+                )
                 logger.warning(
                     "postprocess worker not started: handlers not connected (%s)", ",".join(missing)
                 )
@@ -98,6 +113,9 @@ async def lifespan(app: FastAPI):
                 )
                 app.state.postprocess_worker.start()
                 app.state.postprocess_worker_status = "running"
+        if any(flags.values()):
+            # 켜진 루프가 쓰는 DB pool 의 실제 연결로 한 번만 확인한다(모두 꺼져 있으면 새 연결을 만들지 않는다).
+            await to_thread.run_sync(_log_fitting_db_target)
         async with checkpointer_scope() as checkpointer:
             app.state.checkpointer = checkpointer
             app.state.graph = build_graph(checkpointer)
@@ -133,6 +151,18 @@ async def lifespan(app: FastAPI):
         runtime_manager.close()
         close_connection_pool()
         await close_async_pool()
+
+
+def _log_fitting_db_target() -> None:
+    """진단만. 실패해도 시작·업무 처리를 멈추지 않는다."""
+    try:
+        from app.config.database import get_connection_pool
+
+        vf_diag.log_db_target(get_connection_pool(), "app")
+    except Exception as error:  # noqa: BLE001 — 진단 실패가 앱 시작을 막지 않게
+        vf_diag.event(
+            "db_target_failed", logging.WARNING, component="app", error_type=type(error).__name__
+        )
 
 
 app = FastAPI(title="KTB4-15th AI Server", lifespan=lifespan)
