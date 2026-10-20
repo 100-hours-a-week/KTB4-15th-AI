@@ -1,40 +1,7 @@
-"""V2: Runware 완료 Webhook 처리 (9단계). POST /api/v2/webhooks/runware?token=<WEBHOOK_TOKEN>
-
-이 모듈은 본문 해석(parse_webhook)과 처리(RunwareWebhookService)를 한다. HTTP·인증은 webhook_router.py 가 한다.
-Webhook 안에서는 S3 HEAD·이미지 다운로드·OpenAI·V1·BE 결과 발행을 하지 않는다. 기록하고 후속 큐에 넘길 뿐이다.
-
-지원하는 본문 (공식 문서 models-api/webhooks·errors, 기존 1단계 Provider 계약):
-  1. 단일 성공 객체(공식 Webhook 형식):
-       {"taskType": "imageInference", "taskUUID": ..., "imageUUID": ..., "imageURL": ..., "cost": 0.023}
-  2. errors 배열(공식 오류 객체): {"errors": [{"taskUUID": ..., "code": "timeoutProvider", ...}]}
-  3. data 배열(Runware 표준 API 응답 형식, 1단계 Provider 가 읽는 형식): {"data": [<1 의 객체>, ...]}
-     data 와 errors 가 함께 있어도 된다.
-  그 밖의 모양, taskType 이 imageInference 가 아닌 항목, taskUUID 가 UUID 문자열이 아닌 항목, 완료 여부가 불명확한
-  항목(status 가 없거나 success 인데 결과 이미지(imageURL·imageUUID)가 없음, 알 수 없는 status)은 400 으로 거절한다.
-  status=processing 은 진행 중이다. 완료로 처리하지 않고 자리도 반환하지 않는다.
-  실제 Runware 계정에서 받은 본문으로는 아직 확인하지 않았다(공식 예시 기반).
-
-처리 단계(이벤트마다, 순서대로). 단계마다 반복해도 같은 결과라 재수신 때 빠진 단계부터 이어진다.
-  0. 사전 확인(부작용 없음): 모든 task 가 등록돼 있고 호출 시작 기록이 있는지, 후속 큐 설정이 있는지.
-  1. 상태: 기존 조건부 전환(record_pruna_succeeded / record_pruna_failed). 이미 바뀌었으면 그대로 둔다.
-  2. 비용: 명시적인 유효 비용이 있으면 TaskCostRepository.record(task 당 한 번).
-  3. 자리: 이 task 가 잡은 진행 중 자리를 반환(release_in_flight, task 일치).
-  4. 발행: 현재 DB 상태가 이 이벤트의 후속 작업(POSTPROCESS / RUN_FALLBACK)을 기다리면 ai-fitting-response 에 발행.
-     상태가 이미 바뀌었다는 이유로 2·3·4 를 건너뛰지 않는다. 발행이 실패·UNKNOWN 이면 예외(5xx) — 재수신 때 다시 발행.
-  5. 경로 확인: DB 에 다음 작업이 **기록됐다**는 것과 그 작업을 **실행할 경로가 있다**는 것은 다르다. 남은 일이
-     결과 발행(PUBLISH_RESULT, 14단계)이거나 운영 확인·복구(RECOVER_UNKNOWN, 15단계 Watchdog)인데 FollowUpPaths 가
-     그 경로를 준비됐다고 답하지 않으면 모든 이벤트를 처리한 뒤 WebhookFollowUpNotReadyError(503)를 낸다.
-     기본 NoFollowUpPaths 는 항상 "없음"이라 지금은 503 이다(완료로 응답하지 않는 보호 조건).
-
-Runware 인증 오류(본문 code 가 AUTH_ERROR_CODES): Runware 가 우리 API 키를 거절했다는 외부 오류다(Webhook token
-인증 실패 401 과 다르다). 사용자 실패 결과를 저장하지 않고, fallback·재호출도 하지 않으며, 상태·기존 결과를 바꾸지
-않는다. 운영 확인 대상으로 오류 로그를 남기고 그 task 의 비용·자리만 정리한다. 결과를 기다리는 작업이면 인증 오류 보류
-기록(auth_hold_*, 15단계 보완)을 DB 에 남겨 요청 Worker 재수신·재시작 뒤에도 같은 operator_review 로 판단한다.
-"""
-
 import json
 import logging
 import re
+import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -44,7 +11,8 @@ from enum import Enum
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from app.clients.sqs import FittingQueue, get_queue_url
+from app.clients.sqs import FittingQueue, SqsConfigError, get_queue_url
+from app.virtual_fitting import diagnostics as diag
 from app.virtual_fitting.exceptions import FittingModelError, VirtualFittingError
 from app.virtual_fitting.pruna_submitter import (
     FollowUpPaths,
@@ -302,6 +270,16 @@ def _follow_up_action(event: WebhookEvent, job: AsyncFittingJob | None) -> NextA
     return None
 
 
+def _diag_job(job: AsyncFittingJob | None) -> dict[str, str]:
+    """DB 가 돌려준 현재 상태(추가 조회 없음)."""
+    if job is None:
+        return {"job_status": "unknown", "next_action": "unknown"}
+    return {
+        "job_status": job.status.value,
+        "next_action": job.next_action.value if job.next_action else "none",
+    }
+
+
 def _already_recorded(event: WebhookEvent, job: AsyncFittingJob | None) -> bool:
     if job is None:
         return False
@@ -336,6 +314,29 @@ def _pending_step(event: WebhookEvent, job: AsyncFittingJob | None) -> NextStep 
     return None
 
 
+# 진단(vf_diag runware_result_processed)의 outcome. 이 알림 한 건의 처리 결과이며 가상피팅 완료를 뜻하지 않는다
+# (남은 일은 next_action 으로 본다). 기존 EventOutcome·후속 발행·경로 확인 결과로만 정한다.
+#   applied  — 이번 알림으로 상태를 바꿨고, 필요한 후속 발행도 성공했다
+#   ignored  — 이미 같은 결과가 있거나(duplicate) 다른 경로로 진행·종료됐다(상태·결과 보존)
+#   deferred — 진행 중 알림, 인증 오류 보류, 또는 기록은 했지만 남은 일을 이어 갈 경로가 아직 없다
+#   failed   — 처리 중 오류. state_change·follow_up 으로 어디까지 됐는지 구분한다(예: 상태 기록 뒤 발행 실패)
+_DIAG_OUTCOME = {
+    EventOutcome.APPLIED: ("applied", "state_recorded"),
+    EventOutcome.DUPLICATE: ("ignored", "duplicate"),
+    EventOutcome.IGNORED: ("ignored", "already_progressed"),
+    EventOutcome.HELD: ("deferred", "auth_hold"),
+    EventOutcome.PROCESSING: ("deferred", "still_processing"),
+}
+
+
+def _diag_failure_reason(error: Exception) -> str:
+    if isinstance(error, WebhookFollowUpError):
+        return "follow_up_publish_failed"
+    if isinstance(error, VirtualFittingError):
+        return error.code.lower()
+    return type(error).__name__
+
+
 class RunwareWebhookService:
     def __init__(
         self,
@@ -346,13 +347,45 @@ class RunwareWebhookService:
         costs: Any,
         queue: Any,
         follow_up: FollowUpPaths | None = None,
+        source: str = "unknown",
+        request_id: str | None = None,
     ) -> None:
         self._jobs, self._state, self._limiter = jobs, state, limiter
         self._costs, self._queue = costs, queue
         # 기본은 NoFollowUpPaths(결과 발행 14단계·Watchdog 15단계 미구현). 설정값으로 바꿀 수 없다.
         self._follow_up = follow_up or NoFollowUpPaths()
+        # 진단용 출처. 조립하는 쪽이 명시한다(HTTP: webhook, Watchdog: watchdog). 그 밖은 unknown(추측하지 않음).
+        self._source, self._request_id = source, request_id
+
+    def _diag_processed(
+        self, event: WebhookEvent, trace: dict, outcome: str, reason: str, started: float
+    ) -> None:
+        fields = {"request_id": self._request_id} if self._request_id else {}
+        diag.event(
+            "runware_result_processed",
+            logging.WARNING if outcome == "failed" else logging.INFO,
+            component="runware_result",
+            source=self._source,
+            **fields,
+            fitting_job_id=trace.get("fitting_job_id", "unknown"),
+            task_uuid=event.task_uuid,
+            event_kind=event.kind.value,
+            outcome=outcome,
+            reason=reason,
+            state_change=trace.get("state_change", "unknown"),
+            follow_up=trace.get("follow_up", "unknown"),
+            **(
+                {"follow_up_message_id": trace["follow_up_message_id"]}
+                if trace.get("follow_up_message_id")
+                else {}
+            ),
+            job_status=trace.get("job_status", "unknown"),
+            next_action=trace.get("next_action", "unknown"),
+            elapsed_ms=diag.elapsed_ms(started),
+        )
 
     def handle(self, events: Sequence[WebhookEvent]) -> list[EventResult]:
+        started = time.monotonic()
         jobs: dict[str, AsyncFittingJob] = {}
         for event in events:  # 사전 확인: 조회만 한다
             if event.task_uuid in jobs:
@@ -364,19 +397,39 @@ class RunwareWebhookService:
                     event.task_uuid,
                     job is not None,
                 )
+                trace = {"fitting_job_id": job.fitting_job_id if job else "none"}
+                trace |= {"state_change": "none", "follow_up": "none"}
+                self._diag_processed(event, trace, "failed", "unknown_task", started)
                 raise WebhookUnknownTaskError()
             jobs[event.task_uuid] = job
         if any(event.kind is not EventKind.PROCESSING for event in events):
-            get_queue_url(
-                FittingQueue.AI_FITTING_RESPONSE
-            )  # 설정 오류면 기록 전에 멈춘다(SqsConfigError)
+            try:
+                get_queue_url(
+                    FittingQueue.AI_FITTING_RESPONSE
+                )  # 설정 오류면 기록 전에 멈춘다(SqsConfigError)
+            except SqsConfigError:
+                for event in events:
+                    trace = {"fitting_job_id": jobs[event.task_uuid].fitting_job_id}
+                    trace |= {"state_change": "none", "follow_up": "none"}
+                    self._diag_processed(event, trace, "failed", "follow_up_queue_config", started)
+                raise
         results, pending = [], []
         for event in events:
-            result, current = self._apply(event, jobs[event.task_uuid])
+            trace: dict[str, Any] = {"fitting_job_id": jobs[event.task_uuid].fitting_job_id}
+            try:
+                result, current = self._apply(event, jobs[event.task_uuid], trace)
+            except Exception as error:
+                self._diag_processed(event, trace, "failed", _diag_failure_reason(error), started)
+                raise
             results.append(result)
             step = _pending_step(event, current)
             if step is not None and not self._follow_up.ready_for(current, step):
                 pending.append((event.task_uuid, step.value))
+                self._diag_processed(
+                    event, trace, "deferred", f"follow_up_not_ready_{step.value}", started
+                )
+            else:
+                self._diag_processed(event, trace, *_DIAG_OUTCOME[result.outcome], started)
         if pending:
             logger.warning(
                 "runware webhook recorded but follow-up path not ready pending=%s",
@@ -386,11 +439,15 @@ class RunwareWebhookService:
         return results
 
     def _apply(
-        self, event: WebhookEvent, job: AsyncFittingJob
+        self, event: WebhookEvent, job: AsyncFittingJob, trace: dict | None = None
     ) -> tuple[EventResult, AsyncFittingJob | None]:
+        # trace: 진단용. 어디까지 됐는지(상태 기록·후속 발행)를 단계마다 적어 두면 예외가 나도 handle 이 남긴다.
+        trace = trace if trace is not None else {}
         job_id, task = job.fitting_job_id, event.task_uuid
         if event.kind is EventKind.PROCESSING:
             logger.info("runware webhook processing fitting_job_id=%s task_uuid=%s", job_id, task)
+            trace |= {"state_change": "processing", "follow_up": "not_needed"}
+            trace |= _diag_job(job)
             return EventResult(task, EventOutcome.PROCESSING), job
 
         if event.auth_error:
@@ -416,13 +473,20 @@ class RunwareWebhookService:
                 outcome = EventOutcome.DUPLICATE
             else:
                 outcome = EventOutcome.IGNORED
+        trace |= {"state_change": outcome.value} | _diag_job(current)
         self._record_cost(event, job)
         released = self._limiter.release_in_flight(job_id, task_uuid=task)
         action = _follow_up_action(event, current)
+        trace["follow_up"] = "not_needed"
         if action is not None:
+            trace["follow_up"] = "unknown"  # 보내는 중 예외가 나면 큐에 들어갔는지 모른다
             sent = self._queue.send_json(
                 FittingQueue.AI_FITTING_RESPONSE, follow_up_message(current, action)
             )
+            outcome_value = getattr(getattr(sent, "outcome", None), "value", "unknown")
+            trace["follow_up"] = f"{action.value.lower()}_{outcome_value}"
+            if getattr(sent, "message_id", None):
+                trace["follow_up_message_id"] = sent.message_id
             if not sent.succeeded:
                 logger.error(
                     "runware webhook follow-up not published fitting_job_id=%s action=%s "

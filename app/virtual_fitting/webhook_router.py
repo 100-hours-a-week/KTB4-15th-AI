@@ -1,26 +1,11 @@
-"""Runware → AI Webhook 엔드포인트 (9단계). POST /api/v2/webhooks/runware?token=<WEBHOOK_TOKEN>
-
-내부 API 인증(verify_internal_key)이 아니라 URL 의 token 을 settings.WEBHOOK_TOKEN 과 비교한다(hmac.compare_digest).
-확인되지 않은 HMAC 서명은 요구하지 않는다. 응답은 공통 형식({"code", "data", "message"})이며 BE 결과 JSON 과 별개다.
-
-  200 — 처리했거나 이미 안전하게 처리된 중복·늦은 알림(가상피팅 성공이라는 뜻이 아님)
-  400 INVALID_REQUEST      — JSON·필수 식별자·형식 오류, 지원하지 않는 본문
-  400 WEBHOOK_UNKNOWN_TASK — 등록되지 않은 task 이거나 호출 시작 기록 없음(부작용 없음)
-  401 UNAUTHORIZED         — token 누락·불일치(DB·SQS·비용·자리 변경 없음)
-  500 WEBHOOK_NOT_CONFIGURED / SQS_CONFIG_ERROR / DATABASE_ERROR — 설정·DB 오류
-  503 WEBHOOK_FOLLOW_UP_FAILED — 기록 뒤 후속 큐 발행 실패·UNKNOWN(재전송 때 이어서 처리)
-  503 WEBHOOK_FOLLOW_UP_NOT_READY — 기록·정리는 했지만 남은 일(결과 발행 PUBLISH_RESULT·운영 확인/복구)을 이어 갈
-                             실제 경로가 없다(FollowUpPaths). 결과는 보존되고 재전송 때 다시 확인한다.
-  503 WEBHOOK_TIMEOUT      — 처리 시간(WEBHOOK_DEADLINE_SECONDS) 초과. 처리 thread 는 계속 돌 수 있고 모든 단계가
-                             반복해도 같은 결과라 재전송이 안전하다. 200 을 먼저 주고 메모리에서만 처리하지 않는다.
-
-토큰·URL·query·본문 전문은 로그에 남기지 않는다(접근 로그의 token 은 logging_config 가 가린다).
-"""
-
 import hmac
+import json
 import logging
+import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 import anyio
 import psycopg
@@ -32,6 +17,7 @@ from app.clients.sqs import SqsConfigError, SqsQueueClient, get_webhook_sqs_clie
 from app.config import settings
 from app.config.database import DatabaseConfigError, get_connection_pool
 from app.errors import INVALID_REQUEST, ApiResponse, error_response
+from app.virtual_fitting import diagnostics as diag
 from app.virtual_fitting.exceptions import FittingDatabaseError, VirtualFittingError
 from app.virtual_fitting.pruna_submitter import FollowUpPaths
 from app.virtual_fitting.runware_webhook import (
@@ -50,6 +36,8 @@ WEBHOOK_DEADLINE_SECONDS = 4.5
 # 동시에 Webhook 처리에 쓰는 worker thread 수. 시간 초과로 버려진 처리가 쌓여도 다른 요청 thread 를 다 쓰지 않게 한다.
 WEBHOOK_THREADS = 8
 WEBHOOK_PROCESSED = "WEBHOOK_PROCESSED"
+# 진단: 이 HTTP 요청의 내부 식별자. worker thread 로도 이어진다(anyio 가 context 를 복사). 외부 값이 아니다.
+_REQUEST_ID: ContextVar[str | None] = ContextVar("vf_webhook_request_id", default=None)
 
 router = APIRouter(
     tags=["virtual-fitting-webhook"],
@@ -103,6 +91,8 @@ def open_webhook_service() -> Iterator[RunwareWebhookService]:
         costs=TaskCostRepository(pool),
         queue=SqsQueueClient(get_webhook_sqs_client()),
         follow_up=webhook_follow_up_paths(),
+        source="webhook",
+        request_id=_REQUEST_ID.get(),
     )
 
 
@@ -137,11 +127,68 @@ def _thread_limiter(request: Request) -> anyio.CapacityLimiter:
     return limiter
 
 
+def _validation(request_id: str, stage: str, result: str, reason: str, **fields) -> None:
+    diag.event(
+        "webhook_validation",
+        logging.INFO if result == "passed" else logging.WARNING,
+        component="webhook",
+        source="webhook",
+        request_id=request_id,
+        stage=stage,
+        result=result,
+        reason=reason,
+        **fields,
+    )
+
+
+def _token_reason(request: Request) -> str:
+    count = len(request.query_params.getlist("token"))  # 개수만 본다(값은 남기지 않음)
+    return "token_missing" if count == 0 else "token_multiple" if count > 1 else "token_mismatch"
+
+
+def _response_code(response) -> str:
+    """이 엔드포인트가 만든 응답의 code(우리가 만든 JSON). 읽지 못하면 unknown."""
+    try:
+        return str(json.loads(response.body).get("code") or "unknown")
+    except Exception:  # noqa: BLE001 — 진단 값만 포기
+        return "unknown"
+
+
 @router.post(WEBHOOK_PATH, response_model=ApiResponse)
 async def runware_webhook(request: Request):
+    """진단: 수신(webhook_http_received) → 검증(webhook_validation) → 처리(runware_result_processed, thread)
+    → 응답(webhook_http_completed) 을 내부 request_id 하나로 잇는다. 인증·본문 검증 전에 수신을 남긴다."""
+    request_id, started = uuid.uuid4().hex[:16], time.monotonic()
+    context = _REQUEST_ID.set(request_id)
+    diag.event(
+        "webhook_http_received", component="webhook", source="webhook", request_id=request_id
+    )
+    http_status, code = status.HTTP_500_INTERNAL_SERVER_ERROR, "unhandled_exception"
+    try:
+        response = await _handle(request, request_id)
+        http_status, code = response.status_code, _response_code(response)
+        return response
+    finally:
+        diag.event(
+            "webhook_http_completed",
+            logging.INFO
+            if http_status < status.HTTP_500_INTERNAL_SERVER_ERROR
+            else logging.WARNING,
+            component="webhook",
+            source="webhook",
+            request_id=request_id,
+            http_status=http_status,
+            code=code,
+            elapsed_ms=diag.elapsed_ms(started),
+        )
+        _REQUEST_ID.reset(context)
+
+
+async def _handle(request: Request, request_id: str):
     expected = settings.WEBHOOK_TOKEN
     if not expected:
         logger.error("runware webhook rejected: WEBHOOK_TOKEN is not configured")
+        _validation(request_id, "config", "rejected", "token_not_configured")
         return error_response(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "WEBHOOK_NOT_CONFIGURED",
@@ -149,16 +196,22 @@ async def runware_webhook(request: Request):
         )
     if not _token_ok(request, expected):
         logger.warning("runware webhook rejected: invalid token")
+        _validation(request_id, "token", "rejected", _token_reason(request))
         return error_response(status.HTTP_401_UNAUTHORIZED, "UNAUTHORIZED", "인증에 실패했습니다.")
 
     try:
         events = parse_webhook(await request.body())
     except WebhookPayloadError as error:
         logger.warning("runware webhook rejected: unsupported body reason=%s", error.reason)
+        _validation(request_id, "body", "rejected", error.reason)
         return error_response(
             status.HTTP_400_BAD_REQUEST, INVALID_REQUEST, "지원하지 않는 Webhook 본문입니다."
         )
 
+    tasks = list(dict.fromkeys(event.task_uuid for event in events))  # 검증된 UUID 만(정규화된 값)
+    _validation(
+        request_id, "body", "passed", "ok", event_count=len(events), task_uuid=",".join(tasks)
+    )
     try:
         with anyio.fail_after(WEBHOOK_DEADLINE_SECONDS):
             results = await to_thread.run_sync(
