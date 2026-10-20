@@ -16,7 +16,6 @@ from botocore.stub import Stubber
 from app.clients import sqs as sqs_module
 from app.clients.sqs import FittingQueue, SqsConfigError, SqsOutcome, SqsQueueClient
 from app.config import settings
-from app.virtual_fitting import async_request
 from app.virtual_fitting.async_request import (
     FittingRequest,
     InvalidFittingRequest,
@@ -253,7 +252,9 @@ def test_mixed_batch_validates_each_message_and_keeps_delivery_info(no_db_or_mod
         raw(json.dumps(with_(fitting_job_id="123")), "m-job-id", "1"),
         raw(json.dumps(with_(products=[{"product_code": "001234"}])), "m-valid-2", "1"),
     ]
-    with Stubber(client) as stubber, caplog.at_level(logging.INFO, logger=async_request.__name__):
+    with Stubber(client) as stubber, caplog.at_level(
+        logging.INFO, logger="app.virtual_fitting.diagnostics"
+    ):
         stubber.add_response(
             "receive_message",
             {"Messages": messages},
@@ -299,10 +300,46 @@ def test_mixed_batch_validates_each_message_and_keeps_delivery_info(no_db_or_mod
     # 잘못된 작업 번호는 만들어 내지 않는다.
     assert (job_id.error.field, job_id.fitting_job_id) == ("fitting_job_id", None)
 
-    assert "valid=2 invalid=4" in caplog.text
-    assert (
-        "message_id=m-products fitting_job_id=123 kind=invalid_field field=products" in caplog.text
-    )
+    def diagnostic_events(event_name):
+        parsed = []
+        for record in caplog.records:
+            if record.name != "app.virtual_fitting.diagnostics":
+                continue
+            fields = dict(
+                part.split("=", 1)
+                for part in record.getMessage().removeprefix("vf_diag ").split()
+                if "=" in part
+            )
+            if fields.get("event") == event_name:
+                parsed.append(fields)
+        return parsed
+
+    received = diagnostic_events("message_received")
+    validated = diagnostic_events("message_validated")
+    validation_failed = diagnostic_events("message_validation_failed")
+    expected_ids = {message["MessageId"] for message in messages}
+    assert len(received) == 6 and {event["message_id"] for event in received} == expected_ids
+    assert len(validated) == 2
+    assert {event["message_id"] for event in validated} == {"m-valid", "m-valid-2"}
+    assert len(validation_failed) == 4
+    assert {event["message_id"] for event in validation_failed} == {
+        "m-json",
+        "m-array",
+        "m-products",
+        "m-job-id",
+    }
+    valid_by_id = {event["message_id"]: event for event in validated}
+    assert valid_by_id["m-valid"]["fitting_job_id"] == "123"
+    assert valid_by_id["m-valid"]["product_codes"] == "123456,789012"
+    assert valid_by_id["m-valid-2"]["fitting_job_id"] == "123"
+    assert valid_by_id["m-valid-2"]["product_codes"] == "001234"
+    invalid_by_id = {event["message_id"]: event for event in validation_failed}
+    assert invalid_by_id["m-json"]["error_kind"] == "invalid_json"
+    assert invalid_by_id["m-array"]["error_kind"] == "not_object"
+    assert invalid_by_id["m-products"]["error_kind"] == "invalid_field"
+    assert invalid_by_id["m-products"]["field"] == "products"
+    assert invalid_by_id["m-job-id"]["error_kind"] == "invalid_field"
+    assert invalid_by_id["m-job-id"]["field"] == "fitting_job_id"
     for secret in (RECEIPT, IMAGE_KEY, "not json"):
         assert secret not in caplog.text
         assert all(secret not in repr(item) for item in batch.messages)
