@@ -37,6 +37,7 @@ from anyio import CapacityLimiter, to_thread
 
 from app.clients.s3 import S3ObjectState
 from app.clients.sqs import FittingQueue, SqsConfigError, get_queue_url
+from app.virtual_fitting import diagnostics as diag
 from app.virtual_fitting.exceptions import FittingDatabaseError, VirtualFittingError
 from app.virtual_fitting.follow_up_queue import publish_follow_up
 from app.virtual_fitting.providers.runware_status import TaskStatusKind
@@ -765,6 +766,12 @@ class WatchdogWorker:
             self.status.crashed = True
             self.status.last_error = type(error).__name__
             logger.error("watchdog crashed", exc_info=error)
+            diag.event(
+                "component_crashed",
+                logging.ERROR,
+                component="watchdog",
+                error_type=type(error).__name__,
+            )
         else:
             self.status.stopped = True
 
@@ -777,6 +784,7 @@ class WatchdogWorker:
     async def _run(self) -> None:
         self.status.running = True
         logger.info("watchdog started")
+        diag.event("component_started", component="watchdog")
         while not self._stop.is_set():
             try:
                 await to_thread.run_sync(self._run_once, limiter=self._limiter)
@@ -792,6 +800,7 @@ class WatchdogWorker:
                 )
                 await self._sleep(backoff)
         logger.info("watchdog stopped")
+        diag.event("component_stopped", component="watchdog")
 
 
 # --- 준비 여부(FollowUpPaths) ---

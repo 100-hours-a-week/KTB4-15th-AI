@@ -28,6 +28,7 @@ from typing import Any
 from anyio import CapacityLimiter, to_thread
 
 from app.clients.sqs import FittingQueue, SqsConfigError, SqsOutcome, get_queue_url
+from app.virtual_fitting import diagnostics as diag
 from app.virtual_fitting.exceptions import VirtualFittingError
 from app.virtual_fitting.pruna_submitter import NextStep
 from app.virtual_fitting.repositories.async_job_repository import (
@@ -130,11 +131,32 @@ class ResultPublishProcessor:
                     return self._exhaust(job, token, "attempts_already_used")
                 return PublishOutcome.SKIPPED
             attempt = claim.job.result_message_attempt_count
-            outcome, reason = self._send(job)
+            outcome, reason, message_id = self._send(job)
+            fields = {
+                "component": "result_publisher",
+                "fitting_job_id": job.fitting_job_id,
+                "result_status": job.result_payload.get("status"),
+                "attempt": attempt,
+            }
             if outcome is SqsOutcome.SUCCEEDED:
+                # SQS 가 MessageId 와 함께 성공을 응답했다(BE 처리 완료 뜻은 아님).
+                diag.event(
+                    "result_sent", **fields, sqs_result="succeeded", sqs_message_id=message_id
+                )
                 final = AsyncJobStatus(job.result_payload["status"])
-                marked = self._state.mark_result_published(job.fitting_job_id, token, final)
+                try:
+                    marked = self._state.mark_result_published(job.fitting_job_id, token, final)
+                except Exception as error:
+                    diag.event(
+                        "result_sent_not_recorded",
+                        logging.ERROR,
+                        **fields,
+                        sqs_message_id=message_id,
+                        error_type=type(error).__name__,
+                    )
+                    raise
                 if marked.applied:
+                    diag.event("result_publish_recorded", **fields, sqs_message_id=message_id)
                     release = False  # mark_result_published 가 lease 를 정리했다
                     logger.info(
                         "result published fitting_job_id=%s status=%s attempt=%s",
@@ -151,6 +173,22 @@ class ResultPublishProcessor:
                     marked.reason.value,
                 )
                 reason = f"sent_not_recorded_{marked.reason.value}"
+                diag.event(
+                    "result_sent_not_recorded",
+                    logging.ERROR,
+                    **fields,
+                    sqs_message_id=message_id,
+                    reason=marked.reason.value,
+                )
+            else:
+                # FAILED(전달 안 됨) 또는 UNKNOWN(전달됐을 수 있음). 성공으로 표시하지 않는다.
+                diag.event(
+                    "result_send_failed",
+                    logging.WARNING,
+                    **fields,
+                    sqs_result=outcome.value,
+                    reason=reason,
+                )
             if attempt >= RESULT_MESSAGE_LIMIT:
                 return self._exhaust(job, token, reason)
             backoff = (
@@ -179,13 +217,13 @@ class ResultPublishProcessor:
                         released.reason.value,
                     )
 
-    def _send(self, job: AsyncFittingJob) -> tuple[SqsOutcome, str]:
+    def _send(self, job: AsyncFittingJob) -> tuple[SqsOutcome, str, str | None]:
         try:
             sent = self._sqs.send_json(FittingQueue.BE_FITTING_RESPONSE, dict(job.result_payload))
         except Exception:
             logger.exception("result publish crashed fitting_job_id=%s", job.fitting_job_id)
-            return SqsOutcome.UNKNOWN, "send_crashed"
-        return sent.outcome, sent.reason
+            return SqsOutcome.UNKNOWN, "send_crashed", None
+        return sent.outcome, sent.reason, getattr(sent, "message_id", None)
 
     def _hold(self, job: AsyncFittingJob, token: str, seconds: float) -> bool:
         """실행 권한을 seconds 동안 쥔 채 둔다(그동안 다른 루프가 선점·재전송하지 않음). 성공하면 True."""
@@ -281,6 +319,12 @@ class ResultPublisherWorker:
             self.status.crashed = True
             self.status.last_error = type(error).__name__
             logger.error("result publisher crashed", exc_info=error)
+            diag.event(
+                "component_crashed",
+                logging.ERROR,
+                component="result_publisher",
+                error_type=type(error).__name__,
+            )
         else:
             self.status.stopped = True
 
@@ -304,6 +348,7 @@ class ResultPublisherWorker:
     async def _run(self) -> None:
         self.status.running = True
         logger.info("result publisher started")
+        diag.event("component_started", component="result_publisher")
         while not self._stop.is_set():
             try:
                 done = await to_thread.run_sync(self._cycle, limiter=self._limiter)
@@ -325,6 +370,7 @@ class ResultPublisherWorker:
             if not done:
                 await self._sleep(self._poll)
         logger.info("result publisher stopped")
+        diag.event("component_stopped", component="result_publisher")
 
 
 # --- 준비 여부(FollowUpPaths) ---
