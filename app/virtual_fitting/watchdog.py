@@ -1,28 +1,3 @@
-"""가상피팅 V2 Watchdog(15단계): 미완료 작업 조사·확인된 근거로 복구·운영 이상 탐지.
-
-FastAPI lifespan 이 시작·종료한다(VIRTUAL_FITTING_WATCHDOG_ENABLED 기본 false, 점검 주기 60초). DB 를 조회해 대상을 찾는다.
-**조사할 수 있다 ≠ 자동으로 복구할 수 있다.** 확인된 근거가 있을 때만 기존 경로(9단계 Webhook 처리·POSTPROCESS·RUN_FALLBACK
-메시지·5단계 상태 메서드)로 이어 가고, 근거가 없으면 기록을 그대로 두고 운영 알림만 남긴다.
-
-지키는 것: 유료 생성 요청 재호출 없음, 시도 횟수 초기화 없음, 시간 경과·lease 만료만으로 자리 반환·실패 확정·fallback 없음,
-RETRY_EXHAUSTED 자동 재발행 없음, 최종 결과·이미지·상태 보존. BE 큐에만 있고 AI DB 에 없는 요청은 대상이 아니다(BE 담당).
-
-작업별 점검(DB 선점: virtual_fitting_watchdog_checks.next_check_at, 작업당 60초에 한 번, updated_at 을 바꾸지 않음):
-  - 진행 중 자리가 10분 넘게 남음: 비동기 task 면 getResponse 로 끝났는지 확인해 끝났을 때만 정리(9단계 처리 재사용).
-    fallback task 는 조회 근거가 없어(동기) 운영 확인.
-  - RECEIVED 접수 불명확(호출 시작 기록 기준) / WAITING_PRUNA(최초 접수 기준): 3분부터 getResponse, 5분부터 지연 알림.
-    success → 9단계 성공 처리(비용·자리·POSTPROCESS). timeoutProvider → 9단계 fallback 처리. 그 밖의 오류 코드·조회 실패·
-    결과 없음·인증 오류 → 상태를 바꾸지 않고 운영 확인.
-  - POSTPROCESS·RUN_FALLBACK 이 유효한 실행 권한 없이 10분 넘게 진전 없음: 이어 갈 근거가 있으면 기존 메시지를 다시 발행
-    (작업당 10분에 한 번). S3 확인 2묶음을 다 썼는데 결과가 불명확하면 복구용 단발 HEAD 1번(EXISTS 만 근거로 쓴다).
-    fallback 시작 기록만 있으면 고정 Key(pruna-sync.jpg) 단발 HEAD — 이 시도 뒤에 저장된 객체일 때만 기록 복구.
-  - PUBLISH_RESULT: 정상 전송은 14단계 결과 전송 루프 몫. RETRY_EXHAUSTED·전송 루프 없음·설정 오류·장기 보류를 알린다.
-  - COMPLETED·FAILED: 업무 결과는 끝났어도 남은 자리(위)·비동기 task 비용 누락(호출 시작 후 24시간 안, 접수 확인된 task)을
-    getResponse 로 확인해 9단계 처리로 정리한다. 상태·결과·횟수는 바꾸지 않는다. 결론이 없으면 15분 뒤 다시.
-전역 점검: 공유 SEND_HOLD(자동 해제 안 함), 켜져 있어야 할 Worker·결과 전송 루프의 중단.
-외부 HTTP·S3·SQS 호출 중에는 DB 트랜잭션·잠금을 잡지 않는다. DB 트랜잭션은 5초 잠금 대기 제한을 둔다.
-"""
-
 import asyncio
 import json
 import logging
@@ -343,10 +318,13 @@ class StatusQueryGate:
         )
         self._last: float | None = None
         self._not_before = 0.0
+        # 진단: 마지막 query() 가 실제로 Runware 를 불렀는지(대기 안내 중이면 부르지 않는다)
+        self.last_called = False
 
     def query(self, task_uuid: str):
         from app.virtual_fitting.providers.runware_status import TaskStatus
 
+        self.last_called = False
         now = self._clock()
         if now < self._not_before:
             return TaskStatus(
@@ -355,6 +333,7 @@ class StatusQueryGate:
         if self._last is not None and now - self._last < self._min:
             self._sleep(self._min - (now - self._last))
         self._last = self._clock()
+        self.last_called = True
         status = self._client.query(task_uuid)
         if status.kind is TaskStatusKind.RATE_LIMITED:
             self._not_before = self._clock() + (status.retry_after or 60.0)
@@ -560,7 +539,35 @@ class Watchdog:
 
     # 비동기 Pruna 상태 조회 → 확인된 결과만 9단계 처리로
     def _query(self, job: AsyncFittingJob, report: CheckReport, why: str, *, alert: bool = True):
-        status = self._status.query(job.task_uuid)
+        started = time.monotonic()
+        fields = {
+            "component": "watchdog",
+            "source": "watchdog",
+            "fitting_job_id": job.fitting_job_id,
+            "task_uuid": job.task_uuid,
+            "check_reason": why,
+        }
+        try:
+            status = self._status.query(job.task_uuid)
+        except Exception as error:
+            diag.event(
+                "runware_status_checked",
+                logging.WARNING,
+                **fields,
+                result="error",
+                error_type=type(error).__name__,
+                elapsed_ms=diag.elapsed_ms(started),
+            )
+            raise
+        diag.event(
+            "runware_status_checked",
+            **fields,
+            result=status.kind.value,
+            called=getattr(self._status, "last_called", "unknown"),
+            http_status=getattr(status, "http_status", None) or "unknown",
+            error_code=diag.safe(getattr(status, "error_code", None), 64),
+            elapsed_ms=diag.elapsed_ms(started),
+        )
         report.actions.append(f"query_{why}_{status.kind.value}")
         if status.kind is TaskStatusKind.SUCCEEDED:
             self._apply(
@@ -903,6 +910,7 @@ def create_watchdog(components: Callable[[], dict[str, Any]] = dict) -> Watchdog
         ),
         costs=TaskCostRepository(pool),
         queue=sqs,
+        source="watchdog",  # 진단: 이 경로의 처리는 HTTP Webhook 이 아니다
     )
     worker: WatchdogWorker
 

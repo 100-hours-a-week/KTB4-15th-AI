@@ -1,14 +1,3 @@
-"""가상피팅 V2 단계별 진단 로그(CloudWatch 에서 한 작업을 끝까지 추적하기 위한 것).
-
-출력: 기존 formatter 의 message 자리에 `vf_diag event=<이름> key=value ...` 한 줄. `logging.extra` 에만 넣지 않는다
-(기존 formatter 가 출력하지 않으므로). 값은 안전한 문자 집합으로 바꾸고 길이를 제한해 줄바꿈·필드 위조를 막는다.
-
-남기지 않는 것: API Key·토큰·비밀번호·DATABASE_URL·Presigned/Webhook URL·메시지 본문·결과 payload·외부 응답 전문·
-사용자 사진 Key·이미지 URL·생성 제목·코멘트·ReceiptHandle. 호출하는 쪽은 이런 값을 넘기지 않는다.
-
-모든 줄에 run_id(이 프로세스 실행 식별자, 시작할 때 한 번 만든 임의 값)를 붙인다. 같은 run_id 면 같은 프로세스다.
-"""
-
 import hashlib
 import logging
 import os
@@ -46,9 +35,13 @@ def codes(values: Iterable[Any]) -> str:
 
 
 def event(name: str, level: int = logging.INFO, **fields: Any) -> None:
-    parts = [f"event={safe(name)}", f"run_id={RUN_ID}"]
-    parts += [f"{key}={safe(value, 240)}" for key, value in fields.items()]
-    logger.log(level, "vf_diag %s", " ".join(parts))
+    """진단 한 줄. 값 변환·출력이 실패해도 호출한 업무 처리로 예외를 올리지 않는다."""
+    try:
+        parts = [f"event={safe(name)}", f"run_id={RUN_ID}"]
+        parts += [f"{key}={safe(value, 240)}" for key, value in fields.items()]
+        logger.log(level, "vf_diag %s", " ".join(parts))
+    except Exception:  # noqa: BLE001, S110 — 진단 실패가 업무 처리를 막지 않게(출력 자체가 실패한 경우라 남길 곳이 없다)
+        pass
 
 
 def elapsed_ms(started: float) -> int:
