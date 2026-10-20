@@ -184,15 +184,6 @@ class FollowUpProcessor:
 
     def process(self, item: ValidFollowUp | InvalidFollowUp) -> RequestOutcome:
         if isinstance(item, InvalidFollowUp):
-            logger.error(
-                "ai-fitting-response invalid message kept for DLQ message_id=%s fitting_job_id=%s "
-                "kind=%s field=%s receive_count=%s",
-                item.message_id,
-                item.fitting_job_id,
-                item.error.kind.value,
-                item.error.field,
-                item.approximate_receive_count,
-            )
             return RequestOutcome(item.message_id, item.fitting_job_id, "invalid_kept")
         try:
             return self._valid(item)
@@ -228,16 +219,6 @@ class FollowUpProcessor:
         job_id, action = message.fitting_job_id, message.action
 
         def outcome(name: str, delete: bool = False) -> RequestOutcome:
-            logger.info(
-                "ai-fitting-response processed fitting_job_id=%s message_id=%s action=%s "
-                "outcome=%s delete=%s receive_count=%s",
-                job_id,
-                item.message_id,
-                action.value,
-                name,
-                delete,
-                item.approximate_receive_count,
-            )
             return RequestOutcome(item.message_id, job_id, name, delete)
 
         job = self._jobs.find_by_fitting_job_id(job_id)

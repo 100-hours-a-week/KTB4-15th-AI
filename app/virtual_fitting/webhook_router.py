@@ -31,7 +31,9 @@ from app.virtual_fitting.runware_webhook import (
 
 logger = logging.getLogger(__name__)
 
-# Runware 권장 응답 시간(약 5초)보다 조금 짧게. DB·SQS 대기 전체에 건다.
+# Runware 권장 응답 시간(약 5초)보다 조금 짧게. DB·연결 풀·SQS 대기를 모두 포함한 처리 전체에 건다.
+# 넘기면 503 WEBHOOK_TIMEOUT 으로 먼저 응답하고, 처리 thread 는 계속 돌 수 있다(모든 단계가 반복해도 같은 결과).
+# Webhook 전용 SQS client 의 timeout(app.clients.sqs, 연결 1초·응답 2초)은 이보다 짧게 맞춘다.
 WEBHOOK_DEADLINE_SECONDS = 4.5
 # 동시에 Webhook 처리에 쓰는 worker thread 수. 시간 초과로 버려진 처리가 쌓여도 다른 요청 thread 를 다 쓰지 않게 한다.
 WEBHOOK_THREADS = 8

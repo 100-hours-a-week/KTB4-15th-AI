@@ -56,13 +56,26 @@ def image_commit() -> str:
     return "unknown"
 
 
+def hostname() -> str:
+    """이 프로세스의 호스트 이름(컨테이너면 task 마다 다름). 읽지 못하면 unknown."""
+    try:
+        return safe(socket.gethostname(), 64)
+    except Exception:  # noqa: BLE001 — 진단 값만 포기
+        return "unknown"
+
+
+def process_fields() -> dict[str, Any]:
+    """어느 프로세스인지(run_id 는 모든 줄에 이미 있다). 여러 task·컨테이너가 같은 큐를 읽을 때 구분용."""
+    return {"hostname": hostname(), "pid": os.getpid()}
+
+
 def app_start(flags: dict[str, bool]) -> None:
     """앱 시작: 이미지 커밋·프로세스 식별자·네 Worker 설정의 해석값(꺼져 있어도 남긴다)."""
     event(
         "app_start",
         component="app",
         image_commit=image_commit(),
-        hostname=safe(socket.gethostname(), 64),
+        hostname=hostname(),
         pid=os.getpid(),
         **{f"{name}_enabled": value for name, value in flags.items()},
     )

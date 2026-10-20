@@ -140,15 +140,14 @@ def test_normal_request_is_traceable_by_one_job_id(env, rendered):
     env.send_request(JOB)
     stack.request_once()
     names = [e["event"] for e in events(rendered) if e.get("fitting_job_id") == str(JOB)]
-    assert names[:5] == [
-        "request_validated",
+    assert names[:4] == [
+        "message_validated",
         "job_save_started",
         "job_saved",
         "product_lookup",
-        "request_decision",
     ]
-    (received,) = events(rendered, "request_received")
-    (validated,) = events(rendered, "request_validated")
+    (received,) = events(rendered, "message_received")
+    (validated,) = events(rendered, "message_validated")
     assert received["message_id"] == validated["message_id"] and received["receive_count"] == "1"
     (lookup,) = events(rendered, "product_lookup")
     assert (
@@ -173,8 +172,7 @@ def test_missing_product_logs_requested_found_missing_and_the_saved_failure(env,
     (saved,) = events(rendered, "failure_result_saved")
     assert saved["error_code"] == "PRODUCT_NOT_FOUND" and saved["change"] == "applied"
     assert events(rendered, "product_lookup_failed") == []
-    (decision,) = events(rendered, "request_decision")
-    assert decision["action"] == "failure_saved_PRODUCT_NOT_FOUND"
+    assert events(rendered, "message_processing_result") == []  # worker 루프에서 기록
 
 
 def test_db_error_on_products_is_not_logged_as_a_missing_product(env, rendered):
@@ -298,11 +296,12 @@ def test_delete_decision_and_api_result_are_separate(rendered, decision):
     asyncio.run(run())
     names = [e["event"] for e in events(rendered) if e.get("message_id") == "m-1"]
     expected = {
-        "delete_ok": ["message_deleted"],
-        "delete_failed": ["message_delete_failed"],
-        "kept": ["message_kept"],
+        "delete_ok": ["message_processing_result", "message_delete_result"],
+        "delete_failed": ["message_processing_result", "message_delete_result"],
+        "kept": ["message_processing_result"],
     }
-    assert names == expected[decision]
+    # 처리 대상 선택(message_selected) 뒤에 결정 한 줄
+    assert names == ["message_selected", *expected[decision]]
     assert "RECEIPT-SECRET-HANDLE" not in rendered.getvalue()
 
 
@@ -311,7 +310,7 @@ def test_delete_decision_and_api_result_are_separate(rendered, decision):
 
 def test_rendered_line_format_and_injection_safety(rendered):
     diag.event(
-        "request_received",
+        "message_received",
         component="request_worker",
         message_id="a b\nevent=forged",
         receive_count=None,
@@ -547,7 +546,7 @@ def test_db_target_without_fingerprint_is_unverified_and_rolled_back(
         admin.close()
 
 
-# 14. 두 요청: request_validated 한 줄에 같은 요청의 message_id·fitting_job_id 가 함께 나오고 서로 섞이지 않는다
+# 14. 두 요청: message_validated 한 줄에 같은 요청의 message_id·fitting_job_id 가 함께 나오고 서로 섞이지 않는다
 
 
 def test_two_requests_link_message_id_to_job_id_on_one_line(env, rendered):
@@ -556,8 +555,8 @@ def test_two_requests_link_message_id_to_job_id_on_one_line(env, rendered):
     stack = Stack(env).mark_running()
     outcomes = stack.request_once() + stack.request_once()  # 한 번 수신에 한 건씩
     assert sorted(o.fitting_job_id for o in outcomes) == [first, second]
-    received = events(rendered, "request_received")
-    validated = events(rendered, "request_validated")
+    received = events(rendered, "message_received")
+    validated = events(rendered, "message_validated")
     assert {e["message_id"] for e in received} == set(sent)
     # 최종 출력 한 줄에 둘 다 있다(extra 가 아니라 렌더링된 문자열에서 읽음)
     assert {e["message_id"]: int(e["fitting_job_id"]) for e in validated} == sent

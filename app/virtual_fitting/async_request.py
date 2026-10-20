@@ -23,8 +23,6 @@ from app.clients.sqs import FittingQueue, ReceivedMessage, SqsQueueClient, SqsRe
 from app.virtual_fitting import diagnostics as diag
 from app.virtual_fitting.repositories.async_job_repository import MAX_PRODUCTS, _check_job_id
 
-logger = logging.getLogger(__name__)
-
 REQUIRED_FIELDS = ("fitting_job_id", "requested_at", "user_image_key", "products")
 
 
@@ -237,49 +235,40 @@ def receive_fitting_requests(
     )
     if not result.succeeded:
         return RequestBatch(receive_result=result)
-    messages = tuple(_classify(message) for message in result.messages)
-    for item in messages:
-        # 수신 직후(작업 저장 전). 수신 횟수는 SQS 의 ApproximateReceiveCount, 없으면 unknown.
-        count = item.approximate_receive_count
+    messages = []
+    for message in result.messages:
+        count = message.approximate_receive_count
         diag.event(
-            "request_received",
+            "message_received",
             component="request_worker",
-            message_id=item.message_id,
+            worker="request",
+            queue="be-fitting-request",
+            message_id=message.message_id,
             receive_count=count if count is not None else "unknown",
         )
+        item = _classify(message)
         if isinstance(item, ValidRequestMessage):
             diag.event(
-                "request_validated",
+                "message_validated",
                 component="request_worker",
+                worker="request",
+                queue="be-fitting-request",
                 message_id=item.message_id,
+                message_valid=True,
                 fitting_job_id=item.request.fitting_job_id,
                 product_codes=diag.codes(item.request.product_codes),
             )
         else:
             diag.event(
-                "request_invalid",
+                "message_validation_failed",
                 logging.WARNING,
                 component="request_worker",
+                worker="request",
+                queue="be-fitting-request",
                 message_id=item.message_id,
-                fitting_job_id=item.fitting_job_id,
+                message_valid=False,
                 error_kind=item.error.kind.value,
                 field=item.error.field,
             )
-        if isinstance(item, InvalidRequestMessage):
-            logger.warning(
-                "be-fitting-request invalid message_id=%s fitting_job_id=%s kind=%s field=%s "
-                "receive_count=%s",
-                item.message_id,
-                item.fitting_job_id,
-                item.error.kind.value,
-                item.error.field,
-                item.approximate_receive_count,
-            )
-    if messages:
-        logger.info(
-            "be-fitting-request received=%s valid=%s invalid=%s",
-            len(messages),
-            sum(isinstance(item, ValidRequestMessage) for item in messages),
-            sum(isinstance(item, InvalidRequestMessage) for item in messages),
-        )
-    return RequestBatch(receive_result=result, messages=messages)
+        messages.append(item)
+    return RequestBatch(receive_result=result, messages=tuple(messages))

@@ -311,3 +311,67 @@ def test_logging_failure_does_not_change_the_webhook_result(env, rendered, monke
     assert response.json()["data"]["results"][0]["outcome"] == "applied"
     assert env.job(JOB).next_action.value == "POSTPROCESS"
     assert rendered.getvalue().count(" vf_diag ") == before  # 출력은 실패했고 처리 결과는 같다
+
+
+# 8. 처리 시간 초과·예기치 않은 처리 오류도 수신 → 검증 → 응답이 같은 request_id 로 이어진다
+
+
+def _any_success_body() -> bytes:
+    import json
+    import uuid
+
+    return json.dumps(
+        {
+            "taskType": "imageInference",
+            "taskUUID": str(uuid.uuid4()),
+            "imageUUID": str(uuid.uuid4()),
+            "imageURL": "https://im.runware.ai/image/fake/result.jpg",
+        }
+    ).encode()
+
+
+def test_timeout_and_unhandled_error_are_linked_to_the_received_request(
+    env,  # noqa: F811
+    rendered,  # noqa: F811
+    monkeypatch,
+):
+    import threading
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    release = threading.Event()
+
+    def slow(events_):
+        release.wait(5)
+        return []
+
+    monkeypatch.setattr(webhook_router, "WEBHOOK_DEADLINE_SECONDS", 0.2)
+    monkeypatch.setattr(webhook_router, "_process", slow)
+    timed_out = post_webhook(client(), _any_success_body())
+    release.set()
+
+    def broken(events_):
+        raise RuntimeError("unexpected token=SHOULD_NOT_APPEAR")
+
+    monkeypatch.setattr(webhook_router, "_process", broken)
+    crashed = post_webhook(TestClient(app, raise_server_exceptions=False), _any_success_body())
+
+    assert (timed_out.status_code, timed_out.json()["code"]) == (503, "WEBHOOK_TIMEOUT")
+    assert crashed.status_code == 500
+    first, second = events(rendered, "webhook_http_received")
+    for received, (status, code) in (
+        (first, ("503", "WEBHOOK_TIMEOUT")),
+        (second, ("500", "unhandled_exception")),
+    ):
+        names = [e["event"] for e in chain(rendered, received["request_id"])]
+        assert names == ["webhook_http_received", "webhook_validation", "webhook_http_completed"]
+        (completed,) = [
+            e
+            for e in events(rendered, "webhook_http_completed")
+            if e["request_id"] == received["request_id"]
+        ]
+        assert (completed["http_status"], completed["code"]) == (status, code)
+    no_secrets(rendered)
+    assert "SHOULD_NOT_APPEAR" not in rendered.getvalue()

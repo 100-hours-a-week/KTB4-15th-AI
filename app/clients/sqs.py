@@ -178,16 +178,20 @@ def get_sqs_client() -> Any:
     )
 
 
-# Webhook 처리(응답 목표 약 5초) 안에서 쓰는 전송 timeout(초). 기본 client(60초)를 쓰면 응답이 늦어진다.
-WEBHOOK_CONNECT_TIMEOUT_SECONDS = 10.0
-WEBHOOK_READ_TIMEOUT_SECONDS = 10.0
+# Webhook 처리 안에서 쓰는 SQS 호출 timeout(초). Webhook 전체 처리 제한(webhook_router.WEBHOOK_DEADLINE_SECONDS,
+# 4.5초)보다 짧게 둔다. 이 값은 SQS 호출 한 번의 연결·응답 대기 상한일 뿐이고, 같은 처리 안의 DB 조회·기록과
+# 연결 풀 대기 등은 따로 걸리므로 이것만으로 전체 처리가 4.5초 안에 끝난다는 보장은 아니다(전체 상한은 Router 가 건다).
+# 기본 client(botocore 기본 60초)를 쓰면 전체 제한을 넘기기 쉽다.
+WEBHOOK_CONNECT_TIMEOUT_SECONDS = 1.0
+WEBHOOK_READ_TIMEOUT_SECONDS = 2.0
 
 
 @lru_cache(maxsize=1)
 def get_webhook_sqs_client() -> Any:
-    """Webhook 전용 SQS client. SDK 재시도를 하지 않고(total_max_attempts=1) 짧은 timeout 을 쓴다.
+    """Webhook 전용 SQS client. SDK 재시도를 하지 않고(total_max_attempts=1) 짧은 timeout(연결 1초·응답 2초)을 쓴다.
 
-    timeout 으로 응답을 받지 못하면 SendMessage 결과는 UNKNOWN 이다(큐에 들어갔을 수 있음).
+    응답 timeout 으로 결과를 받지 못하면 SendMessage 결과는 UNKNOWN 이다(큐에 들어갔을 수 있음). 연결 단계에서
+    실패하면(보내지 못함) 기존 분류대로 FAILED(not_connected)다. 어느 쪽이든 이 모듈은 다시 보내지 않는다.
     """
     import boto3
     from botocore.config import Config

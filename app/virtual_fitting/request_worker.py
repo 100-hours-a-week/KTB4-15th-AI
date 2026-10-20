@@ -440,40 +440,13 @@ class RequestProcessor:
     def _invalid(item: InvalidRequestMessage) -> RequestOutcome:
         # 저장할 수 있는 값이 없다(가짜 사진·상품·시각을 만들지 않는다). 읽힌 작업 번호가 있어도 기존 작업에
         # 실패를 쓰지 않는다. 삭제하지 않으므로 재전달되다가 Redrive Policy 에 따라 DLQ 로 간다(운영 복구 대상).
-        logger.error(
-            "be-fitting-request invalid message kept for DLQ message_id=%s fitting_job_id=%s kind=%s "
-            "field=%s receive_count=%s",
-            item.message_id,
-            item.fitting_job_id,
-            item.error.kind.value,
-            item.error.field,
-            item.approximate_receive_count,
-        )
         return RequestOutcome(item.message_id, item.fitting_job_id, "invalid_kept")
 
     def _valid(self, item: ValidRequestMessage) -> RequestOutcome:
         request = item.request
         job_id = request.fitting_job_id
 
-        started = time.monotonic()
-
         def outcome(action: str, delete: bool = False) -> RequestOutcome:
-            logger.info(
-                "be-fitting-request processed fitting_job_id=%s message_id=%s action=%s delete=%s",
-                job_id,
-                item.message_id,
-                action,
-                delete,
-            )
-            diag.event(
-                "request_decision",
-                component="request_worker",
-                fitting_job_id=job_id,
-                message_id=item.message_id,
-                action=action,
-                delete_decided=delete,
-                elapsed_ms=diag.elapsed_ms(started),
-            )
             return RequestOutcome(item.message_id, job_id, action, delete)
 
         fingerprint = request_fingerprint(request.user_image_key, request.product_codes)
@@ -783,41 +756,105 @@ class RequestWorker:
                 if self._stop.is_set():
                     break  # 남은 메시지는 처리·삭제하지 않는다(다시 보인다).
                 self.status.received += 1
+                # 진단: 이 프로세스(run_id·hostname·pid)의 이 Worker 가 이 메시지를 처리 대상으로 골랐다.
+                # 이후 처리 결과와 실제 삭제 결과를 같은 worker·message_id 로 연결한다.
+                selected = time.monotonic()
+                count = getattr(item, "approximate_receive_count", None)
+                diag.event(
+                    "message_selected",
+                    component=f"{self.name}_worker",
+                    worker=self.name,
+                    queue=(
+                        "be-fitting-request" if self.name == "request" else "ai-fitting-response"
+                    ),
+                    **diag.process_fields(),
+                    message_id=getattr(item, "message_id", None),
+                    receive_count=count if count is not None else "unknown",
+                    **_verified_ids(item),
+                )
                 result = await to_thread.run_sync(self._process, item, limiter=self._limiter)
                 self.status.outcomes[result.action] = self.status.outcomes.get(result.action, 0) + 1
-                fields = {
-                    "component": f"{self.name}_worker",
-                    # 진단 값이 없어도 루프는 계속돼야 한다(로그만을 위해 처리 흐름을 바꾸지 않음).
-                    "fitting_job_id": getattr(result, "fitting_job_id", None),
-                    "message_id": getattr(item, "message_id", None),
-                    "action": getattr(result, "action", None),
-                }
+                identity = _verified_ids(item)
+                diag.event(
+                    "message_processing_result",
+                    component=f"{self.name}_worker",
+                    worker=self.name,
+                    queue=(
+                        "be-fitting-request" if self.name == "request" else "ai-fitting-response"
+                    ),
+                    message_id=getattr(item, "message_id", None),
+                    **identity,
+                    action=getattr(result, "action", None),
+                    delete_decided=result.delete,
+                    processing_elapsed_ms=diag.elapsed_ms(selected),
+                )
                 if result.delete:
+                    delete_started = time.monotonic()
                     deleted = await to_thread.run_sync(
                         self._delete, item.receipt_handle, limiter=self._limiter
                     )
                     if deleted.succeeded:
                         self.status.deleted += 1
                         # SQS DeleteMessage 응답을 받았다는 뜻이다(중복 재전달이 없다는 보장은 아니다).
-                        diag.event("message_deleted", **fields, sqs_result="succeeded")
-                    else:
-                        logger.warning(
-                            "%s worker delete failed message_id=%s reason=%s",
-                            self.name,
-                            item.message_id,
-                            deleted.reason,
-                        )
                         diag.event(
-                            "message_delete_failed",
+                            "message_delete_result",
+                            component=f"{self.name}_worker",
+                            worker=self.name,
+                            queue=(
+                                "be-fitting-request"
+                                if self.name == "request"
+                                else "ai-fitting-response"
+                            ),
+                            message_id=getattr(item, "message_id", None),
+                            **identity,
+                            action=getattr(result, "action", None),
+                            sqs_result="succeeded",
+                            delete_elapsed_ms=diag.elapsed_ms(delete_started),
+                        )
+                    else:
+                        diag.event(
+                            "message_delete_result",
                             logging.WARNING,
-                            **fields,
+                            component=f"{self.name}_worker",
+                            worker=self.name,
+                            queue=(
+                                "be-fitting-request"
+                                if self.name == "request"
+                                else "ai-fitting-response"
+                            ),
+                            message_id=getattr(item, "message_id", None),
+                            **identity,
+                            action=getattr(result, "action", None),
                             sqs_result=deleted.outcome.value,
                             reason=deleted.reason,
+                            delete_elapsed_ms=diag.elapsed_ms(delete_started),
                         )
-                else:
-                    diag.event("message_kept", **fields)
         logger.info("%s worker stopped", self.name)
         diag.event("component_stopped", component=f"{self.name}_worker")
+
+
+def _verified_ids(item: Any) -> dict[str, Any]:
+    """진단용 작업 식별자. 수신 단계에서 이미 검증된 값만 꺼낸다(새로 파싱하지 않음).
+
+    요청(ValidRequestMessage.request)·후처리(ValidFollowUp.message)의 fitting_job_id 는 양의 정수, task_uuid 는
+    UUID 로 검증돼 있다. 형식 오류 메시지의 "읽을 수 있었던" 값은 신뢰하지 않아 남기지 않는다.
+    """
+    try:
+        if getattr(item, "error", None) is not None:
+            return {"message_valid": False}
+        parsed = getattr(item, "request", None) or getattr(item, "message", None)
+        if parsed is None:
+            return {}
+        ids: dict[str, Any] = {"message_valid": True}
+        job_id = getattr(parsed, "fitting_job_id", None)
+        if isinstance(job_id, int) and not isinstance(job_id, bool):
+            ids["fitting_job_id"] = job_id
+        task = getattr(parsed, "task_uuid", None)
+        if isinstance(task, str):
+            ids["task_uuid"] = task
+        return ids
+    except Exception:  # noqa: BLE001 — 진단 값만 포기
+        return {}
 
 
 def create_request_worker() -> RequestWorker:
