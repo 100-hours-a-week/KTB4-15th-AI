@@ -20,6 +20,7 @@ from enum import Enum
 from typing import Any
 
 from app.clients.sqs import FittingQueue, ReceivedMessage, SqsQueueClient, SqsResult
+from app.virtual_fitting import diagnostics as diag
 from app.virtual_fitting.repositories.async_job_repository import NextAction, _check_job_id
 
 logger = logging.getLogger(__name__)
@@ -198,11 +199,41 @@ def receive_follow_ups(
     )
     if not result.succeeded:
         return FollowUpBatch(receive_result=result)
-    messages = tuple(_classify(message) for message in result.messages)
-    if messages:
-        logger.info(
-            "ai-fitting-response received=%s invalid=%s",
-            len(messages),
-            sum(isinstance(item, InvalidFollowUp) for item in messages),
+    messages = []
+    for message in result.messages:
+        count = message.approximate_receive_count
+        diag.event(
+            "message_received",
+            component="postprocess_worker",
+            worker="postprocess",
+            queue="ai-fitting-response",
+            message_id=message.message_id,
+            receive_count=count if count is not None else "unknown",
         )
-    return FollowUpBatch(receive_result=result, messages=messages)
+        item = _classify(message)
+        if isinstance(item, ValidFollowUp):
+            diag.event(
+                "message_validated",
+                component="postprocess_worker",
+                worker="postprocess",
+                queue="ai-fitting-response",
+                message_id=item.message_id,
+                message_valid=True,
+                fitting_job_id=item.message.fitting_job_id,
+                task_uuid=item.message.task_uuid,
+                action=item.message.action.value,
+            )
+        else:
+            diag.event(
+                "message_validation_failed",
+                logging.WARNING,
+                component="postprocess_worker",
+                worker="postprocess",
+                queue="ai-fitting-response",
+                message_id=item.message_id,
+                message_valid=False,
+                error_kind=item.error.kind.value,
+                field=item.error.field,
+            )
+        messages.append(item)
+    return FollowUpBatch(receive_result=result, messages=tuple(messages))

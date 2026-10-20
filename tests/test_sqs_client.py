@@ -215,6 +215,51 @@ def test_real_boto3_client_gets_the_retry_config(monkeypatch, fresh_clients):
     assert client.meta.config.retries == {"mode": "standard", "total_max_attempts": 1}
 
 
+@pytest.fixture
+def fresh_webhook_client():
+    sqs_module.get_webhook_sqs_client.cache_clear()
+    yield
+    sqs_module.get_webhook_sqs_client.cache_clear()
+
+
+def test_webhook_client_uses_short_timeouts_and_one_attempt(
+    monkeypatch, fresh_clients, fresh_webhook_client
+):
+    from app.virtual_fitting.webhook_router import WEBHOOK_DEADLINE_SECONDS
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", ACCESS_KEY)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", SECRET_KEY)
+    webhook = sqs_module.get_webhook_sqs_client()
+    general = get_sqs_client()
+
+    assert webhook.meta.region_name == REGION
+    assert (webhook.meta.config.connect_timeout, webhook.meta.config.read_timeout) == (1.0, 2.0)
+    assert webhook.meta.config.retries == {"mode": "standard", "total_max_attempts": 1}
+    # 연결 + 응답 대기 상한이 Webhook 전체 처리 제한보다 짧다(전체 상한은 Router 가 따로 건다)
+    assert 1.0 + 2.0 < WEBHOOK_DEADLINE_SECONDS == 4.5
+    # 일반 Worker·결과 발행용 client 는 그대로(botocore 기본 60초, 재시도 없음)
+    assert (general.meta.config.connect_timeout, general.meta.config.read_timeout) == (60, 60)
+    assert general.meta.config.retries == {"mode": "standard", "total_max_attempts": 1}
+
+
+def test_webhook_client_read_timeout_is_unknown_and_sent_once(monkeypatch, fresh_webhook_client):
+    """실제 Webhook client(SDK 재시도 설정 포함)로: 응답 timeout 은 UNKNOWN 이고 SDK 도 다시 보내지 않는다."""
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", ACCESS_KEY)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", SECRET_KEY)
+    client = sqs_module.get_webhook_sqs_client()
+    attempts = []
+
+    def no_response(request, **kwargs):  # 네트워크로 나가기 직전에 응답 timeout 을 흉내 낸다
+        attempts.append(request.url)
+        raise ReadTimeoutError(endpoint_url=request.url)
+
+    client.meta.events.register("before-send.sqs.SendMessage", no_response)
+    result = SqsQueueClient(client).send_json(FittingQueue.AI_FITTING_RESPONSE, PAYLOAD)
+
+    assert (result.outcome, result.reason) == (SqsOutcome.UNKNOWN, "timeout")
+    assert len(attempts) == 1
+
+
 # --- 큐별 역할: AI 가 하지 않는 호출은 막는다 ---
 
 
