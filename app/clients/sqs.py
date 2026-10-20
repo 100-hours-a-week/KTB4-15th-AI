@@ -179,8 +179,8 @@ def get_sqs_client() -> Any:
 
 
 # Webhook 처리(응답 목표 약 5초) 안에서 쓰는 전송 timeout(초). 기본 client(60초)를 쓰면 응답이 늦어진다.
-WEBHOOK_CONNECT_TIMEOUT_SECONDS = 1.0
-WEBHOOK_READ_TIMEOUT_SECONDS = 2.0
+WEBHOOK_CONNECT_TIMEOUT_SECONDS = 10.0
+WEBHOOK_READ_TIMEOUT_SECONDS = 10.0
 
 
 @lru_cache(maxsize=1)
