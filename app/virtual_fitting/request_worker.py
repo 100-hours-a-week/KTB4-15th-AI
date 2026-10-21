@@ -34,6 +34,7 @@ from typing import Any, Protocol
 
 from anyio import CapacityLimiter, to_thread
 
+from app import metrics
 from app.clients.s3 import S3ObjectState
 from app.clients.sqs import FittingQueue, SqsQueueClient, SqsResult
 from app.virtual_fitting import diagnostics as diag
@@ -649,6 +650,10 @@ class RequestWorker:
         self.status = WorkerStatus()
 
     @property
+    def queue_name(self) -> str:
+        return "be-fitting-request" if self.name == "request" else "ai-fitting-response"
+
+    @property
     def stopping(self) -> bool:
         return self._stop.is_set()
 
@@ -690,11 +695,13 @@ class RequestWorker:
         self.status.running = False
         if task.cancelled():
             self.status.stopped = True
+            metrics.worker_stopped(self.name, self.queue_name, crashed=False)
             return
         error = task.exception()
         if error is not None:  # 예상하지 못한 종료를 숨기지 않는다.
             self.status.crashed = True
             self.status.last_error = type(error).__name__
+            metrics.worker_stopped(self.name, self.queue_name, crashed=True)
             logger.error("%s worker crashed", self.name, exc_info=error)
             diag.event(
                 "component_crashed",
@@ -704,6 +711,7 @@ class RequestWorker:
             )
         else:
             self.status.stopped = True
+            metrics.worker_stopped(self.name, self.queue_name, crashed=False)
 
     async def _sleep(self, seconds: float) -> None:
         try:
@@ -719,6 +727,7 @@ class RequestWorker:
 
     async def _run(self) -> None:
         self.status.running = True
+        metrics.worker_started(self.name, self.queue_name)
         logger.info("%s worker started", self.name)
         diag.event("component_started", component=f"{self.name}_worker")
         while not self._stop.is_set():
@@ -732,6 +741,9 @@ class RequestWorker:
                 # 설정 오류 등. 빠르게 반복하지 않고 물러난다.
                 self.status.consecutive_errors += 1
                 self.status.last_error = type(error).__name__
+                metrics.worker_receive_failed(
+                    self.name, self.queue_name, self.status.consecutive_errors
+                )
                 logger.exception(
                     "%s worker receive crashed; backing off %.1fs", self.name, self._backoff()
                 )
@@ -740,6 +752,9 @@ class RequestWorker:
             if not batch.received:
                 self.status.consecutive_errors += 1
                 self.status.last_error = batch.receive_result.reason
+                metrics.worker_receive_failed(
+                    self.name, self.queue_name, self.status.consecutive_errors
+                )
                 logger.warning(
                     "%s worker receive failed reason=%s; backing off %.1fs",
                     self.name,
@@ -749,6 +764,7 @@ class RequestWorker:
                 await self._sleep(self._backoff())
                 continue
             self.status.consecutive_errors = 0
+            metrics.worker_receive_succeeded(self.name, self.queue_name)
             if not batch.messages:
                 await self._sleep(self._idle)
                 continue
@@ -756,6 +772,7 @@ class RequestWorker:
                 if self._stop.is_set():
                     break  # 남은 메시지는 처리·삭제하지 않는다(다시 보인다).
                 self.status.received += 1
+                metrics.message_received(self.name, self.queue_name)
                 # 진단: 이 프로세스(run_id·hostname·pid)의 이 Worker 가 이 메시지를 처리 대상으로 골랐다.
                 # 이후 처리 결과와 실제 삭제 결과를 같은 worker·message_id 로 연결한다.
                 selected = time.monotonic()
@@ -772,7 +789,24 @@ class RequestWorker:
                     receive_count=count if count is not None else "unknown",
                     **_verified_ids(item),
                 )
-                result = await to_thread.run_sync(self._process, item, limiter=self._limiter)
+                metrics.message_processing_started(self.name, self.queue_name)
+                processing_started = time.monotonic()
+                try:
+                    result = await to_thread.run_sync(self._process, item, limiter=self._limiter)
+                except BaseException:
+                    metrics.message_processing_finished(
+                        self.name,
+                        self.queue_name,
+                        "exception",
+                        time.monotonic() - processing_started,
+                    )
+                    raise
+                metrics.message_processing_finished(
+                    self.name,
+                    self.queue_name,
+                    result.action,
+                    time.monotonic() - processing_started,
+                )
                 self.status.outcomes[result.action] = self.status.outcomes.get(result.action, 0) + 1
                 identity = _verified_ids(item)
                 diag.event(
@@ -794,6 +828,7 @@ class RequestWorker:
                         self._delete, item.receipt_handle, limiter=self._limiter
                     )
                     if deleted.succeeded:
+                        metrics.message_delete_finished(self.name, self.queue_name, "succeeded")
                         self.status.deleted += 1
                         # SQS DeleteMessage 응답을 받았다는 뜻이다(중복 재전달이 없다는 보장은 아니다).
                         diag.event(
@@ -812,6 +847,7 @@ class RequestWorker:
                             delete_elapsed_ms=diag.elapsed_ms(delete_started),
                         )
                     else:
+                        metrics.message_delete_finished(self.name, self.queue_name, "failed")
                         diag.event(
                             "message_delete_result",
                             logging.WARNING,

@@ -11,6 +11,8 @@ numpy
 mediapipe
 opencv-python-headless
 python-multipart
+prometheus-client
+prometheus-fastapi-instrumentator
 rembg[cpu]
 # app/body_image_validation/remote.py 가 직접 쓴다(httpx.AsyncClient). 0.x 는 minor 마다 API 가 바뀐다.
 httpx>=0.28.1,<0.29

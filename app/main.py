@@ -21,6 +21,7 @@ from app.config.checkpointer import checkpointer_scope
 from app.config.database import close_async_pool, close_connection_pool, open_async_pool
 from app.config.logging_config import LOGGING_CONFIG, configure_logging
 from app.errors import register_error_handlers
+from app.metrics import setup_metrics
 from app.virtual_fitting import diagnostics as vf_diag
 from app.virtual_fitting import router as virtual_fitting_router
 from app.virtual_fitting import webhook_router as virtual_fitting_webhook_router
@@ -166,6 +167,7 @@ def _log_fitting_db_target() -> None:
 
 
 app = FastAPI(title="KTB4-15th AI Server", lifespan=lifespan)
+setup_metrics(app)
 
 register_error_handlers(app)
 app.include_router(health_router.router)
