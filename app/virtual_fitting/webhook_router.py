@@ -1,6 +1,7 @@
 import hmac
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import Iterator
@@ -143,6 +144,52 @@ def _validation(request_id: str, stage: str, result: str, reason: str, **fields)
     )
 
 
+# 진단: 수신 헤더 관찰(이름·존재 여부만). Runware 가 실제로 어떤 인증·서명 헤더를 보내는지 확인하려는 것이며
+# 헤더가 있다고 Runware 발신이나 서명이 유효하다는 뜻은 아니다. 인증은 기존 쿼리 token 검증만 한다.
+_SIGNAL_HEADERS = (
+    "authorization",
+    "x-webhook-token",
+    "x-webhook-signature",
+    "x-signature",
+    "webhook-signature",
+    "webhook-id",
+    "webhook-timestamp",
+)
+# HTTP header 이름(token 문자)만. 그 밖(제어문자·공백·비 ASCII 등)은 이름도 남기지 않고 invalid 로 센다.
+_HEADER_NAME = re.compile(r"[a-z0-9!#$%&'*+.^_`|~-]{1,64}")
+_MAX_HEADER_NAMES = 40
+_HEADER_NAMES_BUDGET = 230  # diag 값 길이 상한(240) 안에서 이름 중간이 잘리지 않게
+
+
+def _header_fields(request: Request) -> dict:
+    """수신 헤더의 이름 목록·대표 인증/서명 헤더 존재 여부·쿼리 token 개수. 헤더 값·쿼리 값은 읽지 않는다."""
+    try:
+        names = []
+        for raw_name, _value in request.headers.raw:  # 값은 쓰지 않는다
+            name = raw_name.decode("latin-1").lower()
+            names.append(name if _HEADER_NAME.fullmatch(name) else "invalid")
+        unique = list(dict.fromkeys(names))
+        shown, used = [], 0
+        for name in unique[:_MAX_HEADER_NAMES]:
+            if used + len(name) + 1 > _HEADER_NAMES_BUDGET:
+                break
+            shown.append(name)
+            used += len(name) + 1
+        present = set(unique)
+        tokens = len(request.query_params.getlist("token"))
+        return {
+            "header_count": len(names),
+            "header_names": ",".join(shown) or "none",
+            "header_names_truncated": len(shown) < len(unique),
+            # <이름>_present 형식(has_<이름>= 이면 "token=" 같은 비밀값 패턴처럼 보여 검사·검색에 걸린다)
+            **{f"{name.replace('-', '_')}_present": name in present for name in _SIGNAL_HEADERS},
+            "query_token_present": tokens > 0,
+            "query_token_count": tokens,
+        }
+    except Exception:  # noqa: BLE001 — 진단 값만 포기
+        return {"header_names": "unavailable"}
+
+
 def _token_reason(request: Request) -> str:
     count = len(request.query_params.getlist("token"))  # 개수만 본다(값은 남기지 않음)
     return "token_missing" if count == 0 else "token_multiple" if count > 1 else "token_mismatch"
@@ -163,7 +210,11 @@ async def runware_webhook(request: Request):
     request_id, started = uuid.uuid4().hex[:16], time.monotonic()
     context = _REQUEST_ID.set(request_id)
     diag.event(
-        "webhook_http_received", component="webhook", source="webhook", request_id=request_id
+        "webhook_http_received",
+        component="webhook",
+        source="webhook",
+        request_id=request_id,
+        **_header_fields(request),
     )
     http_status, code = status.HTTP_500_INTERNAL_SERVER_ERROR, "unhandled_exception"
     try:

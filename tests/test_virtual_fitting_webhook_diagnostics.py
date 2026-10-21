@@ -375,3 +375,212 @@ def test_timeout_and_unhandled_error_are_linked_to_the_received_request(
         assert (completed["http_status"], completed["code"]) == (status, code)
     no_secrets(rendered)
     assert "SHOULD_NOT_APPEAR" not in rendered.getvalue()
+
+
+# 9. 수신 헤더 관찰: 이름 목록·대표 인증/서명 헤더 존재 여부·쿼리 token 개수만(값은 어떤 것도 남기지 않음)
+
+SIGNAL_FLAGS = (
+    "authorization_present",
+    "x_webhook_token_present",
+    "x_webhook_signature_present",
+    "x_signature_present",
+    "webhook_signature_present",
+    "webhook_id_present",
+    "webhook_timestamp_present",
+)
+SECRET_VALUES = (
+    "SECRETJWT.eyJhbGciOi.abc",
+    "SECRETSIG-0123456789abcdef",
+    "SECRETCOOKIE-session",
+    "SECRETRUNWARESIG-xyz",
+    "SECRETWEBHOOKTOKEN-hdr",
+    "SECRETBODYVALUE",
+    "SECRETQUERYEXTRA",
+)
+
+
+def _post(body: bytes, *, params, headers=None):
+    return client().post("/api/v2/webhooks/runware", params=params, content=body, headers=headers)
+
+
+def test_request_without_auth_headers_logs_names_and_flags_only(env, rendered):  # noqa: F811
+    stack = Stack(env).mark_running()
+    task = submitted(env, stack, JOB)
+    response = _post(env.runware.complete(task), params={"token": WEBHOOK_TOKEN})
+    assert response.status_code == 200 and response.json()["code"] == "WEBHOOK_PROCESSED"
+    (received,) = events(rendered, "webhook_http_received")
+    assert {received[f] for f in SIGNAL_FLAGS} == {"false"}
+    assert (received["query_token_present"], received["query_token_count"]) == ("true", "1")
+    names = received["header_names"].split(",")
+    assert "content-length" in names and "host" in names
+    assert received["header_names_truncated"] == "false"
+    assert int(received["header_count"]) == len(names)
+    no_secrets(rendered)
+
+
+def test_arbitrary_auth_and_signature_headers_are_seen_by_name_never_by_value(
+    env,  # noqa: F811
+    rendered,  # noqa: F811
+):
+    stack = Stack(env).mark_running()
+    task = submitted(env, stack, JOB)
+    body = env.runware.complete(task).replace(
+        b'"taskType"', b'"note": "SECRETBODYVALUE", "taskType"'
+    )
+    headers = {
+        "Authorization": f"Bearer {SECRET_VALUES[0]}",
+        "X-Webhook-Signature": SECRET_VALUES[1],
+        "Cookie": SECRET_VALUES[2],
+        "X-Runware-Signature": SECRET_VALUES[3],  # 예시 목록에 없는 서명 헤더도 이름으로 보인다
+        "X-Webhook-Token": SECRET_VALUES[4],
+        "Webhook-Id": "msg_SECRETSIG-0123456789abcdef",
+    }
+    response = _post(
+        body, params={"token": WEBHOOK_TOKEN, "extra": SECRET_VALUES[6]}, headers=headers
+    )
+    # 헤더가 있어도 인증·처리는 기존과 같다(쿼리 token 으로만 판단)
+    assert response.status_code == 200 and response.json()["code"] == "WEBHOOK_PROCESSED"
+    (received,) = events(rendered, "webhook_http_received")
+    flags = {f: received[f] for f in SIGNAL_FLAGS}
+    assert flags == {
+        "authorization_present": "true",
+        "x_webhook_token_present": "true",
+        "x_webhook_signature_present": "true",
+        "x_signature_present": "false",
+        "webhook_signature_present": "false",
+        "webhook_id_present": "true",
+        "webhook_timestamp_present": "false",
+    }
+    names = received["header_names"].split(",")
+    assert {"x-runware-signature", "cookie", "authorization"} <= set(names)
+    text = rendered.getvalue()
+    for secret in (*SECRET_VALUES, "Bearer", "msg_"):
+        assert secret not in text, secret
+    no_secrets(rendered)
+
+
+def test_wrong_token_with_auth_header_is_still_401(env, rendered):  # noqa: F811
+    """인증 헤더가 있어도 쿼리 token 이 틀리면 거절(새 헤더 인증 없음)."""
+    stack = Stack(env).mark_running()
+    task = submitted(env, stack, JOB)
+    response = _post(
+        env.runware.complete(task),
+        params={"token": "wrong"},
+        headers={"Authorization": f"Bearer {WEBHOOK_TOKEN}", "X-Webhook-Token": WEBHOOK_TOKEN},
+    )
+    assert response.status_code == 401 and response.json()["code"] == "UNAUTHORIZED"
+    (received,) = events(rendered, "webhook_http_received")
+    assert received["authorization_present"] == "true" and received["query_token_count"] == "1"
+    (validation,) = events(rendered, "webhook_validation")
+    assert (validation["stage"], validation["reason"]) == ("token", "token_mismatch")
+    assert events(rendered, "runware_result_processed") == []
+    assert env.job(JOB).status.value == "WAITING_PRUNA"  # 상태 변화 없음
+    no_secrets(rendered)
+
+
+@pytest.mark.parametrize("case", ["ok", "bad_token", "bad_body", "timeout"])
+def test_received_headers_link_to_validation_processing_and_completion(
+    env,  # noqa: F811
+    rendered,  # noqa: F811
+    monkeypatch,
+    case,
+):
+    import threading
+
+    stack = Stack(env).mark_running()
+    task = submitted(env, stack, JOB)
+    headers = {"Webhook-Signature": SECRET_VALUES[1], "Webhook-Timestamp": "1760000000"}
+    params, body = {"token": WEBHOOK_TOKEN}, env.runware.complete(task)
+    release = threading.Event()
+    if case == "bad_token":
+        params = {}
+    elif case == "bad_body":
+        body = b'{"SECRETBODYVALUE": '
+    elif case == "timeout":
+
+        def slow(events_):
+            release.wait(5)
+            return []
+
+        monkeypatch.setattr(webhook_router, "WEBHOOK_DEADLINE_SECONDS", 0.2)
+        monkeypatch.setattr(webhook_router, "_process", slow)
+    response = _post(body, params=params, headers=headers)
+    release.set()
+
+    expected = {
+        "ok": (200, "WEBHOOK_PROCESSED", ("body", "passed", "ok")),
+        "bad_token": (401, "UNAUTHORIZED", ("token", "rejected", "token_missing")),
+        "bad_body": (400, "INVALID_REQUEST", ("body", "rejected", "invalid_json")),
+        "timeout": (503, "WEBHOOK_TIMEOUT", ("body", "passed", "ok")),
+    }[case]
+    assert (response.status_code, response.json()["code"]) == expected[:2]
+    (received,) = events(rendered, "webhook_http_received")
+    assert received["webhook_signature_present"] == "true"
+    assert received["webhook_timestamp_present"] == "true"
+    assert received["query_token_present"] == ("false" if case == "bad_token" else "true")
+    line = chain(rendered, received["request_id"])
+    names = [e["event"] for e in line]
+    assert names[0] == "webhook_http_received" and names[-1] == "webhook_http_completed"
+    (validation,) = [e for e in line if e["event"] == "webhook_validation"]
+    assert (validation["stage"], validation["result"], validation["reason"]) == expected[2]
+    if validation["result"] == "passed":
+        assert validation["task_uuid"] == task  # 검증된 뒤에만
+    else:
+        assert "task_uuid" not in validation and "fitting_job_id" not in validation
+    processed = [e for e in line if e["event"] == "runware_result_processed"]
+    if case == "ok":
+        (result,) = processed
+        assert result["source"] == "webhook" and result["outcome"] == "applied"
+        assert result["fitting_job_id"] == str(JOB) and result["next_action"] == "POSTPROCESS"
+    else:
+        assert processed == []
+    completed = line[-1]
+    assert (completed["http_status"], completed["code"]) == (str(expected[0]), expected[1])
+    assert int(completed["elapsed_ms"]) >= 0
+    text = rendered.getvalue()
+    assert SECRET_VALUES[1] not in text and "SECRETBODYVALUE" not in text
+    no_secrets(rendered)
+
+
+def test_header_names_are_sanitized_bounded_and_never_raise():
+    from types import SimpleNamespace
+
+    def request(raw, tokens=()):
+        return SimpleNamespace(
+            headers=SimpleNamespace(raw=raw),
+            query_params=SimpleNamespace(getlist=lambda name: list(tokens)),
+        )
+
+    fields = webhook_router._header_fields(
+        request(
+            [
+                (b"X-Bad\x01Name", b"SECRET1"),
+                (b"x bad", b"SECRET2"),
+                ("ä-name".encode("latin-1"), b"SECRET3"),
+                (b"Authorization", b"SECRET4"),
+            ],
+            tokens=("a", "b"),
+        )
+    )
+    assert (
+        fields["header_names"] == "invalid,authorization"
+    )  # 제어문자·공백·비 ASCII 이름은 invalid
+    assert fields["header_count"] == 4 and fields["authorization_present"] is True
+    assert (fields["query_token_present"], fields["query_token_count"]) == (True, 2)
+    assert "SECRET" not in repr(fields)
+
+    many = webhook_router._header_fields(
+        request([(f"x-custom-header-{i:03d}".encode(), b"v") for i in range(80)])
+    )
+    assert many["header_names_truncated"] is True and many["header_count"] == 80
+    assert len(many["header_names"]) <= 230
+    assert all(name.startswith("x-custom-header-") for name in many["header_names"].split(","))
+
+    class Broken:
+        @property
+        def raw(self):
+            raise RuntimeError("boom")
+
+    assert webhook_router._header_fields(SimpleNamespace(headers=Broken(), query_params=None)) == {
+        "header_names": "unavailable"
+    }
