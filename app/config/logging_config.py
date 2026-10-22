@@ -9,6 +9,7 @@ uvicorn 기본 LOGGING_CONFIG(uvicorn.config)와 같은 handler/logger 구성을
 
 import logging
 import logging.config
+import re
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -29,8 +30,53 @@ class _KstTimeMixin:
         )
 
 
+# URL query 의 비밀값(Webhook token 등). 접근 로그의 요청 줄에서 값만 가린다.
+_SECRET_QUERY = re.compile(r"([?&](?:token|webhook_token)=)[^&\s]*", re.IGNORECASE)
+
+
+def redact_query_secrets(text: str) -> str:
+    return _SECRET_QUERY.sub(r"\1<redacted>", text)
+
+
+class RedactQuerySecretsFilter(logging.Filter):
+    """uvicorn 접근 로그의 경로(args[2], query 포함)에서 token 값을 가린다. 로그 줄 자체는 남긴다."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            record.args = (*args[:2], redact_query_secrets(args[2]), *args[3:])
+        return True
+
+
+# 최종 출력(메시지·예외 traceback 포함)에서 비밀이 될 수 있는 부분을 가린다. 스택 구조와 예외 종류는 남긴다.
+_REDACTIONS = (
+    (
+        re.compile(r"\b(postgres(?:ql)?|mysql)(\+\w+)?://[^\s'\"<>]+", re.IGNORECASE),
+        r"\1://<redacted>",
+    ),
+    (re.compile(r"(https?://[^\s?'\"<>]+)\?[^\s'\"<>]*", re.IGNORECASE), r"\1?<redacted>"),
+    (re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=\-]+", re.IGNORECASE), "Bearer <redacted>"),
+    (
+        re.compile(
+            r"\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key)"
+            r"(\s*[=:]\s*)[^\s,'\"&;]+",
+            re.IGNORECASE,
+        ),
+        r"\1\2<redacted>",
+    ),
+    (re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b"), "<redacted-aws-key>"),
+)
+
+
+def redact_secrets(text: str) -> str:
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 class KstDefaultFormatter(_KstTimeMixin, DefaultFormatter):
-    pass
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_secrets(super().format(record))
 
 
 class KstAccessFormatter(_KstTimeMixin, AccessFormatter):
@@ -55,6 +101,7 @@ LOGGING_CONFIG: dict[str, Any] = {
             "use_colors": False,
         },
     },
+    "filters": {"redact_query_secrets": {"()": RedactQuerySecretsFilter}},
     "handlers": {
         "default": {
             "formatter": "default",
@@ -63,6 +110,7 @@ LOGGING_CONFIG: dict[str, Any] = {
         },
         "access": {
             "formatter": "access",
+            "filters": ["redact_query_secrets"],
             "class": "logging.StreamHandler",
             "stream": "ext://sys.stdout",
         },

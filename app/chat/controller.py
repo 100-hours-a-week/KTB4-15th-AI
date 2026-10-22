@@ -24,9 +24,7 @@ def thread_config(request: ChatRequest) -> dict:
     return {"configurable": {"thread_id": str(request.chat_id), "user_id": request.user_id}}
 
 
-async def find_pre_stream_error(
-    graph, request: ChatRequest
-) -> tuple[int, str, str, dict] | None:
+async def find_pre_stream_error(request: ChatRequest) -> tuple[int, str, str, dict] | None:
     """스트림을 열기 전에 확인할 수 있는 오류만 여기서 찾는다.
 
     찾으면 (status, code, message, data) 를 돌려주고, 없으면 None 을 돌려준다.
@@ -43,18 +41,33 @@ async def find_pre_stream_error(
             {"chat_id": request.chat_id},
         )
 
-    # 찜 추천 칩은 대화를 시작할 때만 누를 수 있다. 진행 중인 대화에 오면 거절한다.
-    snapshot = await graph.aget_state(thread_config(request))
-    if snapshot.values.get("messages"):
-        # 이 code 는 Backend 와 합의가 필요하다.
-        return (
-            status.HTTP_400_BAD_REQUEST,
-            "WISHLIST_NOT_AT_CHAT_START",
-            "찜 추천은 대화를 시작할 때만 요청할 수 있습니다.",
-            {"chat_id": request.chat_id},
-        )
-
     return None
+
+
+# sabu: 같은 chat_id 로 WISHLIST 요청 두 개가 거의 동시에 오면(칩 연타, Backend 재시도)
+#       한쪽이 지우는 사이 다른 쪽 그래프가 쓰고 있을 수 있다. 무엇이 남지?
+async def clear_reused_chat_state(graph, request: ChatRequest) -> None:
+    """찜 추천 요청인데 이 chat_id 에 이전 대화가 남아 있으면 지운다 (2026-10-18 결정).
+
+    찜 추천 칩은 채팅방의 첫 메시지에서만 누를 수 있고, 첫 메시지인지는 Backend 가
+    판단한다. 그런데도 대화가 남아 있다면 Backend DB 초기화 등으로 chat_id 가 재사용된
+    것이다. 예전 채팅방의 대화가 새 채팅방의 LLM 입력에 섞이지 않게 비우고 시작한다.
+    """
+    if request.source_type != "WISHLIST":
+        return
+
+    snapshot = await graph.aget_state(thread_config(request))
+    messages = snapshot.values.get("messages")
+    if not messages:
+        return
+
+    # 대화 내용은 남기지 않는다. 재사용이 얼마나 자주 일어나는지만 볼 수 있으면 된다.
+    logger.warning(
+        "wishlist request on a chat with existing state, clearing it: chat_id=%s messages=%d",
+        request.chat_id,
+        len(messages),
+    )
+    await delete_chat_state(graph.checkpointer, request.chat_id)
 
 
 async def stream_chat(graph, request: ChatRequest) -> AsyncIterator[str]:

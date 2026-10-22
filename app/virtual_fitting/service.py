@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from anyio import to_thread
@@ -114,14 +115,24 @@ class VirtualFittingService:
         )
 
     def prepare(self, request: SyncFittingRequest) -> PreparedFitting:
-        # 상의 → 하의 순서. garment_image_urls 와 prompt 의 N번째 garment image 가 같은 순서를 쓴다.
-        products = select_fitting_products(
-            [product.product_code for product in request.products], self.repository
+        return self.prepare_fitting(
+            [product.product_code for product in request.products], request.user_image_url
         )
+
+    def prepare_fitting(
+        self, product_codes: Sequence[str], person_image_url: str
+    ) -> PreparedFitting:
+        """상품 조회·조합 검증·세부 분류 매핑을 하고 VTON 입력을 만든다. 예산·VTON·LLM·저장은 하지 않는다.
+
+        V1 은 요청의 user_image_url 을, V2 fallback 은 호출 직전에 발급한 user_image_key 의 Presigned GET URL 을
+        person_image_url 로 넘긴다(그 URL 은 저장·로그하지 않는다).
+        """
+        # 상의 → 하의 순서. garment_image_urls 와 prompt 의 N번째 garment image 가 같은 순서를 쓴다.
+        products = select_fitting_products(list(product_codes), self.repository)
         return PreparedFitting(
             products=products,
             fitting_input=FittingInput(
-                person_image_url=request.user_image_url,
+                person_image_url=person_image_url,
                 garment_image_urls=[product.image_url for product in products],
                 prompt=build_fitting_prompt(products),
             ),
@@ -149,9 +160,17 @@ class VirtualFittingService:
     def generate_title(self, llm_comment: str) -> str:
         return self.comment_provider.generate_title(llm_comment)
 
-    def store_result(self, fitting_result: FittingResult) -> str:
+    def store_result(self, fitting_result: FittingResult, *, key: str | None = None) -> str:
+        """결과 이미지를 S3 로 옮기고 Key 를 돌려준다. key 를 주지 않으면 V1 방식(results/ 아래 새 이름)이다.
+
+        V2 fallback 은 key="virtual-fitting/results/{id}/pruna-sync.jpg" 를 넘긴다(async_image_key 와 분리).
+        """
         # LLM 이 실패해도 S3 저장까지 가서 정상 응답한다. S3 실패는 숨기지 않는다.
         try:
+            if key is not None:
+                return self.image_storage.store_remote_image_at(
+                    fitting_result.result_image_url, key
+                )
             return self.image_storage.store_remote_image(
                 fitting_result.result_image_url,
                 "virtual-fitting/results",

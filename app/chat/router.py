@@ -34,9 +34,11 @@ Checkpointer = Annotated[Any, Depends(get_checkpointer)]
 async def chat_stream(request: ChatRequest, graph: Graph):
     # sabu: 스트림을 여는 시점 — 404 chat_not_found 와 503 은 스트림 전에 내야 하는데,
     #       추천 분기인지는 analyze 가 끝나야 안다. 이 두 오류는 언제 판단하지?
-    found = await controller.find_pre_stream_error(graph, request)
+    found = await controller.find_pre_stream_error(request)
     if found is not None:
         return error_response(*found)
+
+    await controller.clear_reused_chat_state(graph, request)
 
     return StreamingResponse(
         controller.stream_chat(graph, request),

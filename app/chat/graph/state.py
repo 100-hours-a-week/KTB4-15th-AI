@@ -8,7 +8,9 @@ from typing import Annotated, Literal, TypedDict
 # 직전 턴에 봇이 사용자에게 물어 둔 것. 없으면 None.
 #   confirm_summary  summarize 가 조건을 요약하고 이대로 추천할지 물었다
 #   ask_change       ask_change 가 무엇을 바꾸고 싶은지 물었다
-PendingQuestion = Literal["confirm_summary", "ask_change"]
+#   confirm_result   search 가 상품을 보여줬다. 말로 묻지는 않지만 마음에 드는지를 묻고 있는 상태로 본다
+#                    (2026-10-13, QA 9번). "다른 거"는 no, "고마워"는 yes
+PendingQuestion = Literal["confirm_summary", "ask_change", "confirm_result"]
 
 # 봇의 질문에 대한 사용자의 답. analyze(LLM)가 낸다. 봇이 묻고 있는 것이 없으면 none.
 ANSWERS = ("yes", "no", "none")
@@ -37,6 +39,9 @@ class ChatState(TypedDict):
     # 검색 질의 재료 두 칸 (2026-10-03, QA 10번). 사용자가 실제로 말한 표현만 담는다.
     detail_category: str  # 세부 종류·핏·소재("자켓", "와이드", "데님"). 새로 말하면 덮어쓰고, category 가 바뀌면 지운다
     mood: str  # 상황·분위기("데이트", "출근"). 새로 말하면 덮어쓰고, category 가 바뀌어도 유지한다
+    # 이 채팅방에서 보여준 상품의 product_code (2026-10-13, QA 9번). 검색할 때마다 빼고 찾는다.
+    # 채팅방이 끝날 때까지 쌓기만 한다. messages 의 추천 기록에서 뽑지 않는 것은 기록이 잘려도 남게 하려고다
+    shown_product_codes: list[str]
     # 수명은 다음 사용자 턴 하나. 매 턴 끝나는 노드가 새로 쓴다
     pending_question: PendingQuestion | None
     answer: Answer  # 이번 턴에만 쓰는 값
