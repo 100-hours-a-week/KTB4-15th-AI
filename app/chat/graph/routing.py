@@ -19,9 +19,13 @@ ROUTES = {
 #
 # ask_change 뒤의 "no"(바꿀 것을 말하지 못함)는 같은 질문을 되풀이하지 않고 chat 으로 보낸다.
 # chat 은 카탈로그 종류를 예로 들며 종류·색·예산 중 하나를 묻는다.
+#
+# confirm_result 뒤의 "no"("다른 거")는 요약·확인 없이 같은 조건으로 바로 다시 검색한다.
+# 이미 보여준 상품은 search 가 뺀다. "yes"("고마워")는 chat 이 가볍게 받고 끝낸다.
 _ANSWER_ROUTES = {
     "confirm_summary": {"yes": "search", "no": "ask_change", "none": "chat"},
     "ask_change": {"yes": "search", "no": "chat", "none": "chat"},
+    "confirm_result": {"yes": "chat", "no": "search", "none": "chat"},
 }
 
 

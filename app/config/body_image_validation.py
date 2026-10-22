@@ -22,13 +22,39 @@ MAX_IMAGE_PIXELS = int(os.getenv("BODY_IMAGE_MAX_PIXELS", str(25_000_000)))
 MIN_SHORT_SIDE = int(os.getenv("BODY_IMAGE_MIN_SHORT_SIDE", "480"))
 # 입력 검증을 통과한 이미지는 긴 변을 이 값 이하로 줄인 뒤 모델/rembg 에 넣는다(확대는 안 함).
 MAX_PROCESSING_IMAGE_SIDE = int(os.getenv("MAX_PROCESSING_IMAGE_SIDE", "1600"))
+# true 이면 JPEG decode·resize 를 GPU(nvJPEG)로 먼저 시도하고, 지원하지 않는 입력(PNG·CMYK 등)과
+# GPU 실패는 기존 Pillow 경로로 처리한다. torch/torchvision(CUDA)이 설치된 GPU 배포에서만 켠다.
+GPU_PREPROCESSING = os.getenv("BODY_IMAGE_GPU_PREPROCESSING", "false").lower() == "true"
+# local: 이 프로세스가 모델을 올려 직접 검증한다(EC2 CPU 기존 방식, Modal worker).
+# remote: 모델을 올리지 않고 Modal T4 worker(BODY_IMAGE_REMOTE_URL)에 HTTP 로 맡긴다(AI Server).
+# Modal worker 는 local 로만 뜬다(remote 면 시작을 거부해 자기 자신을 다시 부르지 않는다).
+VALIDATION_MODE = os.getenv("BODY_IMAGE_VALIDATION_MODE", "local").strip().lower()
+# worker 의 base URL(https). 경로 /api/v1/validation/body-image 는 코드가 붙인다.
+REMOTE_URL = os.getenv("BODY_IMAGE_REMOTE_URL", "").strip()
+# worker 호출의 네트워크 timeout(초). 연결·전송·응답 대기·읽기 각 단계가 멈춰 있을 수 있는 최대 시간이며
+# 남은 전체 deadline 보다 길게 쓰이지 않는다. Modal 은 150초에 303 을 보내므로, deadline 이 150초를 넘으면
+# 이 값도 150초보다 커야 한다(staging 예: 180).
+REMOTE_TIMEOUT_SECONDS = float(os.getenv("BODY_IMAGE_REMOTE_TIMEOUT_SECONDS", "90"))
+# 첫 요청부터 최종 응답을 다 읽을 때까지의 전체 deadline(초). redirect 를 따라가도 다시 시작하지 않고, 넘으면
+# 재시도 없이 504 BODY_IMAGE_WORKER_TIMEOUT. 기본 90, staging 예: 200(Modal 303 한 번을 받아 결과까지 기다림).
+REMOTE_TOTAL_DEADLINE_SECONDS = float(os.getenv("BODY_IMAGE_REMOTE_TOTAL_DEADLINE_SECONDS", "90"))
 # 무거운 검증(모델 추론·rembg)의 프로세스 내 동시 실행 수와 대기 수. 넘치면 즉시 429.
 MAX_CONCURRENT_BODY_VALIDATIONS = int(os.getenv("MAX_CONCURRENT_BODY_VALIDATIONS", "1"))
 MAX_WAITING_BODY_VALIDATIONS = int(os.getenv("MAX_WAITING_BODY_VALIDATIONS", "1"))
+# remote 모드에서 대기열에 들어간 요청이 실행 슬롯을 기다리는 최대 시간(초). 넘으면 429 SERVER_BUSY. 이 대기도
+# 전체 deadline(BODY_IMAGE_REMOTE_TOTAL_DEADLINE_SECONDS) 안에 들어가고, deadline 이 먼저 끝나면 504.
+# local 모드에는 적용하지 않는다(기존처럼 대기 시간 제한 없음).
+MAX_QUEUE_WAIT_SECONDS = float(os.getenv("BODY_IMAGE_MAX_QUEUE_WAIT_SECONDS", "10"))
 # rembg ONNX session 의 CPU memory arena. arena 는 요청 때 잡은 버퍼를 프로세스가 끝날 때까지
 # 들고 있어 요청이 끝난 뒤 메모리가 높게 남는다(Docker 50회 측정: 끄면 idle −31%, latency 차이
 # 없음). 문제가 생기면 true 로 되돌린다(ONNX Runtime 기본값).
 REMBG_ENABLE_CPU_MEM_ARENA = os.getenv("REMBG_ENABLE_CPU_MEM_ARENA", "false").lower() == "true"
+# rembg ONNX Runtime execution provider 순서(쉼표 구분). 비우면 rembg 기본 선택을 그대로 쓴다.
+# Modal T4 worker 는 "CUDAExecutionProvider,CPUExecutionProvider" 로 둔다. GPU 전처리 플래그
+# (BODY_IMAGE_GPU_PREPROCESSING)와는 별개다.
+REMBG_PROVIDERS = tuple(
+    name.strip() for name in os.getenv("BODY_IMAGE_REMBG_PROVIDERS", "").split(",") if name.strip()
+)
 
 PERSON_SCORE_THRESHOLD = float(os.getenv("PERSON_SCORE_THRESHOLD", "0.40"))
 PERSON_HEIGHT_RATIO_THRESHOLD = float(os.getenv("PERSON_HEIGHT_RATIO_THRESHOLD", "0.55"))

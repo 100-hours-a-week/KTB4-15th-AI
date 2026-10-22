@@ -348,3 +348,59 @@ def test_non_postprocess_errors_are_not_turned_into_fallback(error):
         service.fit(_request("1", "2"))
 
     assert storage.urls == []
+
+
+# --- 제목 토큰 한도: 실제 V1 RunwareCommentProvider(HTTP 계층만 가짜) ---
+
+
+@pytest.mark.parametrize("title_failure", ["length", "http_400"])
+def test_v1_title_failure_through_the_real_provider_falls_back_as_a_pair(title_failure):
+    import io
+    import json
+    from urllib.error import HTTPError
+
+    from app.virtual_fitting.providers.runware_comment import RunwareCommentProvider
+
+    sent = []
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    def reply(text, finish_reason="stop"):
+        body = {"choices": [{"message": {"content": text}, "finish_reason": finish_reason}]}
+        return Response(json.dumps(body).encode())
+
+    def opener(request, timeout):
+        payload = json.loads(request.data)
+        user = payload["messages"][1]["content"]
+        kind = "comment" if isinstance(user, list) else "title"
+        sent.append((kind, payload["max_completion_tokens"], user if kind == "title" else None))
+        if kind == "comment":
+            return reply("네이비 티셔츠가 잘 어울리는 코디입니다.")
+        if title_failure == "length":
+            return reply("편안한", finish_reason="length")
+        raise HTTPError(
+            request.full_url, 400, "bad request", {}, io.BytesIO(b'{"error": {"message": "limit"}}')
+        )
+
+    events = []
+    storage = FakeImageStorage(events=events)
+    fitting = FakeFittingProvider(result_image_url=RESULT_URL, events=events)
+    service = _service(
+        FakeRepository(TOP, BOTTOM), fitting, RunwareCommentProvider("k", opener=opener), storage
+    )
+
+    result = service.fit(_request("1", "2"))
+
+    assert sent == [
+        ("comment", 512, None),
+        ("title", 1024, "코디 설명: 네이비 티셔츠가 잘 어울리는 코디입니다."),
+    ]  # V1 은 재시도 없이 한 번씩
+    assert result == VirtualFittingResult(
+        result_image_key=RESULT_KEY, llm_comment=FALLBACK_COMMENT, llm_title=FALLBACK_TITLE
+    )
+    assert events.count("vton") == 1 and storage.urls == [(RESULT_URL, "virtual-fitting/results")]

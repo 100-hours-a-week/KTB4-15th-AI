@@ -14,6 +14,12 @@ STATUS = "status"
 # 저장할 문장이 필요해서 고정 문구로 합의했다 (2026-09-27).
 SEARCH_DONE_CONTENT = "조건에 맞는 옷을 검색해봤습니다."
 
+# 찜 기반 추천 턴의 done content (2026-10-15 결정, 문구는 Backend 합의 전 초안).
+# 한 갈래만 결과가 있어도 같은 문구다 — 두 갈래로 찾으려고 시도한 것은 같다.
+# 0건이면 검색 추천과 달리 AI 가 "찾지 못했다"는 고정 문구를 보낸다.
+WISHLIST_DONE_CONTENT = "자주 찜하신 색상과 종류를 바탕으로 추천해봤습니다."
+WISHLIST_EMPTY_DONE_CONTENT = "찜하신 상품과 비슷한 옷을 찾지 못했습니다."
+
 
 def format_event(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"

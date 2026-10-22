@@ -34,3 +34,10 @@ htmlcov/
 
 scripts/pipeline/
 scripts/db/load_products.sql
+
+# 로컬 통합 테스트 실행 결과·빌드 캐시
+/tests/local_be_ai/runs/
+/tests/real_sqs_local/runs/
+/tests/real_sqs_local/build_check/
+/tests/local_be_ai/
+/tests/real_sqs_local/

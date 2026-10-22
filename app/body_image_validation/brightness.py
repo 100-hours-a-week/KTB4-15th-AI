@@ -1,7 +1,6 @@
 """사람 bbox 영역의 HSV V 평균을 이용한 밝기 검증."""
 
 import numpy as np
-from PIL import Image
 
 from app.body_image_validation.exceptions import user_error
 from app.body_image_validation.models import BoundingBox
@@ -12,13 +11,13 @@ class BrightnessCheckError(RuntimeError):
     """밝기 검증만 건너뛸 수 있는 시스템 오류."""
 
 
-def mean_value_channel(image: Image.Image, box: BoundingBox) -> float:
+def mean_value_channel(array: np.ndarray, box: BoundingBox) -> float:
+    """array 는 detector 와 같이 쓰는 HxWx3 RGB 배열이다. 잘라 쓰기만 하고 바꾸지 않는다."""
     try:
         import cv2
     except ImportError as error:
         raise BrightnessCheckError("OpenCV를 불러오지 못했습니다.") from error
 
-    array = np.asarray(image)
     height, width = array.shape[:2]
     x1 = max(0, min(box.origin_x, width))
     y1 = max(0, min(box.origin_y, height))
@@ -34,6 +33,6 @@ def mean_value_channel(image: Image.Image, box: BoundingBox) -> float:
     return float(hsv[:, :, 2].mean())
 
 
-def validate_brightness(image: Image.Image, box: BoundingBox) -> None:
-    if mean_value_channel(image, box) < config.DARK_THRESHOLD:
+def validate_brightness(array: np.ndarray, box: BoundingBox) -> None:
+    if mean_value_channel(array, box) < config.DARK_THRESHOLD:
         raise user_error("IMAGE_TOO_DARK")

@@ -66,9 +66,9 @@ def send(chat_id: int, message: str, source_type: str = "GENERAL") -> None:
                         print(f"{GREY}(추천 상품 없음){RESET}")
                     for index, product in enumerate(items, start=1):
                         print(f"{CYAN}  {index}. {product['product_name']}{RESET}")
-                        print(f"{GREY}     {product['color']} · {product['detail_url']}{RESET}")
-                        if product["llm_comment"]:
-                            print(f"{GREY}     {product['llm_comment']}{RESET}")
+                        print(f"{GREY}     {product['color']} · {product['purchase_url']}{RESET}")
+                        if product["recommended_reason"]:
+                            print(f"{GREY}     {product['recommended_reason']}{RESET}")
                 elif event == "error":
                     print(f"\n{GREY}[error] {data['code']} — {data['message']}{RESET}")
                 elif event == "done":

@@ -22,10 +22,10 @@ PRODUCTS = [
     {
         "product_code": "0000001",
         "product_name": "오버핏 코튼 셔츠",
-        "image_url": "https://example.com/1.jpg",
-        "detail_url": "https://example.com/p/1",
+        "product_image_url": "https://example.com/1.jpg",
+        "purchase_url": "https://example.com/p/1",
         "color": "NAVY",
-        "llm_comment": "차분한 네이비 셔츠입니다.",
+        "recommended_reason": "차분한 네이비 셔츠입니다.",
     }
 ]
 
@@ -125,7 +125,8 @@ def test_three_turns_share_one_conversation(monkeypatch):
     assert fake_search.called_with["max_price"] == 50000
 
     state = _state(graph)
-    assert state["pending_question"] is None
+    assert state["pending_question"] == "confirm_result"
+    assert state["shown_product_codes"] == ["0000001"]
     assert "오버핏 코튼 셔츠 (0000001)" in state["messages"][-1]["content"]
     # 사용자 3번 + 봇 3번(요약·요약·추천기록)
     assert len(state["messages"]) == 6
@@ -180,3 +181,73 @@ def test_condition_change_after_ask_change_goes_back_to_summary(monkeypatch):
     assert state["said_conditions"] is True
     assert state["mood"] == "여름 데이트 룩"
     assert state["pending_question"] == "confirm_summary"  # 재요약했다
+
+
+def test_another_one_searches_again_without_shown_products(monkeypatch):
+    """추천 뒤 "다른 거"는 요약 없이 같은 조건으로 다시 검색하고, 보여준 상품은 뺀다 (QA 9번)."""
+    fake = FakeLLM(
+        [
+            {"answer": "none", "metadata": {"category": "셔츠"}},
+            {"answer": "yes", "metadata": {}},
+            # 3턴: "다른 거" — 조건 없이 no
+            {"answer": "no", "metadata": {}},
+        ]
+    )
+    monkeypatch.setattr(llm_module.llm, "complete_json", fake.complete_json)
+    monkeypatch.setattr(llm_module.llm, "stream_text", fake.stream_text)
+
+    second = [{**PRODUCTS[0], "product_code": "0000002", "product_name": "옥스퍼드 셔츠"}]
+    calls = []
+
+    async def fake_search(**kwargs):
+        calls.append(kwargs)
+        return PRODUCTS if len(calls) == 1 else second
+
+    monkeypatch.setattr(recommendation, "search_products", fake_search)
+
+    graph = build_graph(InMemorySaver())
+    _run(graph, "셔츠 추천해줘")
+    _run(graph, "응")
+    events = _run(graph, "다른 거 보여줘")
+
+    assert events[-1]["products"] == second
+    assert calls[0]["exclude_codes"] == []
+    assert calls[1]["exclude_codes"] == ["0000001"]
+    assert calls[1]["category"] == "셔츠"  # 같은 조건으로
+
+    state = _state(graph)
+    assert state["pending_question"] == "confirm_result"
+    assert state["shown_product_codes"] == ["0000001", "0000002"]
+
+
+def test_zero_results_leave_no_pending_question(monkeypatch):
+    """0건이면 같은 조건으로 다시 찾아도 0건이다. 묻는 것 없이 두어 "응"도 다시 검색하지 않게 한다."""
+    fake = FakeLLM(
+        [
+            {"answer": "none", "metadata": {"category": "셔츠"}},
+            {"answer": "yes", "metadata": {}},
+            # 3턴: 0건 화면 뒤 "응" — 봇이 묻지 않았으므로 답은 보지 않는다
+            {"answer": "yes", "metadata": {}},
+        ]
+    )
+    monkeypatch.setattr(llm_module.llm, "complete_json", fake.complete_json)
+    monkeypatch.setattr(llm_module.llm, "stream_text", fake.stream_text)
+
+    calls = []
+
+    async def fake_search(**kwargs):
+        calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(recommendation, "search_products", fake_search)
+
+    graph = build_graph(InMemorySaver())
+    _run(graph, "셔츠 추천해줘")
+    _run(graph, "응")
+    state = _state(graph)
+    assert state["pending_question"] is None
+    assert "조건에 맞는 상품을 찾지 못했다." in state["messages"][-1]["content"]  # chat 이 이걸 보고 다시 묻는다
+
+    _run(graph, "응")
+    assert len(calls) == 1  # 같은 0건 조건으로 다시 검색하지 않는다
+    assert _state(graph)["pending_question"] is None  # chat 으로 갔다

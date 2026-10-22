@@ -11,14 +11,37 @@ from app.body_image_validation.models import BoundingBox, Landmark, PersonDetect
 from app.config import body_image_validation as config
 
 
+class DetectionImage:
+    """한 요청의 처리용 RGB 이미지와, detector·밝기 검사가 같이 쓰는 변환 결과.
+
+    np.asarray(PIL) 와 mp.Image 생성은 부를 때마다 이미지 전체를 복사한다. Person·Pose·밝기 검사가
+    요청마다 이 객체 하나를 새로 만들어 같이 쓰고, 요청 밖에 보관하지 않는다.
+    """
+
+    def __init__(self, image: Image.Image) -> None:
+        self.image = image
+        # PIL 과 메모리를 공유하지 않는 읽기 전용 HxWx3 uint8 배열이라 image 를 닫아도 쓸 수 있다.
+        self.array = np.asarray(image)
+        self._mediapipe_image = None
+
+    def mediapipe_image(self):
+        """처음 부를 때 한 번 만든다. mp.Image 는 만들 때 픽셀을 복사한 뒤 바뀌지 않고, detect 는
+        포인터만 빌려 쓰므로 두 detector 가 같은 객체를 써도 된다."""
+        if self._mediapipe_image is None:
+            import mediapipe as mp
+
+            self._mediapipe_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=self.array)
+        return self._mediapipe_image
+
+
 @runtime_checkable
 class PersonDetector(Protocol):
-    def detect(self, image: Image.Image) -> list[PersonDetection]: ...
+    def detect(self, image: DetectionImage) -> list[PersonDetection]: ...
 
 
 @runtime_checkable
 class PoseDetector(Protocol):
-    def detect(self, image: Image.Image) -> Mapping[str, Landmark] | None: ...
+    def detect(self, image: DetectionImage) -> Mapping[str, Landmark] | None: ...
 
 
 class MediaPipePersonDetector:
@@ -34,15 +57,11 @@ class MediaPipePersonDetector:
             category_allowlist=["person"],
             running_mode=mp.tasks.vision.RunningMode.IMAGE,
         )
-        self._mp = mp
         self._detector = mp.tasks.vision.ObjectDetector.create_from_options(options)
         self._lock = threading.Lock()
 
-    def detect(self, image: Image.Image) -> list[PersonDetection]:
-        mp_image = self._mp.Image(
-            image_format=self._mp.ImageFormat.SRGB,
-            data=np.asarray(image),
-        )
+    def detect(self, image: DetectionImage) -> list[PersonDetection]:
+        mp_image = image.mediapipe_image()
         with self._lock:
             result = self._detector.detect(mp_image)
         detections = []
@@ -112,15 +131,11 @@ class MediaPipePoseDetector:
             min_pose_detection_confidence=config.POSE_DETECTION_CONFIDENCE,
             min_pose_presence_confidence=config.POSE_PRESENCE_CONFIDENCE,
         )
-        self._mp = mp
         self._detector = mp.tasks.vision.PoseLandmarker.create_from_options(options)
         self._lock = threading.Lock()
 
-    def detect(self, image: Image.Image) -> Mapping[str, Landmark] | None:
-        mp_image = self._mp.Image(
-            image_format=self._mp.ImageFormat.SRGB,
-            data=np.asarray(image),
-        )
+    def detect(self, image: DetectionImage) -> Mapping[str, Landmark] | None:
+        mp_image = image.mediapipe_image()
         with self._lock:
             result = self._detector.detect(mp_image)
         if not result.pose_landmarks:

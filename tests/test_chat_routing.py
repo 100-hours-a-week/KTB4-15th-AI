@@ -11,7 +11,7 @@ import pytest
 
 from app.chat.graph.routing import ENTRY_ROUTES, ROUTES, entry_route, route
 
-PENDING = ("confirm_summary", "ask_change", None)
+PENDING = ("confirm_summary", "ask_change", "confirm_result", None)
 ANSWERS = ("yes", "no", "none")
 
 
@@ -57,6 +57,9 @@ def test_saying_conditions_always_resummarizes(pending, answer):
         ("ask_change", "yes", "search"),
         ("ask_change", "no", "chat"),  # 같은 질문을 되풀이하지 않는다
         ("ask_change", "none", "chat"),
+        ("confirm_result", "yes", "chat"),  # "고마워" — 가볍게 받고 끝낸다
+        ("confirm_result", "no", "search"),  # "다른 거" — 요약 없이 바로 다시 검색
+        ("confirm_result", "none", "chat"),
         (None, "yes", "chat"),  # 묻지 않았으면 답은 보지 않는다
         (None, "no", "chat"),
         (None, "none", "chat"),  # 조건 없는 추천 요청은 chat 이 조건을 되묻는다

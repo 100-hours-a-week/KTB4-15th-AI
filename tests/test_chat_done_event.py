@@ -16,12 +16,12 @@ PRODUCTS = [
     {
         "product_code": "4097486",
         "product_name": "리넨 블랜디드 커브드 팬츠",
-        "image_url": "https://example.com/1.jpg",
-        "detail_url": "https://example.com/p/1",
+        "product_image_url": "https://example.com/1.jpg",
+        "purchase_url": "https://example.com/p/1",
         "color": "블랙",
-        "price": 25420,
+        "current_price": 25420,
         "item_type": "BOTTOM",
-        "llm_comment": "일상적인 캐주얼 스타일에 적합하다.",
+        "recommended_reason": "일상적인 캐주얼 스타일에 적합하다.",
     }
 ]
 
@@ -83,7 +83,7 @@ def test_search_with_no_result_still_uses_fixed_content():
 
 
 def test_products_without_done_content_keep_spoken_content():
-    # 찜 추천처럼 고정 문구를 정하지 않은 경로는 말풍선 전체(없으면 빈 문자열)를 그대로 쓴다
+    # products 청크에 done_content 가 없으면 말풍선 전체(없으면 빈 문자열)를 그대로 쓴다
     events = _events([
         {"event": sse.STATUS, "label": "찜한 상품을 살펴보고 있어요"},
         {"event": sse.PRODUCTS, "products": PRODUCTS},

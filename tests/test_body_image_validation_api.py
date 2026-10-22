@@ -257,11 +257,11 @@ def test_user_file_problems_are_user_failures_before_any_model(
 def test_internal_decode_error_is_a_500_internal_server_error_not_a_user_error(
     client, monkeypatch
 ):
-    def broken_exif_transpose(image):
+    # 전체 decode 는 모든 입력에서 실행된다. exif_transpose 는 Orientation 2~8 일 때만 불린다.
+    def broken_load(image):
         raise RuntimeError("internal bug")
 
-    monkeypatch.setattr("app.body_image_validation.image_io.ImageOps.exif_transpose",
-                        broken_exif_transpose)
+    monkeypatch.setattr("PIL.ImageFile.ImageFile.load", broken_load)
     calls = []
     use_service(
         monkeypatch,
