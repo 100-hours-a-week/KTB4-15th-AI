@@ -268,6 +268,7 @@ jobs:
       ECS_SERVICE: lookddak-dev-v2-fastapi-service
       TASK_FAMILY: lookddak-dev-v2-fastapi
       TEMPLATE_KEY: dev/v2/fastapi.json
+      APP_CONTAINER_NAME: fastapi
     steps:
       - name: Guard - develop / hotfix 브랜치 확인
         if: ${{ github.ref != 'refs/heads/develop' && !startsWith(github.ref, 'refs/heads/hotfix/') }}
@@ -338,6 +339,7 @@ jobs:
           echo "repository_uri=${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}" >> "$GITHUB_OUTPUT"
 
       # __DIGEST__만 바꾸고, 결과가 예상과 정확히 같은지 확인한다.
+      # 앱 컨테이너는 이름(APP_CONTAINER_NAME)으로 찾는다. 모니터링 사이드카가 함께 있어도 앱 image만 바꾼다.
       # 다른 저장소 이미지나 다른 family로 바뀌지 않게 막는다.
       - name: digest 치환 및 검증
         env:
@@ -347,26 +349,26 @@ jobs:
           TEMPLATE="$RUNNER_TEMP/template.json"
           TASKDEF="$RUNNER_TEMP/taskdef.json"
 
-          jq -e --arg family "$TASK_FAMILY" --arg image "${REPOSITORY_URI}@__DIGEST__" '
+          jq -e --arg family "$TASK_FAMILY" --arg name "$APP_CONTAINER_NAME" --arg image "${REPOSITORY_URI}@__DIGEST__" '
             .family == $family and
-            (.containerDefinitions | length) == 1 and
-            .containerDefinitions[0].image == $image
+            ([.containerDefinitions[] | select(.name == $name)] | length) == 1 and
+            (.containerDefinitions[] | select(.name == $name) | .image) == $image
           ' "$TEMPLATE" > /dev/null \
-          || { echo "::error::템플릿이 예상과 다릅니다 (family, 컨테이너 수, image 확인)"; exit 1; }
+          || { echo "::error::템플릿이 예상과 다릅니다 (family, 앱 컨테이너 이름, image 확인)"; exit 1; }
 
-          jq --arg digest "$DIGEST" \
-            '.containerDefinitions[0].image |= sub("@__DIGEST__$"; "@" + $digest)' \
+          jq --arg name "$APP_CONTAINER_NAME" --arg digest "$DIGEST" \
+            '(.containerDefinitions[] | select(.name == $name) | .image) |= sub("@__DIGEST__$"; "@" + $digest)' \
             "$TEMPLATE" > "$TASKDEF"
 
           if grep -q '__DIGEST__' "$TASKDEF"; then
             echo "::error::치환 후에도 __DIGEST__가 남아 있습니다."
             exit 1
           fi
-          jq -e --arg image "${REPOSITORY_URI}@${DIGEST}" \
-            '.containerDefinitions[0].image == $image' "$TASKDEF" > /dev/null \
+          jq -e --arg name "$APP_CONTAINER_NAME" --arg image "${REPOSITORY_URI}@${DIGEST}" \
+            '(.containerDefinitions[] | select(.name == $name) | .image) == $image' "$TASKDEF" > /dev/null \
           || { echo "::error::치환 결과 image가 예상과 다릅니다."; exit 1; }
 
-          echo "image=$(jq -r '.containerDefinitions[0].image' "$TASKDEF")"
+          echo "image=$(jq -r --arg name "$APP_CONTAINER_NAME" '.containerDefinitions[] | select(.name == $name) | .image' "$TASKDEF")"
 
       # revision 등록 → 서비스 갱신만 한다. 안정화 대기는 끈다.
       # 공식 액션(SDK waiter)의 대기는 wait-for-minutes보다 일찍 끝난 사례가 있어
