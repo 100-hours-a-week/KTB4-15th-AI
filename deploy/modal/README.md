@@ -118,12 +118,22 @@ Content-Type: multipart/form-data; field "image"
 | `BODY_IMAGE_REMOTE_URL` | worker base URL (https 만) |
 | `BODY_IMAGE_REMOTE_PROXY_KEY` / `_SECRET` | Modal 대시보드(Settings → Proxy Auth Tokens)에서 만든 token |
 | `BODY_IMAGE_REMOTE_API_KEY` | worker Secret 의 `INTERNAL_API_KEY` (Backend→AI Server 키와 다르게 둘 수 있다) |
-| `BODY_IMAGE_REMOTE_TIMEOUT_SECONDS` | 기본 90. 연결·전송·대기·읽기 각 단계의 상한(남은 deadline 보다 길게 쓰이지 않음) |
-| `BODY_IMAGE_REMOTE_TOTAL_DEADLINE_SECONDS` | 기본 90. 요청을 받은 시점부터(대기열 대기 포함) 최종 응답까지 전체 상한. 운영 예: 50, staging 예: 200 (+ TIMEOUT 180) |
 | `BODY_IMAGE_MAX_QUEUE_WAIT_SECONDS` | 기본 10. 대기열에서 실행 슬롯을 기다리는 최대 시간. 넘으면 429 `SERVER_BUSY`, deadline 이 먼저 끝나면 504 |
+
+worker 호출 시간 제한은 환경변수가 아니라 `app/config/body_image_validation.py` 의 코드 상수다. 바꾸려면 코드를
+고쳐 AI Server 를 다시 배포한다.
+
+| 상수 | 값 | 내용 |
+|---|---|---|
+| `REMOTE_TOTAL_DEADLINE_SECONDS` | 120 | 요청을 받은 시점부터 입력 검사·대기열 대기·Modal 호출·최종 응답 수신까지 전체 상한. 넘으면 재시도 없이 504 `BODY_IMAGE_WORKER_TIMEOUT` |
+| `REMOTE_TIMEOUT_SECONDS` | 120 | 연결·전송·대기·읽기 각 단계의 상한. 남은 전체 deadline 보다 길게 쓰이지 않는다 |
+
+Backend 의 AI Server 호출 timeout 은 이 120초보다 길어야 AI Server 의 504 응답을 받을 수 있다.
+Modal 함수 자체의 실행 timeout·컨테이너 자원은 이 값과 별개다(`deploy/modal/body_image_worker.py` 설정 그대로).
 
 150초가 넘으면 Modal 은 같은 URL 에 결과 조회 query 를 붙여 303 을 보낸다. AI Server 는 같은 https origin 의
 303 만 GET(본문 없음)으로 따라가고(최대 5회), 다른 origin·301/302/307/308 은 따라가지 않고 502 로 끝낸다.
+전체 deadline 이 120초라 정상적으로는 303 을 받기 전에 504 로 끝난다(deadline 을 150초 넘게 늘릴 때를 위한 처리).
 
 응답: worker 의 성공(`data.s3_key`)과 공통 형식 오류(400/413/422/429/500)는 code·message·status 그대로 전한다.
 worker 에 닿지 못하면(연결 실패·503) 503, 정상 worker 응답이 아니면(공통 형식이 아님, 200 인데 `s3_key` 없음,

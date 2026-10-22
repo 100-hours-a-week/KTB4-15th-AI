@@ -31,18 +31,19 @@ GPU_PREPROCESSING = os.getenv("BODY_IMAGE_GPU_PREPROCESSING", "false").lower() =
 VALIDATION_MODE = os.getenv("BODY_IMAGE_VALIDATION_MODE", "local").strip().lower()
 # worker 의 base URL(https). 경로 /api/v1/validation/body-image 는 코드가 붙인다.
 REMOTE_URL = os.getenv("BODY_IMAGE_REMOTE_URL", "").strip()
-# worker 호출의 네트워크 timeout(초). 연결·전송·응답 대기·읽기 각 단계가 멈춰 있을 수 있는 최대 시간이며
-# 남은 전체 deadline 보다 길게 쓰이지 않는다. Modal 은 150초에 303 을 보내므로, deadline 이 150초를 넘으면
-# 이 값도 150초보다 커야 한다(staging 예: 180).
-REMOTE_TIMEOUT_SECONDS = float(os.getenv("BODY_IMAGE_REMOTE_TIMEOUT_SECONDS", "90"))
-# 첫 요청부터 최종 응답을 다 읽을 때까지의 전체 deadline(초). redirect 를 따라가도 다시 시작하지 않고, 넘으면
-# 재시도 없이 504 BODY_IMAGE_WORKER_TIMEOUT. 기본 90, staging 예: 200(Modal 303 한 번을 받아 결과까지 기다림).
-REMOTE_TOTAL_DEADLINE_SECONDS = float(os.getenv("BODY_IMAGE_REMOTE_TOTAL_DEADLINE_SECONDS", "90"))
+# worker 호출 시간 제한은 환경변수가 아닌 코드 상수로 둔다(바꾸려면 이 파일을 고쳐 재배포한다).
+# 네트워크 timeout(초): 연결·전송·응답 대기·읽기 각 단계가 멈춰 있을 수 있는 최대 시간. 남은 전체 deadline 보다
+# 길게 쓰이지 않는다.
+REMOTE_TIMEOUT_SECONDS = 120.0
+# 전체 deadline(초): endpoint 가 요청을 받은 시점부터 입력 검사·대기열 대기·Modal 호출·최종 응답 수신까지.
+# redirect 를 따라가도 다시 시작하지 않고, 넘으면 재시도 없이 504 BODY_IMAGE_WORKER_TIMEOUT.
+# Modal 의 303 redirect(150초)보다 짧으므로 정상적으로는 303 을 받기 전에 끝난다.
+REMOTE_TOTAL_DEADLINE_SECONDS = 120.0
 # 무거운 검증(모델 추론·rembg)의 프로세스 내 동시 실행 수와 대기 수. 넘치면 즉시 429.
 MAX_CONCURRENT_BODY_VALIDATIONS = int(os.getenv("MAX_CONCURRENT_BODY_VALIDATIONS", "1"))
 MAX_WAITING_BODY_VALIDATIONS = int(os.getenv("MAX_WAITING_BODY_VALIDATIONS", "1"))
 # remote 모드에서 대기열에 들어간 요청이 실행 슬롯을 기다리는 최대 시간(초). 넘으면 429 SERVER_BUSY. 이 대기도
-# 전체 deadline(BODY_IMAGE_REMOTE_TOTAL_DEADLINE_SECONDS) 안에 들어가고, deadline 이 먼저 끝나면 504.
+# 전체 deadline(REMOTE_TOTAL_DEADLINE_SECONDS) 안에 들어가고, deadline 이 먼저 끝나면 504.
 # local 모드에는 적용하지 않는다(기존처럼 대기 시간 제한 없음).
 MAX_QUEUE_WAIT_SECONDS = float(os.getenv("BODY_IMAGE_MAX_QUEUE_WAIT_SECONDS", "10"))
 # rembg ONNX session 의 CPU memory arena. arena 는 요청 때 잡은 버퍼를 프로세스가 끝날 때까지
