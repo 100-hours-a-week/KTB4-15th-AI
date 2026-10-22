@@ -14,11 +14,13 @@ PNG·S3 업로드는 worker 가 기존 local service 로 하고, 여기서는 �
   시간 초과는 worker 가 처리를 끝내고 S3 에 올렸을 수도 있다는 뜻이다(응답만 받지 못함).
 
 시간 제한은 두 가지다.
-- 전체 deadline(BODY_IMAGE_REMOTE_TOTAL_DEADLINE_SECONDS): 첫 POST 부터 마지막 응답 본문을 다 읽을 때까지.
-  redirect 를 따라가도 다시 시작하지 않는다. asyncio.timeout 이 넘는 순간 진행 중인 연결·전송·대기·읽기를 취소한다.
-- 네트워크 timeout(BODY_IMAGE_REMOTE_TIMEOUT_SECONDS): 연결·전송·응답 대기·읽기 각 단계가 멈춰 있을 수 있는
+값은 app/config/body_image_validation.py 의 코드 상수다(둘 다 120초, 환경변수로 바꾸지 않는다).
+- 전체 deadline(REMOTE_TOTAL_DEADLINE_SECONDS): validate() 가 요청을 받은 시점부터 입력 검사·대기열 대기·
+  Modal 호출·마지막 응답 본문을 다 읽을 때까지. redirect 를 따라가도 다시 시작하지 않는다. asyncio.timeout 이
+  넘는 순간 진행 중인 연결·전송·대기·읽기를 취소한다.
+- 네트워크 timeout(REMOTE_TIMEOUT_SECONDS): 연결·전송·응답 대기·읽기 각 단계가 멈춰 있을 수 있는
   최대 시간. 남은 deadline 보다 길게 잡히지 않는다. Modal 은 150초가 지나야 303 을 보내므로, deadline 이 150초를
-  넘으면 이 값도 150초보다 커야 303 을 받을 수 있다.
+  넘도록 상수를 바꾸면 이 값도 150초보다 커야 303 을 받을 수 있다.
 
 Modal web function 은 150초를 넘기면 같은 URL 에 결과 조회용 query 를 붙여 303 으로 돌려보낸다
 (https://modal.com/docs/guide/webhook-timeouts). 303 은 같은 https origin 일 때만 GET(본문 없음)으로 따라가고,
@@ -118,13 +120,13 @@ class RemoteBodyImageValidationService:
             # 인증 헤더가 평문으로 나가지 않게 https 만 받는다.
             raise RemoteWorkerConfigError("BODY_IMAGE_REMOTE_URL 은 https:// 로 시작해야 합니다.")
         if timeout <= 0:
-            raise RemoteWorkerConfigError("BODY_IMAGE_REMOTE_TIMEOUT_SECONDS 는 0 보다 커야 합니다.")
+            raise RemoteWorkerConfigError("REMOTE_TIMEOUT_SECONDS 는 0 보다 커야 합니다.")
         if total_deadline <= 0:
-            raise RemoteWorkerConfigError("BODY_IMAGE_REMOTE_TOTAL_DEADLINE_SECONDS 는 0 보다 커야 합니다.")
+            raise RemoteWorkerConfigError("REMOTE_TOTAL_DEADLINE_SECONDS 는 0 보다 커야 합니다.")
         if total_deadline > MODAL_REDIRECT_AFTER_SECONDS and timeout <= MODAL_REDIRECT_AFTER_SECONDS:
-            # 설정 실수다. 이 상태에서는 Modal 이 150초에 보내는 303 을 받기 전에 네트워크 timeout 이 먼저 난다.
+            # 상수 설정 실수다. 이 상태에서는 Modal 이 150초에 보내는 303 을 받기 전에 네트워크 timeout 이 먼저 난다.
             logger.warning(
-                "BODY_IMAGE_REMOTE_TIMEOUT_SECONDS(%s) <= %ss: requests longer than %ss end with 504 "
+                "REMOTE_TIMEOUT_SECONDS(%s) <= %ss: requests longer than %ss end with 504 "
                 "before Modal's 303 redirect arrives (deadline=%s)",
                 timeout, MODAL_REDIRECT_AFTER_SECONDS, MODAL_REDIRECT_AFTER_SECONDS, total_deadline,
             )
