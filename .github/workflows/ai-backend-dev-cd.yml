@@ -11,7 +11,7 @@ name: AI dev CD
 run-name: >-
   ${{ github.event_name == 'push'
       && format('AI dev auto deploy - {0}', github.sha)
-      || format('AI dev rollback - {0} ({1})', inputs.image_tag, inputs.target) }}
+      || format('AI dev rollback - {0}', inputs.image_tag) }}
 
 on:
   # develop: 평소 dev 배포 / hotfix/**: 운영 반영 전 dev 서버에서 hotfix 검증
@@ -31,17 +31,6 @@ on:
         description: "롤백 사유"
         required: true
         type: string
-      # all: V1(EC2) + V2(ECS) / v1: EC2만 / v2: ECS만
-      # 한쪽만 다시 배포하거나, 다른 쪽에 영향 없이 배포 실패 경로를 검증할 때 사용한다.
-      target:
-        description: "배포 대상 (all: V1+V2, v1: EC2만, v2: ECS만)"
-        required: true
-        default: all
-        type: choice
-        options:
-          - all
-          - v1
-          - v2
 
 permissions: {}
 
@@ -112,14 +101,9 @@ jobs:
     # main 브랜치 Ruleset의 필수 체크 이름 (prod CD의 deploy job과 구분)
     name: dev-deploy
     needs: build-and-push
-    if: >-
-      ${{
-        always() &&
-        (
-          (github.event_name == 'push' && needs.build-and-push.result == 'success') ||
-          (github.event_name == 'workflow_dispatch' && inputs.target != 'v2')
-        )
-      }}
+    # V1 dev(EC2)는 종료됐다. 변수 V1_DEV_DEPLOY_ENABLED를 두지 않으므로 실행되지 않는다 (skipped).
+    # main Ruleset 필수 체크(dev-deploy)가 dev-v2-deploy로 바뀌면 job을 삭제한다.
+    if: ${{ vars.V1_DEV_DEPLOY_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: develop
@@ -242,7 +226,7 @@ jobs:
             *)    echo "::error::결과 확인 불가(status=$STATUS). CloudWatch /lookddak/dev/deploy 확인"; exit 1 ;;
           esac
 
-  # V2 dev(ECS) 배포. V1 dev-deploy와 같은 이미지(태그)를 병렬로 배포한다.
+  # V2 dev(ECS) 배포. V1 dev(EC2)는 종료돼 V2에만 배포한다.
   # - Task Definition 설정은 CLOUD 레포 Terraform이 S3 템플릿으로 관리한다.
   #   이 job은 템플릿의 __DIGEST__만 이번 이미지 digest로 바꿔 revision을 등록한다.
   # - 실패하면 dev CD 전체 실패로 본다 (main merge 필수 체크).
@@ -254,7 +238,7 @@ jobs:
         always() &&
         (
           (github.event_name == 'push' && needs.build-and-push.result == 'success') ||
-          (github.event_name == 'workflow_dispatch' && inputs.target != 'v1')
+          github.event_name == 'workflow_dispatch'
         )
       }}
     runs-on: ubuntu-24.04
