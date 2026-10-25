@@ -1,9 +1,16 @@
 """재사용 rembg ONNX session을 사용하는 배경 제거."""
 
+import json
+import logging
+import os
+import tempfile
 import threading
+import time
 from io import BytesIO
 
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 
 class RembgBackgroundRemover:
@@ -12,6 +19,7 @@ class RembgBackgroundRemover:
         model_path: str,
         enable_cpu_mem_arena: bool = False,
         providers: list[str] | None = None,
+        profile_runs: int = 0,
     ) -> None:
         import onnxruntime as ort
         from rembg import new_session
@@ -21,6 +29,13 @@ class RembgBackgroundRemover:
         # (onnxruntime CPU 패키지에서는 CPU). Modal T4 worker 는 CUDA 를 명시해 넘긴다.
         sess_opts = ort.SessionOptions()
         sess_opts.enable_cpu_mem_arena = enable_cpu_mem_arena
+        # 진단용. profile_runs 번 실행한 뒤 profiling 을 끝내고 실행별 provider 노드 수를 로그로 남긴다.
+        # session 은 그대로 재사용하고, profiling 이 끝난 뒤의 실행은 기록하지 않는다.
+        self._profile_runs = profile_runs
+        self._runs = 0
+        if profile_runs > 0:
+            sess_opts.enable_profiling = True
+            sess_opts.profile_file_prefix = os.path.join(tempfile.gettempdir(), "rembg_ort_profile")
         options = {"providers": list(providers)} if providers else {}
         self._session = new_session(
             "u2net_custom", model_path=model_path, sess_opts=sess_opts, **options
@@ -42,6 +57,10 @@ class RembgBackgroundRemover:
 
         with self._lock:
             output = remove(image, session=self._session)
+            if self._profile_runs:
+                self._runs += 1
+                if self._runs == self._profile_runs:
+                    self._finish_profiling()
         if output.mode == "RGBA":
             return output
         try:
@@ -49,6 +68,55 @@ class RembgBackgroundRemover:
         finally:
             if output is not image:
                 output.close()
+
+
+    def _finish_profiling(self) -> None:
+        """profiling 을 끝내고 요약을 로그로 남긴다. 진단 실패가 요청을 실패시키지 않게 경고만 남긴다."""
+        path = None
+        try:
+            started = time.perf_counter()
+            path = self._session.inner_session.end_profiling()
+            runs = summarize_ort_profile(path)
+            logger.info(
+                "rembg onnxruntime profile: runs=%s parse_ms=%.1f",
+                json.dumps(runs), (time.perf_counter() - started) * 1000,
+            )
+        except Exception:
+            logger.warning("rembg onnxruntime profiling summary failed", exc_info=True)
+        finally:
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
+def summarize_ort_profile(path: str) -> list[dict]:
+    """ONNX Runtime profile JSON 을 실행(model_run)별로 나눠 provider 별 노드 수·노드 시간을 센다.
+
+    이벤트는 기록된 순서대로 읽는다. 각 실행의 노드 이벤트 다음에 그 실행의 model_run 이벤트가 온다.
+    (시간값으로 나누지 않으므로 snapshot 복원으로 시계가 바뀌어도 실행이 섞이지 않는다.)
+    노드 시간(dur)은 ONNX Runtime 이 잰 kernel 호출 시간이다. CUDA kernel 은 비동기라 GPU 실행 시간과 같지 않다.
+    model_run 시간은 출력을 CPU 로 가져올 때까지라 GPU 실행을 포함한 추론 전체 시간이다.
+    """
+    with open(path) as file:
+        events = json.load(file)
+    runs, nodes, node_us = [], {}, {}
+    for event in events:
+        args = event.get("args") or {}
+        if event.get("cat") == "Node" and args.get("provider"):
+            provider = args["provider"]
+            nodes[provider] = nodes.get(provider, 0) + 1
+            node_us[provider] = node_us.get(provider, 0) + int(event.get("dur", 0))
+        elif event.get("cat") == "Session" and event.get("name") == "model_run":
+            runs.append({
+                "run": len(runs) + 1,
+                "model_run_ms": round(int(event.get("dur", 0)) / 1000, 2),
+                "nodes": nodes,
+                "node_ms": {name: round(us / 1000, 2) for name, us in node_us.items()},
+            })
+            nodes, node_us = {}, {}
+    return runs
 
 
 def encode_png(image: Image.Image) -> bytes:

@@ -86,7 +86,14 @@ GPU_SNAPSHOT = STAGE == "staging"
 STAGE_SNAPSHOT = {"experimental_options": {"enable_gpu_snapshot": True}} if GPU_SNAPSHOT else {}
 # 컨테이너는 이 파일을 다시 import 해 lifecycle 을 고른다. 로컬 환경변수는 컨테이너에 없으므로 staging 은
 # stage 를 컨테이너 환경변수로 넘긴다(production 은 기본값이 production 이라 넘기지 않는다).
-STAGE_ENV = {"env": {"BODY_IMAGE_WORKER_STAGE": STAGE}} if GPU_SNAPSHOT else {}
+# staging 검증용 진단(요청별 단계 시간 로그 + rembg ONNX Runtime profiling). 배포할 때
+# BODY_IMAGE_WORKER_DIAGNOSTICS=true 로만 켠다. profiling 은 snapshot 전 warm-up(1번째)과 복원 뒤 첫
+# 요청(2번째)까지만 기록하고 끝낸다. production 에서는 켤 수 없다.
+DIAGNOSTICS = os.environ.get("BODY_IMAGE_WORKER_DIAGNOSTICS", "").strip().lower() == "true"
+if DIAGNOSTICS and STAGE != "staging":
+    raise ValueError("BODY_IMAGE_WORKER_DIAGNOSTICS 는 staging 배포에서만 켤 수 있습니다.")
+DIAGNOSTIC_ENV = {"BODY_IMAGE_DIAGNOSTICS": "true", "BODY_IMAGE_REMBG_PROFILE_RUNS": "2"} if DIAGNOSTICS else {}
+STAGE_ENV = {"env": {"BODY_IMAGE_WORKER_STAGE": STAGE, **DIAGNOSTIC_ENV}} if GPU_SNAPSHOT else {}
 
 WORKER_ENV = {
     "PYTHONUNBUFFERED": "1",
@@ -127,65 +134,75 @@ image = (
     .env(WORKER_ENV)
     # rembg import 가 PyMatting 함수를 컴파일하며 Numba cache 를 만든다. 비어 있으면 빌드를 멈춘다.
     .run_commands(f"mkdir -p {NUMBA_CACHE_DIR}", 'python -c "import rembg"', _CHECK_NUMBA_CACHE)
-    # 코드는 마지막 layer 다. 코드만 바뀌면 의존성·모델·cache layer 를 다시 만들지 않는다.
-    .add_local_dir(ROOT / "app", "/root/app", ignore=["**/__pycache__", "**/*.pyc"])
 )
+# staging 이미지에만 stage 를 굽는다. 함수 env(STAGE_ENV)와 다른 경로로 전달되는 값이라 컨테이너에서 둘을
+# 비교해 한쪽이 빠지거나 다르면 멈춘다(resolve_gpu_snapshot). production 이미지는 바꾸지 않는다.
+# env 도 build step 이라 코드 layer(add_local_dir, copy 없음) 앞에 둔다(뒤에 두면 modal deploy 가 거절한다).
+IMAGE_STAGE_VAR = "BODY_IMAGE_WORKER_IMAGE_STAGE"
+if GPU_SNAPSHOT:
+    image = image.env({IMAGE_STAGE_VAR: STAGE})
+# 코드는 마지막 layer 다. 코드만 바뀌면 의존성·모델·cache layer 를 다시 만들지 않는다.
+image = image.add_local_dir(ROOT / "app", "/root/app", ignore=["**/__pycache__", "**/*.pyc"])
 
 app = modal.App(APP_NAME)
 
 
 class StageConfigError(RuntimeError):
-    """Modal 에 등록된 함수 구성과 컨테이너가 읽은 stage 가 맞지 않는다. 다른 경로로 바꾸지 않고 멈춘다."""
+    """배포 stage 가 컨테이너에 일관되게 전달되지 않았다. 다른 경로(production)로 바꾸지 않고 멈춘다."""
 
 
-def registered_gpu_snapshot() -> tuple[bool, str] | None:
-    """이 컨테이너가 Modal 서버에서 받은 함수 정의의 (GPU snapshot 사용 여부, GPU 종류). 컨테이너 밖이면 None.
-
-    배포 때 experimental_options 로 등록된 구성이라 BODY_IMAGE_WORKER_STAGE(env)와 독립적이다.
-    Modal 런타임 내부 객체(modal 1.6.1 의 _ContainerIOManager)를 읽으므로, 읽지 못하면 None 이다.
-    """
-    try:
-        from modal._runtime.container_io_manager import _ContainerIOManager
-
-        manager = _ContainerIOManager._singleton
-        if manager is None:
-            return None
-        function_def = manager.function_def
-        gpu_type = function_def.resources.gpu_config.gpu_type
-        return bool(function_def._experimental_enable_gpu_snapshot and gpu_type), gpu_type
-    except (ImportError, AttributeError):  # SDK 내부 구조가 바뀌면 읽지 못한 것으로 본다
-        return None
+class SnapshotStateError(RuntimeError):
+    """GPU snapshot 에 담을 모델(또는 복원된 모델)이 없다. runtime 없이 시작하지 않고 멈춘다."""
 
 
 def _rounded(timings: dict[str, float] | None) -> dict[str, float] | None:
     return None if timings is None else {name: round(value, 1) for name, value in timings.items()}
 
 
+def _stage_from(name: str) -> str:
+    return (os.environ.get(name) or "production").strip().lower()
+
+
 def container_stage() -> str:
-    return (os.environ.get("BODY_IMAGE_WORKER_STAGE") or "production").strip().lower()
+    """함수 env(@app.cls(env=...), Modal 이 Secret 으로 넣는다)로 받은 stage."""
+    return _stage_from("BODY_IMAGE_WORKER_STAGE")
+
+
+def image_stage() -> str:
+    """이미지(Image.env)에 구운 stage. 이미지 layer 라 컨테이너 시작부터 있다."""
+    return _stage_from(IMAGE_STAGE_VAR)
 
 
 def resolve_gpu_snapshot() -> bool:
-    """snap=True 에서 GPU snapshot 경로를 쓸지 정한다. 등록 구성과 컨테이너 stage 가 다르면 StageConfigError.
+    """snap=True 에서 GPU snapshot 경로를 쓸지 정한다. Modal 공개 API 로 넘긴 값만 쓴다.
 
-    - staging 으로 배포됐는데(GPU snapshot 등록) 컨테이너가 stage 를 못 받음 → 멈춘다(production 경로로 가지 않음).
-    - 컨테이너는 staging 인데 GPU snapshot 이 등록되지 않음 → 멈춘다.
-    - production(등록 안 됨, env 없음)은 기존 경로 그대로다. 구성을 읽지 못해도 production 은 그대로 진행한다.
+    배포가 서로 다른 두 경로(이미지 env·함수 env)로 넘긴 stage 를 비교해, 하나가 빠지거나 다르면
+    StageConfigError 로 멈춘다(staging 으로 배포했는데 production 경로로 조용히 가지 않는다).
+    production 은 둘 다 없어 기존 경로 그대로다.
+
+    한계: 두 값 모두 같은 배포 코드가 정하므로 "Modal 에 GPU snapshot 옵션이 실제로 등록됐는지"는 여기서 알 수
+    없다. 그것은 배포 설정 테스트(experimental_options 등록)와, staging snap=True 에서 CUDA 를 실제로 쓰는지
+    (prepare_gpu_snapshot(require_cuda=True)), 그리고 Modal 로그(Creating/Restoring)로 확인한다.
     """
-    stage = container_stage()
-    wants_gpu_snapshot = stage == "staging"
-    registered = registered_gpu_snapshot()
-    if registered is None:
-        if wants_gpu_snapshot:
-            raise StageConfigError("staging 컨테이너인데 Modal 함수 구성을 읽지 못해 GPU snapshot 을 확인할 수 없습니다.")
-        return False
-    enabled, gpu_type = registered
-    if enabled != wants_gpu_snapshot:
-        raise StageConfigError(
-            f"Modal 함수 구성(gpu_snapshot={enabled}, gpu={gpu_type})과 컨테이너 stage({stage!r})가 맞지 않습니다."
-        )
-    print(f"body image worker lifecycle: stage={stage} gpu_snapshot={enabled} gpu={gpu_type}", flush=True)
-    return enabled
+    stages = {"image": image_stage(), "function": container_stage()}
+    unknown = {where: stage for where, stage in stages.items() if stage not in _DEFAULT_NAMES}
+    if unknown:
+        raise StageConfigError(f"알 수 없는 stage 입니다: {unknown}")
+    if stages["image"] != stages["function"]:
+        raise StageConfigError(f"이미지 stage 와 함수 stage 가 다릅니다: {stages}")
+    gpu_snapshot = stages["function"] == "staging"
+    print(f"body image worker lifecycle: stage={stages['function']} gpu_snapshot={gpu_snapshot}", flush=True)
+    return gpu_snapshot
+
+
+def _cuda_device_name() -> str | None:
+    """실제로 붙은 GPU 이름(torch 공개 API). torch·CUDA 가 없으면 None."""
+    try:
+        import torch
+
+        return torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+    except Exception:  # noqa: BLE001 - 진단 로그용. 실패해도 시작을 막지 않는다(CUDA 검사는 require_cuda 가 한다)
+        return None
 
 
 @app.cls(
@@ -210,13 +227,18 @@ class BodyImageWorker:
         self.detectors = None
         self.models = self.warmup_ms = None
         self.gpu_snapshot = resolve_gpu_snapshot()
+        gpu = None
         if self.gpu_snapshot:
             self.models, self.warmup_ms = worker.prepare_gpu_snapshot(require_cuda=True)
+            if self.models is None:
+                # 모델 파일 누락 등. GPU snapshot 에 빈 상태를 담고 runtime 없이 시작하지 않는다.
+                raise SnapshotStateError("GPU snapshot 단계에서 모델을 준비하지 못했습니다.")
+            gpu = _cuda_device_name()
         else:
             self.detectors = worker.prepare_cpu()
         print(
             f"body image worker lifecycle: snap=True done start={started:.3f} end={time.time():.3f} "
-            f"gpu_snapshot={self.gpu_snapshot} warmup_ms={_rounded(self.warmup_ms)}",
+            f"gpu_snapshot={self.gpu_snapshot} gpu={gpu} warmup_ms={_rounded(self.warmup_ms)}",
             flush=True,
         )
 
@@ -230,14 +252,16 @@ class BodyImageWorker:
         from app.body_image_validation import worker
 
         started = time.time()
-        if (container_stage() == "staging") != self.gpu_snapshot:
+        if resolve_gpu_snapshot() != self.gpu_snapshot:
             # 복원된 컨테이너의 stage 가 snapshot 을 만들 때와 다르다. 다른 경로로 바꾸지 않고 멈춘다.
             raise StageConfigError(f"복원 뒤 stage({container_stage()!r})가 snapshot 구성과 다릅니다.")
-        if self.detectors is not None:
-            timings = worker.start_gpu(*self.detectors)
-        else:
+        if self.gpu_snapshot:
+            if self.models is None:
+                raise SnapshotStateError("복원된 snapshot 에 GPU 모델이 없습니다.")
             runtime = worker.start_restored_runtime(self.models, self.warmup_ms)
             timings = self.warmup_ms if runtime is not None else None
+        else:
+            timings = worker.start_gpu(*self.detectors)
         print(
             f"body image worker lifecycle: snap=False done start={started:.3f} end={time.time():.3f} "
             f"runtime={'ready' if timings is not None else 'unavailable'} warmup_ms={_rounded(timings)}",

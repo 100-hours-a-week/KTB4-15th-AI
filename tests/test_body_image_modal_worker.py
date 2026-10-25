@@ -21,6 +21,8 @@ _NAME_VARS = (
     "BODY_IMAGE_WORKER_APP_NAME",
     "BODY_IMAGE_WORKER_LABEL",
     "BODY_IMAGE_WORKER_SECRET_NAME",
+    "BODY_IMAGE_WORKER_DIAGNOSTICS",
+    "BODY_IMAGE_WORKER_IMAGE_STAGE",
 )
 
 
@@ -154,10 +156,20 @@ def test_production_initializes_only_cpu_in_the_snapshot_and_gpu_after_restore(m
     assert calls[2:] == [("close", ())]
 
 
-def as_staging_container(monkeypatch, loaded, registered=(True, "T4")):
-    """컨테이너 환경변수(env=)와 Modal 에 등록된 함수 구성(registered)을 지정한다."""
-    monkeypatch.setenv("BODY_IMAGE_WORKER_STAGE", "staging")
-    monkeypatch.setattr(loaded, "registered_gpu_snapshot", lambda: registered)
+STAGE_VARS = ("BODY_IMAGE_WORKER_STAGE", "BODY_IMAGE_WORKER_IMAGE_STAGE")
+
+
+def set_container_stages(monkeypatch, function_stage, image_stage):
+    """컨테이너가 받는 두 값: 함수 env(@app.cls(env=...))와 이미지 env(Image.env). None 이면 없음."""
+    for name, value in zip(STAGE_VARS, (function_stage, image_stage), strict=True):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+
+def as_staging_container(monkeypatch, loaded):
+    set_container_stages(monkeypatch, "staging", "staging")
     return loaded
 
 
@@ -175,60 +187,60 @@ def test_staging_initializes_gpu_in_the_snapshot_and_only_the_runtime_after_rest
     assert calls[2:] == [("close", ())]
 
 
-def test_staging_snapshot_failure_starts_without_a_runtime(fake_worker, monkeypatch):
+def test_staging_snapshot_without_models_fails_fast(fake_worker, monkeypatch):
     from app.body_image_validation import worker
 
-    calls = fake_worker["calls"]
     monkeypatch.setattr(worker, "prepare_gpu_snapshot", lambda require_cuda: (None, None))
     staging = as_staging_container(monkeypatch, load(BODY_IMAGE_WORKER_STAGE="staging"))
-    _, pre, post, _ = lifecycle(staging)
+    _, pre, _, _ = lifecycle(staging)
 
+    with pytest.raises(staging.SnapshotStateError):  # runtime 없이 시작하지 않는다
+        run(pre)
+
+
+def test_staging_restore_without_models_fails_fast(fake_worker, monkeypatch):
+    staging = as_staging_container(monkeypatch, load(BODY_IMAGE_WORKER_STAGE="staging"))
+    obj, pre, post, _ = lifecycle(staging)
     run(pre)
-    run(post)
-    assert calls == [("start_restored_runtime", (None, None))]
+    obj.models = None  # 복원된 상태에 모델이 없다
+
+    with pytest.raises(staging.SnapshotStateError):
+        run(post)
+    assert [call[0] for call in fake_worker["calls"]] == ["prepare_gpu_snapshot"]
 
 
-# --- stage 구성 불일치는 멈춘다(production 경로로 조용히 바꾸지 않는다) ---
+# --- stage 불일치는 멈춘다(production 경로로 조용히 바꾸지 않는다). Modal 내부 API 없이 두 공개 경로만 비교 ---
 
 
 @pytest.mark.parametrize(
-    ("env_stage", "registered", "expected"),
+    ("function_stage", "image_stage", "expected"),
     [
-        ("staging", (True, "T4"), True),  # staging 배포 + 컨테이너도 staging
-        (None, (False, "T4"), False),  # production 배포(env 없음)
-        (None, None, False),  # 컨테이너 밖·구성을 못 읽음: production 은 기존 그대로
-        ("production", (False, "T4"), False),
+        ("staging", "staging", True),  # staging 배포: 함수 env·이미지 env 모두 staging
+        (None, None, False),  # production 배포: 둘 다 없음(기존 그대로)
+        ("production", None, False),
+        ("production", "production", False),
     ],
 )
-def test_matching_stage_and_registered_config_pick_the_lifecycle(
-    module, monkeypatch, env_stage, registered, expected
-):
-    if env_stage is None:
-        monkeypatch.delenv("BODY_IMAGE_WORKER_STAGE", raising=False)
-    else:
-        monkeypatch.setenv("BODY_IMAGE_WORKER_STAGE", env_stage)
-    monkeypatch.setattr(module, "registered_gpu_snapshot", lambda: registered)
+def test_matching_stages_pick_the_lifecycle(module, monkeypatch, function_stage, image_stage, expected):
+    set_container_stages(monkeypatch, function_stage, image_stage)
 
     assert module.resolve_gpu_snapshot() is expected
 
 
 @pytest.mark.parametrize(
-    ("env_stage", "registered"),
+    ("function_stage", "image_stage"),
     [
-        (None, (True, "T4")),  # staging 으로 배포됐는데 컨테이너가 stage 를 못 받음
-        ("production", (True, "T4")),
-        ("staging", (False, "T4")),  # 컨테이너는 staging 인데 GPU snapshot 이 등록되지 않음
-        ("staging", None),  # staging 인데 등록 구성을 확인할 수 없음
+        (None, "staging"),  # staging 이미지인데 함수 env 가 전달되지 않음
+        ("production", "staging"),
+        ("staging", None),  # 함수 env 는 staging 인데 이미지가 staging 이 아님
+        ("staging", "production"),
+        ("stagin", "stagin"),  # 알 수 없는 값
     ],
-    ids=["staging-deploy-without-env", "staging-deploy-with-production-env",
-         "staging-env-without-gpu-snapshot", "staging-env-unverifiable"],
+    ids=["function-env-missing", "function-env-production", "image-env-missing", "image-env-production",
+         "unknown-stage"],
 )
-def test_mismatched_stage_and_registered_config_fail_fast(module, monkeypatch, env_stage, registered):
-    if env_stage is None:
-        monkeypatch.delenv("BODY_IMAGE_WORKER_STAGE", raising=False)
-    else:
-        monkeypatch.setenv("BODY_IMAGE_WORKER_STAGE", env_stage)
-    monkeypatch.setattr(module, "registered_gpu_snapshot", lambda: registered)
+def test_mismatched_or_unknown_stages_fail_fast(module, monkeypatch, function_stage, image_stage):
+    set_container_stages(monkeypatch, function_stage, image_stage)
 
     with pytest.raises(module.StageConfigError):
         module.resolve_gpu_snapshot()
@@ -236,8 +248,7 @@ def test_mismatched_stage_and_registered_config_fail_fast(module, monkeypatch, e
 
 def test_snapshot_hook_stops_instead_of_falling_back_to_the_production_path(fake_worker, monkeypatch):
     staging = load(BODY_IMAGE_WORKER_STAGE="staging")
-    monkeypatch.delenv("BODY_IMAGE_WORKER_STAGE", raising=False)  # env 가 컨테이너에 전달되지 않음
-    monkeypatch.setattr(staging, "registered_gpu_snapshot", lambda: (True, "T4"))
+    set_container_stages(monkeypatch, None, "staging")  # 함수 env 가 컨테이너에 전달되지 않음
     _, pre, _, _ = lifecycle(staging)
 
     with pytest.raises(staging.StageConfigError):
@@ -256,32 +267,63 @@ def test_restore_with_a_different_stage_fails_fast(fake_worker, monkeypatch):
     assert [call[0] for call in fake_worker["calls"]] == ["prepare_gpu_snapshot"]
 
 
-def test_registered_config_is_read_from_the_modal_container_function_definition(module, monkeypatch):
-    from types import SimpleNamespace
+def test_staging_bakes_its_stage_into_the_image_and_production_does_not(monkeypatch):
+    import modal
 
-    from modal._runtime.container_io_manager import _ContainerIOManager
+    baked = []
+    original = modal.Image.env
 
-    assert module.registered_gpu_snapshot() is None  # 컨테이너 밖
+    def spy(self, vars):
+        baked.append(dict(vars))
+        return original(self, vars)
 
-    def function_def(enabled, gpu_type):
-        return SimpleNamespace(
-            _experimental_enable_gpu_snapshot=enabled,
-            resources=SimpleNamespace(gpu_config=SimpleNamespace(gpu_type=gpu_type)),
-        )
+    monkeypatch.setattr(modal.Image, "env", spy)
+    load()
+    production_envs = list(baked)
+    baked.clear()
+    load(BODY_IMAGE_WORKER_STAGE="staging")
 
-    for enabled, gpu_type, expected in [(True, "T4", (True, "T4")), (False, "T4", (False, "T4")),
-                                         (True, "", (False, ""))]:
-        manager = SimpleNamespace(function_def=function_def(enabled, gpu_type))
-        monkeypatch.setattr(_ContainerIOManager, "_singleton", manager)
-        assert module.registered_gpu_snapshot() == expected
+    assert {"BODY_IMAGE_WORKER_IMAGE_STAGE": "staging"} in baked
+    assert all("BODY_IMAGE_WORKER_IMAGE_STAGE" not in env for env in production_envs)  # production 이미지는 그대로
 
 
-def test_real_function_proto_has_the_fields_the_check_reads():
-    from modal_proto import api_pb2
+@pytest.mark.parametrize("stage", ["production", "staging"])
+def test_no_build_step_runs_after_the_local_code_layer(monkeypatch, stage):
+    # modal deploy 는 copy 없이 add_local_* 한 뒤의 build step(env·run_commands 등)을 거절한다. 로컬 import 로는
+    # 드러나지 않으므로 공개 Image 메서드의 호출 순서로 확인한다. 코드(add_local_dir)는 마지막이어야 한다.
+    import modal
 
-    function = api_pb2.Function()
-    assert "_experimental_enable_gpu_snapshot" in [field.name for field in function.DESCRIPTOR.fields]
-    assert "gpu_type" in [field.name for field in function.resources.gpu_config.DESCRIPTOR.fields]
+    calls = []
+    for name in ("env", "run_commands", "pip_install", "apt_install", "add_local_dir"):
+        original = getattr(modal.Image, name)
+
+        def spy(self, *args, _name=name, _original=original, **kwargs):
+            calls.append(_name)
+            return _original(self, *args, **kwargs)
+
+        monkeypatch.setattr(modal.Image, name, spy)
+    load(BODY_IMAGE_WORKER_STAGE=stage)
+
+    assert calls[-1] == "add_local_dir" and calls.count("add_local_dir") == 1
+
+
+def test_worker_does_not_use_modal_private_runtime_api():
+    """배포 파일이 Modal 비공개 API(modal._*, _experimental_* 속성)에 런타임에 기대지 않는다."""
+    import ast
+
+    tree = ast.parse(WORKER_FILE.read_text())
+    private_imports = [
+        node.module if isinstance(node, ast.ImportFrom) else alias.name
+        for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+        if (isinstance(node, ast.ImportFrom) and (node.module or "").startswith("modal._"))
+        or (isinstance(node, ast.Import) and alias.name.startswith("modal._"))
+    ]
+    private_attributes = [
+        node.attr for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr.startswith(("_experimental", "_singleton"))
+    ]
+    assert private_imports == [] and private_attributes == []
 
 
 def web_endpoint(loaded):
@@ -380,7 +422,7 @@ def test_import_from_the_container_path_does_not_depend_on_the_local_layout():
 def test_staging_container_picks_the_gpu_snapshot_lifecycle_from_its_env(monkeypatch):
     # staging 배포는 env={"BODY_IMAGE_WORKER_STAGE": "staging"} 을 넘기므로 컨테이너도 같은 lifecycle 을 고른다.
     staging = load(BODY_IMAGE_WORKER_STAGE="staging")
-    loaded = load_as_in_container(**staging.STAGE_ENV["env"])
+    loaded = load_as_in_container(**staging.STAGE_ENV["env"], BODY_IMAGE_WORKER_IMAGE_STAGE="staging")
 
     assert loaded["GPU_SNAPSHOT"] is True
 
@@ -450,3 +492,25 @@ def test_staging_enables_gpu_snapshot_and_passes_its_stage_to_the_container(monk
     assert load(BODY_IMAGE_WORKER_STAGE="staging").STAGE_ENV == {
         "env": {"BODY_IMAGE_WORKER_STAGE": "staging"}
     }
+
+
+# --- 진단(staging 검증용) ---
+
+
+def test_diagnostics_are_off_unless_requested():
+    assert load(BODY_IMAGE_WORKER_STAGE="staging").STAGE_ENV == {"env": {"BODY_IMAGE_WORKER_STAGE": "staging"}}
+
+
+def test_staging_diagnostics_pass_profiling_settings_to_the_container():
+    staging = load(BODY_IMAGE_WORKER_STAGE="staging", BODY_IMAGE_WORKER_DIAGNOSTICS="true")
+
+    assert staging.STAGE_ENV == {"env": {
+        "BODY_IMAGE_WORKER_STAGE": "staging",
+        "BODY_IMAGE_DIAGNOSTICS": "true",
+        "BODY_IMAGE_REMBG_PROFILE_RUNS": "2",  # snapshot 전 warm-up 1번 + 복원 뒤 첫 요청 1번
+    }}
+
+
+def test_production_refuses_diagnostics():
+    with pytest.raises(ValueError):
+        load(BODY_IMAGE_WORKER_DIAGNOSTICS="true")

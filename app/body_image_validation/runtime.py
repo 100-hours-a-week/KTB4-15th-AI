@@ -31,6 +31,7 @@ class BodyImageRuntime:
             models.background_remover,
             storage,
             gpu_preprocessor=models.gpu_preprocessor,
+            diagnostics=config.DIAGNOSTICS,
         )
 
     @classmethod

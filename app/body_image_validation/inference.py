@@ -49,6 +49,8 @@ def build_background_remover() -> RembgBackgroundRemover:
     options = {"enable_cpu_mem_arena": config.REMBG_ENABLE_CPU_MEM_ARENA}
     if config.REMBG_PROVIDERS:
         options["providers"] = list(config.REMBG_PROVIDERS)
+    if config.REMBG_PROFILE_RUNS > 0:  # 진단용(기본 꺼짐)
+        options["profile_runs"] = config.REMBG_PROFILE_RUNS
     return RembgBackgroundRemover(str(config.REMBG_MODEL), **options)
 
 

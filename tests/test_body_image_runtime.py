@@ -264,3 +264,25 @@ def test_mediapipe_detector_close_is_idempotent(cls_name):
     detector.close()
     detector.close()
     assert Task.closes == 1
+
+
+
+def test_rembg_profiling_is_passed_only_when_configured(monkeypatch, model_files):
+    monkeypatch.setattr(inference, "RembgBackgroundRemover", _Fake)
+
+    monkeypatch.setattr(config, "REMBG_PROFILE_RUNS", 0)
+    assert "profile_runs" not in inference.build_background_remover().kwargs
+
+    monkeypatch.setattr(config, "REMBG_PROFILE_RUNS", 2)
+    assert inference.build_background_remover().kwargs["profile_runs"] == 2
+
+
+def test_runtime_passes_the_diagnostics_setting_to_the_service(monkeypatch, model_files):
+    monkeypatch.setattr(runtime, "S3ImageStorage", _Fake)
+    for name in ("MediaPipePersonDetector", "MediaPipePoseDetector", "RembgBackgroundRemover"):
+        monkeypatch.setattr(inference, name, _Fake)
+
+    monkeypatch.setattr(config, "DIAGNOSTICS", True)
+    assert runtime.BodyImageRuntime.create().service._diagnostics is not None
+    monkeypatch.setattr(config, "DIAGNOSTICS", False)
+    assert runtime.BodyImageRuntime.create().service._diagnostics is None
