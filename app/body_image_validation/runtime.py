@@ -1,90 +1,58 @@
-"""무거운 모델/session을 프로세스 생명주기 동안 한 번만 준비한다."""
+"""무거운 모델/session을 프로세스 생명주기 동안 한 번만 준비한다.
+
+모델(inference.BodyImageModels)과 연결·요청 상태(S3 client, service 의 limiter)를 나눠 만든다.
+모델은 secret 없이 먼저 만들 수 있고, 이 모듈은 S3 client 를 만들며 settings(secret)를 읽는다.
+"""
 
 import logging
 import threading
-from pathlib import Path
 
-from app.body_image_validation.background import RembgBackgroundRemover
 from app.body_image_validation.concurrency import BodyValidationLimiter
-from app.body_image_validation.detectors import MediaPipePersonDetector, MediaPipePoseDetector
-from app.body_image_validation.gpu_preprocessing import (
-    GpuImagePreprocessor,
-    GpuJpegDecoder,
-    GpuPreprocessingUnavailableError,
-)
+from app.body_image_validation.inference import BodyImageModels, BodyImageRuntimeError
 from app.body_image_validation.service import BodyImageValidationService
-from app.clients.s3 import S3ConfigError, S3ImageStorage, get_s3_bucket
+from app.clients.s3 import ImageStorage, S3ConfigError, S3ImageStorage, get_s3_bucket
 from app.config import body_image_validation as config
 
 logger = logging.getLogger(__name__)
 
 
-class BodyImageRuntimeError(RuntimeError):
-    """모델 파일 또는 runtime 초기화 실패."""
-
-
-def build_gpu_preprocessor() -> GpuImagePreprocessor | None:
-    """GPU 경로는 선택 사항이다. 켰는데 쓸 수 없으면 경고만 남기고 Pillow 로만 동작한다."""
-    if not config.GPU_PREPROCESSING:
-        return None
-    try:
-        return GpuImagePreprocessor(GpuJpegDecoder())
-    except GpuPreprocessingUnavailableError as error:
-        logger.warning("body image GPU preprocessing is unavailable, using Pillow only: %s", error)
-        return None
-
-
 class BodyImageRuntime:
-    def __init__(
-        self,
-        person_detector: MediaPipePersonDetector | None = None,
-        pose_detector: MediaPipePoseDetector | None = None,
-    ) -> None:
-        """detector 를 넘기면 새로 만들지 않고 쓴다. 넘긴 detector 도 이 runtime 이 닫는다.
+    """local 모드 runtime: 미리 만든 모델 + S3 저장소 + 요청을 처리하는 service."""
 
-        Modal worker 는 CPU 전용인 MediaPipe detector 를 memory snapshot 전에 만들어 넘기고,
-        GPU 를 쓰는 rembg session·GPU 전처리·S3 client 는 snapshot 복원 뒤 여기서 만든다.
-        """
-        paths = (
-            config.PERSON_DETECTOR_MODEL,
-            config.POSE_LANDMARKER_MODEL,
-            config.REMBG_MODEL,
+    def __init__(self, models: BodyImageModels, storage: ImageStorage) -> None:
+        """모델 소유권을 넘겨받는다(close() 가 닫는다). service 와 그 limiter(Condition)는 여기서 새로 만든다."""
+        self.models = models
+        self.person_detector = models.person_detector
+        self.pose_detector = models.pose_detector
+        self.background_remover = models.background_remover
+        self.service = BodyImageValidationService(
+            models.person_detector,
+            models.pose_detector,
+            models.background_remover,
+            storage,
+            gpu_preprocessor=models.gpu_preprocessor,
         )
-        missing = [str(path) for path in paths if not Path(path).is_file()]
-        if missing:
-            raise BodyImageRuntimeError(f"전신 이미지 모델 파일이 없습니다: {missing}")
+
+    @classmethod
+    def create(cls, models: BodyImageModels | None = None) -> "BodyImageRuntime":
+        """S3 client 를 만들고 runtime 을 조립한다.
+
+        models 를 넘기면(Modal worker) 그 모델을 쓰고, 없으면(EC2 local) S3 client 다음에 여기서 만든다.
+        어느 쪽이든 실패하면 BodyImageRuntimeError 이고, 넘겨받은 모델도 닫는다.
+        """
         try:
             storage = S3ImageStorage()
-            if person_detector is None:
-                person_detector = MediaPipePersonDetector(str(config.PERSON_DETECTOR_MODEL))
-            if pose_detector is None:
-                pose_detector = MediaPipePoseDetector(str(config.POSE_LANDMARKER_MODEL))
-            remover_options = {"enable_cpu_mem_arena": config.REMBG_ENABLE_CPU_MEM_ARENA}
-            if config.REMBG_PROVIDERS:
-                remover_options["providers"] = list(config.REMBG_PROVIDERS)
-            background_remover = RembgBackgroundRemover(str(config.REMBG_MODEL), **remover_options)
-        # MediaPipe, ONNX Runtime, boto3가 서로 다른 예외 계층을 사용하므로 초기화 경계에서
-        # 하나의 BodyImageRuntimeError로 묶고 이미 열린 native resource를 정리한다.
+        # boto3 예외도 초기화 경계에서 BodyImageRuntimeError 로 묶는다.
         except Exception as error:
-            if person_detector is not None:
-                person_detector.close()
-            if pose_detector is not None:
-                pose_detector.close()
+            if models is not None:
+                models.close()
             raise BodyImageRuntimeError("전신 이미지 runtime 초기화에 실패했습니다.") from error
-        self.person_detector = person_detector
-        self.pose_detector = pose_detector
-        self.background_remover = background_remover
-        self.service = BodyImageValidationService(
-            self.person_detector,
-            self.pose_detector,
-            self.background_remover,
-            storage,
-            gpu_preprocessor=build_gpu_preprocessor(),
-        )
+        if models is None:
+            models = BodyImageModels.load()
+        return cls(models, storage)
 
     def close(self) -> None:
-        self.person_detector.close()
-        self.pose_detector.close()
+        self.models.close()
 
 
 class RemoteBodyImageRuntime:
@@ -124,20 +92,23 @@ class BodyImageRuntimeManager:
         self._error: Exception | None = None
         self._lock = threading.Lock()
 
-    def start(self, **runtime_options) -> None:
-        """runtime_options 는 BodyImageRuntime 에 그대로 넘긴다(Modal worker 의 미리 만든 detector)."""
+    def start(self, models: BodyImageModels | None = None) -> None:
+        """runtime 을 한 번만 만든다. models 는 Modal worker 가 미리 만든 모델이다(없으면 local 에서 만든다).
+
+        이미 runtime 이 있으면 아무것도 하지 않는다(넘긴 models 의 정리는 호출자 몫이다).
+        """
         with self._lock:
             if self._runtime is not None:
                 return
             try:
                 if config.VALIDATION_MODE == "remote":
-                    # 업로드는 worker 가 하므로 S3 설정을 보지 않는다. detector 를 넘기는 쪽은 worker 뿐이다.
-                    if runtime_options:
+                    # 업로드는 worker 가 하므로 S3 설정을 보지 않는다. 모델을 넘기는 쪽은 worker 뿐이다.
+                    if models is not None:
                         raise BodyImageRuntimeError("remote 모드에는 미리 만든 모델을 넘길 수 없습니다.")
                     self._runtime = RemoteBodyImageRuntime()
                 elif config.VALIDATION_MODE == "local":
                     get_s3_bucket()
-                    self._runtime = BodyImageRuntime(**runtime_options)
+                    self._runtime = BodyImageRuntime.create(models)
                 else:
                     raise BodyImageRuntimeError(
                         f"BODY_IMAGE_VALIDATION_MODE 는 local 또는 remote 여야 합니다: "

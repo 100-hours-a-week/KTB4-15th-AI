@@ -16,7 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from app.body_image_validation import router, runtime, worker
+from app.body_image_validation import inference, router, runtime, worker
 from app.body_image_validation.models import BoundingBox, PersonDetection
 from app.body_image_validation.runtime import BodyImageRuntimeManager
 from app.body_image_validation.service import BodyImageValidationService
@@ -96,9 +96,9 @@ def worker_env(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "AUTH_DISABLED", False)
     s3 = FakeS3Client()
     monkeypatch.setattr(runtime, "S3ImageStorage", lambda: S3ImageStorage(client=s3, bucket="test-bucket"))
-    monkeypatch.setattr(runtime, "MediaPipePersonDetector", FakePersonDetector)
-    monkeypatch.setattr(runtime, "MediaPipePoseDetector", FakePoseDetector)
-    monkeypatch.setattr(runtime, "RembgBackgroundRemover", FakeRemover)
+    monkeypatch.setattr(inference, "MediaPipePersonDetector", FakePersonDetector)
+    monkeypatch.setattr(inference, "MediaPipePoseDetector", FakePoseDetector)
+    monkeypatch.setattr(inference, "RembgBackgroundRemover", FakeRemover)
     FakePersonDetector.instances = FakePoseDetector.instances = FakeRemover.instances = 0
     manager = BodyImageRuntimeManager()
     monkeypatch.setattr(runtime, "runtime_manager", manager)
@@ -127,13 +127,14 @@ def test_worker_app_serves_only_the_body_image_endpoint_and_health():
 
 
 def test_snapshot_phase_modules_do_not_read_secret_settings():
-    # prepare_cpu() 가 쓰는 app 모듈(worker·detectors)이 settings(INTERNAL_API_KEY·S3·AWS)를
-    # import 하지 않아야 snapshot 에 secret 이 담기지 않는다. 다른 테스트가 이미 import 했을 수 있어
-    # 새 프로세스에서 확인한다. 무거운 라이브러리 import(preload_modules)는 여기서 하지 않는다.
+    # prepare_cpu()·prepare_gpu_for_snapshot() 이 쓰는 app 모듈(worker·detectors·inference)이
+    # settings(INTERNAL_API_KEY·S3·AWS)를 import 하지 않아야 snapshot 에 secret 이 담기지 않는다. 다른 테스트가
+    # 이미 import 했을 수 있어 새 프로세스에서 확인한다. 무거운 라이브러리 import(preload_modules)는 하지 않는다.
     code = (
         "import sys, json\n"
         "from app.body_image_validation import worker\n"
         "import app.body_image_validation.detectors\n"
+        "import app.body_image_validation.inference\n"
         "print(json.dumps({'settings': 'app.config.settings' in sys.modules,"
         " 's3': 'app.clients.s3' in sys.modules, 'torch': 'torch' in sys.modules}))\n"
     )
@@ -179,6 +180,81 @@ def test_start_gpu_builds_the_runtime_once_with_the_snapshot_detectors(worker_en
     # 위에서 만든 것뿐이다. runtime 이 detector 를 새로 만들지 않는다.
     assert (FakePersonDetector.instances, FakePoseDetector.instances, FakeRemover.instances) == (1, 1, 1)
     assert set(timings) == {"preprocess", "person_pose", "rembg", "png"}
+
+
+def test_prepare_gpu_for_snapshot_builds_models_without_s3_or_runtime(worker_env, monkeypatch):
+    def must_not_build(*args, **kwargs):
+        raise AssertionError("snapshot 단계에서는 S3 client 를 만들지 않는다")
+
+    monkeypatch.setattr(runtime, "S3ImageStorage", must_not_build)
+    person, pose = FakePersonDetector(), FakePoseDetector()
+
+    models, timings = worker.prepare_gpu_for_snapshot(person, pose)
+
+    assert models.person_detector is person and models.pose_detector is pose
+    assert FakeRemover.instances == 1
+    assert (person.calls, pose.calls, models.background_remover.calls) == (1, 1, 1)  # warm-up
+    assert set(timings) == {"preprocess", "person_pose", "rembg", "png"}
+    assert worker_env["manager"].runtime is None  # runtime 등록은 start_runtime 이 한다
+    assert worker_env["s3"].puts == []
+
+
+def test_start_runtime_registers_the_prepared_models_with_a_new_storage(worker_env):
+    models, _ = worker.prepare_gpu_for_snapshot(FakePersonDetector(), FakePoseDetector())
+
+    built = worker.start_runtime(models)
+
+    assert built is worker_env["manager"].runtime
+    assert built.models is models
+    assert FakeRemover.instances == 1  # 모델을 다시 만들지 않는다
+    client = TestClient(worker.create_app(), raise_server_exceptions=False)
+    assert post(client, jpeg()).status_code == 200
+    assert len(worker_env["s3"].puts) == 1
+
+
+def test_start_runtime_without_a_bucket_closes_the_models(worker_env, monkeypatch):
+    person, pose = FakePersonDetector(), FakePoseDetector()
+    models, _ = worker.prepare_gpu_for_snapshot(person, pose)
+    monkeypatch.setattr(settings, "S3_BUCKET", "")
+
+    assert worker.start_runtime(models) is None
+    assert person.closed and pose.closed
+    models.close()  # 다시 닫아도 문제없다
+
+
+def test_start_runtime_checks_auth_settings(worker_env, monkeypatch):
+    models, _ = worker.prepare_gpu_for_snapshot(FakePersonDetector(), FakePoseDetector())
+    monkeypatch.setattr(settings, "AUTH_DISABLED", True)
+
+    with pytest.raises(worker.WorkerConfigError):
+        worker.start_runtime(models)
+    assert worker_env["manager"].runtime is None
+
+
+def test_warm_up_failure_closes_the_models(worker_env, monkeypatch):
+    def broken(self, image):
+        raise RuntimeError("rembg failed")
+
+    monkeypatch.setattr(FakeRemover, "remove", broken)
+    person, pose = FakePersonDetector(), FakePoseDetector()
+
+    with pytest.raises(RuntimeError):
+        worker.prepare_gpu_for_snapshot(person, pose)
+    assert person.closed and pose.closed
+
+
+def test_start_gpu_with_missing_model_files_starts_without_a_runtime(worker_env, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "REMBG_MODEL", tmp_path / "missing.onnx")
+    person, pose = FakePersonDetector(), FakePoseDetector()
+
+    assert worker.start_gpu(person, pose) is None
+    assert worker_env["manager"].runtime is None
+    assert FakeRemover.instances == 0
+    assert person.closed and pose.closed  # 넘긴 snapshot detector 도 정리한다
+    client = TestClient(worker.create_app(), raise_server_exceptions=False)
+    response = post(client, jpeg())
+    assert response.status_code == 500
+    assert response.json()["code"] == "BODY_IMAGE_RUNTIME_UNAVAILABLE"
 
 
 def test_warm_up_runs_every_stage_without_uploading_to_s3(worker_env):
@@ -300,7 +376,10 @@ def test_validation_failure_does_not_upload(worker_env, monkeypatch):
 def test_missing_bucket_starts_without_a_runtime_and_answers_s3_config_error(worker_env, monkeypatch):
     monkeypatch.setattr(settings, "S3_BUCKET", "")
 
-    assert worker.start_gpu(FakePersonDetector(), FakePoseDetector()) is None
+    person, pose = FakePersonDetector(), FakePoseDetector()
+    assert worker.start_gpu(person, pose) is None
+    assert FakeRemover.instances == 0  # 기존처럼 GPU 모델을 만들기 전에 멈춘다
+    assert person.closed and pose.closed  # 넘겨받은 detector 는 정리한다
     client = TestClient(worker.create_app(), raise_server_exceptions=False)
     response = post(client, jpeg())
 

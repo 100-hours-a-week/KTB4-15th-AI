@@ -59,6 +59,7 @@ class MediaPipePersonDetector:
         )
         self._detector = mp.tasks.vision.ObjectDetector.create_from_options(options)
         self._lock = threading.Lock()
+        self._closed = False
 
     def detect(self, image: DetectionImage) -> list[PersonDetection]:
         mp_image = image.mediapipe_image()
@@ -77,7 +78,12 @@ class MediaPipePersonDetector:
         return detections
 
     def close(self) -> None:
-        self._detector.close()
+        """MediaPipe task 를 닫는다. 여러 번 불려도 한 번만 닫는다(진행 중인 detect 가 끝난 뒤)."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._detector.close()
 
 
 LANDMARK_NAMES: Sequence[str] = (
@@ -133,6 +139,7 @@ class MediaPipePoseDetector:
         )
         self._detector = mp.tasks.vision.PoseLandmarker.create_from_options(options)
         self._lock = threading.Lock()
+        self._closed = False
 
     def detect(self, image: DetectionImage) -> Mapping[str, Landmark] | None:
         mp_image = image.mediapipe_image()
@@ -151,4 +158,9 @@ class MediaPipePoseDetector:
         }
 
     def close(self) -> None:
-        self._detector.close()
+        """MediaPipe task 를 닫는다. 여러 번 불려도 한 번만 닫는다(진행 중인 detect 가 끝난 뒤)."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._detector.close()
