@@ -10,6 +10,7 @@ Backend 가 직접 부르는 HTTP API(EC2 AI Server 와 같은 endpoint·응답)
 """
 
 import os
+import time
 from pathlib import Path
 
 import modal
@@ -28,7 +29,7 @@ ROOT = LOCAL_PROJECT_ROOT or _THIS_FILE.parent
 MODEL_DIR = "/app/models/body_image_validation"
 NUMBA_CACHE_DIR = "/opt/numba_cache"
 
-# 배포 대상. 기본은 production 이고, staging 은 이름 기본값과 컨테이너 수 상한만 다르다.
+# 배포 대상. 기본은 production 이고, staging 은 이름 기본값·컨테이너 수 상한·GPU fallback·GPU snapshot 이 다르다.
 STAGE = (os.environ.get("BODY_IMAGE_WORKER_STAGE") or "production").strip().lower()
 _DEFAULT_NAMES = {
     # (app 이름, URL label, Modal Secret 이름)
@@ -63,7 +64,8 @@ TORCH = ("torch==2.14.1", "torchvision==0.29.1")
 TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu130"
 
 # 단일 요청 peak: CPU 2.92 core, RAM 6.46GiB, VRAM 1.37GiB. 컨테이너당 동시 요청은 기본값 1 이다
-# (동시 요청 데코레이터를 쓰지 않는다). GPU memory snapshot 은 쓰지 않는다(experimental_options 없음).
+# (동시 요청 데코레이터를 쓰지 않는다). 공통 자원은 CPU memory snapshot 까지다. GPU snapshot 은 아래
+# STAGE_SNAPSHOT 으로 staging 에서만 켠다.
 WORKER_RESOURCES = {
     "gpu": "T4",
     "cpu": 4,
@@ -75,9 +77,16 @@ WORKER_RESOURCES = {
 
 # staging 에서만 GPU 컨테이너를 1개로 제한한다(비용·테스트 통제). production 은 Modal 기본값 그대로다.
 STAGE_SCALING = {"max_containers": 1} if STAGE == "staging" else {}
-# staging 에서만 GPU fallback 을 시험한다. Modal 은 목록 순서를 우선순위로 쓴다(T4 우선, 없으면 L4).
-# production 은 T4 그대로다. L4 에서도 같은 CUDA 13 / torch 2.14.1 / onnxruntime-gpu 1.30 조합이 동작했다.
-WORKER_GPU = ["T4", "L4"] if STAGE == "staging" else WORKER_RESOURCES["gpu"]
+# staging 도 T4 로 고정한다. GPU snapshot 을 production·benchmark 와 같은 GPU 조건에서 검증하기 위해서다.
+# (L4 fallback 과 T4↔L4 snapshot 호환성은 별도로 검증한 뒤에 다시 켠다.)
+WORKER_GPU = WORKER_RESOURCES["gpu"]
+# staging 에서만 GPU memory snapshot 을 켠다(experimental). 켜면 snap=True 단계에서 GPU 를 쓸 수 있어
+# CUDA·rembg CUDA session·nvJPEG·warm-up 까지 snapshot 에 담는다. production 은 CPU memory snapshot 그대로다.
+GPU_SNAPSHOT = STAGE == "staging"
+STAGE_SNAPSHOT = {"experimental_options": {"enable_gpu_snapshot": True}} if GPU_SNAPSHOT else {}
+# 컨테이너는 이 파일을 다시 import 해 lifecycle 을 고른다. 로컬 환경변수는 컨테이너에 없으므로 staging 은
+# stage 를 컨테이너 환경변수로 넘긴다(production 은 기본값이 production 이라 넘기지 않는다).
+STAGE_ENV = {"env": {"BODY_IMAGE_WORKER_STAGE": STAGE}} if GPU_SNAPSHOT else {}
 
 WORKER_ENV = {
     "PYTHONUNBUFFERED": "1",
@@ -125,26 +134,115 @@ image = (
 app = modal.App(APP_NAME)
 
 
+class StageConfigError(RuntimeError):
+    """Modal 에 등록된 함수 구성과 컨테이너가 읽은 stage 가 맞지 않는다. 다른 경로로 바꾸지 않고 멈춘다."""
+
+
+def registered_gpu_snapshot() -> tuple[bool, str] | None:
+    """이 컨테이너가 Modal 서버에서 받은 함수 정의의 (GPU snapshot 사용 여부, GPU 종류). 컨테이너 밖이면 None.
+
+    배포 때 experimental_options 로 등록된 구성이라 BODY_IMAGE_WORKER_STAGE(env)와 독립적이다.
+    Modal 런타임 내부 객체(modal 1.6.1 의 _ContainerIOManager)를 읽으므로, 읽지 못하면 None 이다.
+    """
+    try:
+        from modal._runtime.container_io_manager import _ContainerIOManager
+
+        manager = _ContainerIOManager._singleton
+        if manager is None:
+            return None
+        function_def = manager.function_def
+        gpu_type = function_def.resources.gpu_config.gpu_type
+        return bool(function_def._experimental_enable_gpu_snapshot and gpu_type), gpu_type
+    except (ImportError, AttributeError):  # SDK 내부 구조가 바뀌면 읽지 못한 것으로 본다
+        return None
+
+
+def _rounded(timings: dict[str, float] | None) -> dict[str, float] | None:
+    return None if timings is None else {name: round(value, 1) for name, value in timings.items()}
+
+
+def container_stage() -> str:
+    return (os.environ.get("BODY_IMAGE_WORKER_STAGE") or "production").strip().lower()
+
+
+def resolve_gpu_snapshot() -> bool:
+    """snap=True 에서 GPU snapshot 경로를 쓸지 정한다. 등록 구성과 컨테이너 stage 가 다르면 StageConfigError.
+
+    - staging 으로 배포됐는데(GPU snapshot 등록) 컨테이너가 stage 를 못 받음 → 멈춘다(production 경로로 가지 않음).
+    - 컨테이너는 staging 인데 GPU snapshot 이 등록되지 않음 → 멈춘다.
+    - production(등록 안 됨, env 없음)은 기존 경로 그대로다. 구성을 읽지 못해도 production 은 그대로 진행한다.
+    """
+    stage = container_stage()
+    wants_gpu_snapshot = stage == "staging"
+    registered = registered_gpu_snapshot()
+    if registered is None:
+        if wants_gpu_snapshot:
+            raise StageConfigError("staging 컨테이너인데 Modal 함수 구성을 읽지 못해 GPU snapshot 을 확인할 수 없습니다.")
+        return False
+    enabled, gpu_type = registered
+    if enabled != wants_gpu_snapshot:
+        raise StageConfigError(
+            f"Modal 함수 구성(gpu_snapshot={enabled}, gpu={gpu_type})과 컨테이너 stage({stage!r})가 맞지 않습니다."
+        )
+    print(f"body image worker lifecycle: stage={stage} gpu_snapshot={enabled} gpu={gpu_type}", flush=True)
+    return enabled
+
+
 @app.cls(
     image=image,
     secrets=[modal.Secret.from_name(SECRET_NAME)],
     **{**WORKER_RESOURCES, "gpu": WORKER_GPU},
     **STAGE_SCALING,
+    **STAGE_SNAPSHOT,
+    **STAGE_ENV,
 )
 class BodyImageWorker:
     @modal.enter(snap=True)
-    def prepare_cpu(self) -> None:
-        """memory snapshot 에 담긴다. CUDA·secret 을 건드리지 않는다."""
+    def prepare_snapshot(self) -> None:
+        """snapshot 에 담긴다. secret·S3 client·limiter 는 만들지 않는다.
+
+        production: import·MediaPipe(CPU)만. CUDA 를 건드리지 않는다.
+        staging(GPU snapshot): 여기에 더해 CUDA·rembg CUDA session·nvJPEG 생성과 warm-up 까지 한다.
+        """
         from app.body_image_validation import worker
 
-        self.detectors = worker.prepare_cpu()
+        started = time.time()
+        self.detectors = None
+        self.models = self.warmup_ms = None
+        self.gpu_snapshot = resolve_gpu_snapshot()
+        if self.gpu_snapshot:
+            self.models, self.warmup_ms = worker.prepare_gpu_snapshot(require_cuda=True)
+        else:
+            self.detectors = worker.prepare_cpu()
+        print(
+            f"body image worker lifecycle: snap=True done start={started:.3f} end={time.time():.3f} "
+            f"gpu_snapshot={self.gpu_snapshot} warmup_ms={_rounded(self.warmup_ms)}",
+            flush=True,
+        )
 
     @modal.enter(snap=False)
-    def start_gpu(self) -> None:
-        """snapshot 복원 뒤 매번. CUDA·rembg CUDA session·S3 client 를 만들고 warm-up 한다."""
+    def start_after_restore(self) -> None:
+        """snapshot 복원 뒤 매번. secret 확인·S3 client·service(limiter)·runtime 등록은 여기서 새로 한다.
+
+        snap=True 가 detector 만 만들었으면(production) 기존 start_gpu 로 GPU 초기화·warm-up 까지 한다.
+        staging 은 snapshot 에 담긴 모델을 그대로 쓰고 다시 만들지 않는다.
+        """
         from app.body_image_validation import worker
 
-        worker.start_gpu(*self.detectors)
+        started = time.time()
+        if (container_stage() == "staging") != self.gpu_snapshot:
+            # 복원된 컨테이너의 stage 가 snapshot 을 만들 때와 다르다. 다른 경로로 바꾸지 않고 멈춘다.
+            raise StageConfigError(f"복원 뒤 stage({container_stage()!r})가 snapshot 구성과 다릅니다.")
+        if self.detectors is not None:
+            timings = worker.start_gpu(*self.detectors)
+        else:
+            runtime = worker.start_restored_runtime(self.models, self.warmup_ms)
+            timings = self.warmup_ms if runtime is not None else None
+        print(
+            f"body image worker lifecycle: snap=False done start={started:.3f} end={time.time():.3f} "
+            f"runtime={'ready' if timings is not None else 'unavailable'} warmup_ms={_rounded(timings)}",
+            flush=True,
+        )
 
     @modal.exit()
     def close(self) -> None:

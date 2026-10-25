@@ -257,6 +257,186 @@ def test_start_gpu_with_missing_model_files_starts_without_a_runtime(worker_env,
     assert response.json()["code"] == "BODY_IMAGE_RUNTIME_UNAVAILABLE"
 
 
+# --- staging GPU snapshot: snap=True prepare_gpu_snapshot → snap=False start_restored_runtime ---
+
+
+class CountingPersonDetector(FakePersonDetector):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.closes = 0
+
+    def close(self):
+        self.closes += 1
+        self.closed = True
+
+
+@pytest.fixture
+def snapshot_env(worker_env, monkeypatch):
+    """prepare_cpu 가 fake detector 를 돌려주게 한다(무거운 import·MediaPipe 없음)."""
+    built = {}
+
+    def prepare_cpu():
+        built["person"], built["pose"] = CountingPersonDetector(), FakePoseDetector()
+        return built["person"], built["pose"]
+
+    monkeypatch.setattr(worker, "prepare_cpu", prepare_cpu)
+    return {**worker_env, "built": built}
+
+
+def test_staging_snapshot_builds_gpu_models_without_s3_runtime_or_limiter(snapshot_env, monkeypatch):
+    def must_not_build(*args, **kwargs):
+        raise AssertionError("snapshot 단계에서는 S3 client 를 만들지 않는다")
+
+    monkeypatch.setattr(runtime, "S3ImageStorage", must_not_build)
+
+    models, timings = worker.prepare_gpu_snapshot()
+
+    assert models.person_detector is snapshot_env["built"]["person"]
+    assert FakeRemover.instances == 1 and models.background_remover.calls == 1  # GPU 모델 + warm-up
+    assert set(timings) == {"preprocess", "person_pose", "rembg", "png"}
+    assert snapshot_env["manager"].runtime is None  # service·limiter·runtime 은 아직 없다
+    assert snapshot_env["s3"].puts == []
+
+
+def test_staging_restore_registers_the_snapshot_models_without_rebuilding(snapshot_env):
+    models, timings = worker.prepare_gpu_snapshot()
+
+    built = worker.start_restored_runtime(models, timings)
+
+    assert built is snapshot_env["manager"].runtime and built.models is models
+    # 복원 뒤 GPU 모델을 다시 만들지 않는다(snapshot 단계에서 만든 하나뿐).
+    assert built.service.person_detector is snapshot_env["built"]["person"]
+    assert (FakePoseDetector.instances, FakeRemover.instances) == (1, 1)
+    # limiter 는 복원 뒤에 새로 만들어진 것이고 비어 있다.
+    assert (built.service.limiter.running, built.service.limiter.waiting) == (0, 0)
+    client = TestClient(worker.create_app(), raise_server_exceptions=False)
+    assert client.get("/health").json() == {"status": "ok"}
+    response = post(client, jpeg())
+    assert response.status_code == 200
+    assert response.json()["code"] == "BODY_IMAGE_UPLOAD_SUCCESS"
+    assert len(snapshot_env["s3"].puts) == 1
+
+
+def test_staging_restore_checks_secret_settings(snapshot_env, monkeypatch):
+    models, timings = worker.prepare_gpu_snapshot()
+    monkeypatch.setattr(settings, "AUTH_DISABLED", True)
+
+    with pytest.raises(worker.WorkerConfigError):
+        worker.start_restored_runtime(models, timings)
+    assert snapshot_env["manager"].runtime is None
+
+
+def test_staging_restore_without_a_bucket_closes_the_snapshot_models(snapshot_env, monkeypatch):
+    models, timings = worker.prepare_gpu_snapshot()
+    monkeypatch.setattr(settings, "S3_BUCKET", "")
+
+    assert worker.start_restored_runtime(models, timings) is None
+    assert snapshot_env["built"]["person"].closes == 1
+    client = TestClient(worker.create_app(), raise_server_exceptions=False)
+    assert post(client, jpeg()).json()["code"] == "S3_CONFIG_ERROR"
+
+
+def test_staging_snapshot_with_missing_model_files_closes_detectors(snapshot_env, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "REMBG_MODEL", tmp_path / "missing.onnx")
+
+    assert worker.prepare_gpu_snapshot() == (None, None)
+    assert snapshot_env["built"]["person"].closes == 1 and snapshot_env["built"]["pose"].closed
+    assert FakeRemover.instances == 0
+
+    assert worker.start_restored_runtime(None, None) is None
+    client = TestClient(worker.create_app(), raise_server_exceptions=False)
+    assert post(client, jpeg()).json()["code"] == "BODY_IMAGE_RUNTIME_UNAVAILABLE"
+
+
+def test_gpu_snapshot_without_an_active_cuda_provider_fails_and_closes_models(snapshot_env, monkeypatch):
+    # GPU snapshot 단계에서 CUDA 가 붙지 않으면(CPU session) 그 상태로 snapshot 을 만들지 않고 멈춘다.
+    monkeypatch.setattr(config, "REMBG_PROVIDERS", ("CUDAExecutionProvider", "CPUExecutionProvider"))
+    monkeypatch.setattr(worker, "_preload_cuda_libraries", lambda: None)
+    monkeypatch.setattr(FakeRemover, "providers", property(lambda self: ["CPUExecutionProvider"]))
+
+    with pytest.raises(worker.WorkerConfigError, match="rembg CUDA provider"):
+        worker.prepare_gpu_snapshot(require_cuda=True)
+    assert snapshot_env["built"]["person"].closes == 1
+
+
+def test_gpu_snapshot_without_nvjpeg_fails_when_gpu_preprocessing_is_on(snapshot_env, monkeypatch):
+    monkeypatch.setattr(config, "GPU_PREPROCESSING", True)
+    monkeypatch.setattr(inference, "build_gpu_preprocessor", lambda: None)  # torch CUDA 없음
+
+    with pytest.raises(worker.WorkerConfigError, match="nvJPEG"):
+        worker.prepare_gpu_snapshot(require_cuda=True)
+    assert snapshot_env["built"]["person"].closes == 1
+
+
+def test_gpu_snapshot_with_active_cuda_passes_the_check(snapshot_env, monkeypatch):
+    monkeypatch.setattr(config, "REMBG_PROVIDERS", ("CUDAExecutionProvider", "CPUExecutionProvider"))
+    monkeypatch.setattr(worker, "_preload_cuda_libraries", lambda: None)
+
+    models, _ = worker.prepare_gpu_snapshot(require_cuda=True)
+
+    assert models is not None and "CUDAExecutionProvider" in models.background_remover.providers
+    assert snapshot_env["built"]["person"].closes == 0
+
+
+def test_staging_snapshot_in_remote_mode_refuses_before_building_anything(snapshot_env, monkeypatch):
+    monkeypatch.setattr(config, "VALIDATION_MODE", "remote")
+
+    with pytest.raises(worker.WorkerConfigError):
+        worker.prepare_gpu_snapshot()
+    assert snapshot_env["built"] == {}
+
+
+def test_exit_after_a_staging_restore_closes_each_detector_once(snapshot_env):
+    models, timings = worker.prepare_gpu_snapshot()
+    worker.start_restored_runtime(models, timings)
+
+    worker.close()
+    worker.close()  # @modal.exit 가 두 번 불리거나 runtime 이 이미 닫혀도 다시 닫지 않는다
+    models.close()
+
+    assert snapshot_env["built"]["person"].closes == 1
+
+
+def test_staging_snapshot_phase_does_not_import_settings_or_s3():
+    # 새 프로세스에서 snapshot 단계(prepare_gpu_snapshot)를 fake 모델로 실제로 돌린 뒤, secret 을 읽는
+    # settings·S3 client 모듈·runtime(service·limiter) 이 import 되지 않았는지 본다.
+    code = (
+        "import sys, json, tempfile\n"
+        "from pathlib import Path\n"
+        "from app.body_image_validation import inference, worker\n"
+        "from app.config import body_image_validation as config\n"
+        "d = Path(tempfile.mkdtemp())\n"
+        "for n in ('PERSON_DETECTOR_MODEL', 'POSE_LANDMARKER_MODEL', 'REMBG_MODEL'):\n"
+        "    (d / n).touch(); setattr(config, n, d / n)\n"
+        "config.GPU_PREPROCESSING = False\n"
+        "config.REMBG_PROVIDERS = ()\n"
+        "class F:\n"
+        "    providers = ['CPUExecutionProvider']\n"
+        "    def __init__(self, *a, **k): pass\n"
+        "    def detect(self, image): return []\n"
+        "    def remove(self, image): return image.convert('RGBA')\n"
+        "    def close(self): pass\n"
+        "worker.prepare_cpu = lambda: (F(), F())\n"
+        "inference.RembgBackgroundRemover = F\n"
+        "models, timings = worker.prepare_gpu_snapshot()\n"
+        "print(json.dumps({'models': models is not None,"
+        " 'settings': 'app.config.settings' in sys.modules,"
+        " 's3': 'app.clients.s3' in sys.modules,"
+        " 'runtime': 'app.body_image_validation.runtime' in sys.modules,"
+        " 'limiter': 'app.body_image_validation.concurrency' in sys.modules}))\n"
+    )
+    env = {**os.environ, "PYTHONPATH": str(ROOT), "BODY_IMAGE_VALIDATION_MODE": "local"}
+    result = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=False,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {
+        "models": True, "settings": False, "s3": False, "runtime": False, "limiter": False,
+    }
+
+
 def test_warm_up_runs_every_stage_without_uploading_to_s3(worker_env):
     person, pose = FakePersonDetector(), FakePoseDetector()
 

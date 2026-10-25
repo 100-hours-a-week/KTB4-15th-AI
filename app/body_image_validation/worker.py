@@ -12,7 +12,10 @@ EC2 AI Server(app.main)와 같은 router·service·runtime 을 그대로 쓰고,
 3. start_runtime(models)       — 실행 모드·INTERNAL_API_KEY 확인, S3 bucket 확인·S3 client, service 와
                                  limiter(Condition) 생성, runtime 등록.
 
-현재 Modal worker 는 1 을 snap=True 에서, 2·3 을 start_gpu() 로 snap=False 에서 부른다(GPU snapshot 미사용).
+Modal worker 의 호출 위치(deploy/modal/body_image_worker.py):
+- production(CPU memory snapshot): snap=True 에서 1, snap=False 에서 2·3 을 start_gpu() 로.
+- staging(GPU snapshot):           snap=True 에서 1·2 를 prepare_gpu_snapshot() 으로,
+                                   snap=False 에서 3 을 start_restored_runtime() 으로.
 create_app() 은 전신 이미지 검증 endpoint 와 /health 만 있는 FastAPI 앱이다.
 """
 
@@ -135,6 +138,46 @@ def start_runtime(models):
     return _register_runtime(models)
 
 
+def prepare_gpu_snapshot(require_cuda: bool = False):
+    """GPU snapshot(staging) 의 snap=True 단계. prepare_cpu → prepare_gpu_for_snapshot.
+
+    (BodyImageModels, warm-up 시간 ms) 를 돌려준다. secret·S3 는 읽지 않는다. 실행 모드는 config 값이라
+    여기서 먼저 확인해 GPU 작업 전에 멈춘다. 모델 파일 누락 등 BodyImageRuntimeError 면 (None, None) 이고
+    detector 는 이미 정리돼 있다(요청은 기존처럼 500 BODY_IMAGE_RUNTIME_UNAVAILABLE).
+
+    require_cuda 면 설정이 요구한 GPU(rembg CUDA provider·nvJPEG 전처리)를 이 단계에서 실제로 쓰지 못할 때
+    모델을 닫고 WorkerConfigError 를 낸다. CPU 상태로 GPU snapshot 을 만든 채 정상 시작하지 않게 하기 위해서다.
+    """
+    from app.body_image_validation.inference import BodyImageRuntimeError
+
+    check_validation_mode()
+    person_detector, pose_detector = prepare_cpu()
+    try:
+        models, timings = prepare_gpu_for_snapshot(person_detector, pose_detector)
+    except BodyImageRuntimeError as error:
+        _log_no_runtime(error)
+        return None, None
+    if require_cuda:
+        missing = _inactive_gpu(models)
+        if missing:
+            models.close()
+            raise WorkerConfigError(f"GPU snapshot 단계에서 GPU 를 쓸 수 없습니다: {', '.join(missing)}")
+    return models, timings
+
+
+def start_restored_runtime(models, warmup_ms: dict[str, float] | None = None):
+    """GPU snapshot(staging) 의 snap=False 단계. snapshot 에 담긴 모델로 start_runtime 만 한다(모델을 다시
+    만들지 않는다). models 가 None(snapshot 단계 실패)이면 설정만 확인하고 runtime 없이 시작한다."""
+    if models is None:
+        check_worker_settings()
+        logger.error("body image worker started without a runtime")
+        return None
+    runtime = start_runtime(models)
+    if runtime is not None:
+        _log_ready(models, warmup_ms or {})
+    return runtime
+
+
 def start_gpu(person_detector, pose_detector) -> dict[str, float] | None:
     """현재 production 순서(snap=False): prepare_gpu_for_snapshot → start_runtime 을 이어서 한다.
 
@@ -202,6 +245,17 @@ def _register_runtime(models):
         # 다른 모델로 runtime 이 이미 있었다. 넘긴 모델은 쓰이지 않으므로 닫는다.
         models.close()
     return runtime
+
+
+def _inactive_gpu(models) -> list[str]:
+    """설정이 요구했지만 실제로 붙지 않은 GPU 경로."""
+    missing = []
+    providers = models.background_remover.providers
+    if _CUDA_PROVIDER in config.REMBG_PROVIDERS and _CUDA_PROVIDER not in providers:
+        missing.append(f"rembg CUDA provider (active: {providers})")
+    if config.GPU_PREPROCESSING and models.gpu_preprocessor is None:
+        missing.append("GPU preprocessing (nvJPEG)")
+    return missing
 
 
 def _warn_inactive_gpu(models) -> None:
