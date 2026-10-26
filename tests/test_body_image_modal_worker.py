@@ -16,35 +16,38 @@ if not WORKER_FILE.is_file():
     pytest.skip("deploy/ 가 없는 환경(Docker test stage)", allow_module_level=True)
 
 
-_NAME_VARS = (
-    "BODY_IMAGE_WORKER_STAGE",
-    "BODY_IMAGE_WORKER_APP_NAME",
-    "BODY_IMAGE_WORKER_LABEL",
-    "BODY_IMAGE_WORKER_SECRET_NAME",
-    "BODY_IMAGE_WORKER_DIAGNOSTICS",
-    "BODY_IMAGE_WORKER_IMAGE_STAGE",
-)
+PREFIX = "BODY_IMAGE_WORKER_"
+
+
+def _with_env(env, action):
+    """셸의 BODY_IMAGE_WORKER_* 를 모두 치우고 env 만 둔 채 action 을 실행한다."""
+    saved = {name: os.environ.pop(name) for name in list(os.environ) if name.startswith(PREFIX)}
+    os.environ.update(env)
+    try:
+        return action()
+    finally:
+        for name in [name for name in os.environ if name.startswith(PREFIX)]:
+            del os.environ[name]
+        os.environ.update(saved)
 
 
 def load(**env):
-    """환경변수를 지정한 채 배포 파일을 새로 불러온다. Modal 에 아무것도 보내지 않는다."""
-    saved = {name: os.environ.pop(name, None) for name in _NAME_VARS}
-    os.environ.update(env)
-    try:
+    """배포 시점처럼(저장소 경로에서) 환경변수를 지정한 채 배포 파일을 새로 불러온다. Modal 에 아무것도 보내지 않는다."""
+    def action():
         spec = importlib.util.spec_from_file_location("body_image_worker", WORKER_FILE)
         loaded = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(loaded)
         return loaded
-    finally:
-        for name in _NAME_VARS:
-            os.environ.pop(name, None)
-            if saved[name] is not None:
-                os.environ[name] = saved[name]
+    return _with_env(env, action)
+
+
+def load_production(**env):
+    return load(BODY_IMAGE_WORKER_STAGE="production", **env)
 
 
 @pytest.fixture(scope="module")
 def module():
-    return load()
+    return load_production()
 
 
 def test_resources_match_the_t4_benchmark(module):
@@ -156,12 +159,17 @@ def test_production_initializes_only_cpu_in_the_snapshot_and_gpu_after_restore(m
     assert calls[2:] == [("close", ())]
 
 
-STAGE_VARS = ("BODY_IMAGE_WORKER_STAGE", "BODY_IMAGE_WORKER_IMAGE_STAGE")
+STAGE_VARS = (
+    "BODY_IMAGE_WORKER_STAGE",  # 함수 env
+    "BODY_IMAGE_WORKER_IMAGE_STAGE",  # 이미지 env
+    "BODY_IMAGE_WORKER_GPU_SNAPSHOT",  # 함수 env
+    "BODY_IMAGE_WORKER_IMAGE_GPU_SNAPSHOT",  # 이미지 env
+)
 
 
-def set_container_stages(monkeypatch, function_stage, image_stage):
-    """컨테이너가 받는 두 값: 함수 env(@app.cls(env=...))와 이미지 env(Image.env). None 이면 없음."""
-    for name, value in zip(STAGE_VARS, (function_stage, image_stage), strict=True):
+def set_container_stages(monkeypatch, function_stage, image_stage, function_gpu=None, image_gpu=None):
+    """컨테이너가 받는 네 값: 함수 env(@app.cls(env=...))·이미지 env(Image.env)의 stage 와 GPU snapshot. None 이면 없음."""
+    for name, value in zip(STAGE_VARS, (function_stage, image_stage, function_gpu, image_gpu), strict=True):
         if value is None:
             monkeypatch.delenv(name, raising=False)
         else:
@@ -169,7 +177,12 @@ def set_container_stages(monkeypatch, function_stage, image_stage):
 
 
 def as_staging_container(monkeypatch, loaded):
-    set_container_stages(monkeypatch, "staging", "staging")
+    set_container_stages(monkeypatch, "staging", "staging", "true", "true")
+    return loaded
+
+
+def as_production_gpu_container(monkeypatch, loaded):
+    set_container_stages(monkeypatch, "production", "production", "true", "true")
     return loaded
 
 
@@ -213,34 +226,46 @@ def test_staging_restore_without_models_fails_fast(fake_worker, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("function_stage", "image_stage", "expected"),
+    ("function_stage", "image_stage", "function_gpu", "image_gpu", "expected"),
     [
-        ("staging", "staging", True),  # staging 배포: 함수 env·이미지 env 모두 staging
-        (None, None, False),  # production 배포: 둘 다 없음(기존 그대로)
-        ("production", None, False),
-        ("production", "production", False),
+        ("staging", "staging", "true", "true", True),  # staging 배포
+        (None, None, None, None, False),  # production 기본(CPU snapshot): 네 값 모두 없음(기존 그대로)
+        ("production", None, None, None, False),
+        ("production", "production", None, None, False),
+        ("production", "production", "true", "true", True),  # production GPU snapshot(명시적 활성화)
     ],
+    ids=["staging", "production-cpu-default", "production-cpu-function-stage", "production-cpu-both-stages",
+         "production-gpu"],
 )
-def test_matching_stages_pick_the_lifecycle(module, monkeypatch, function_stage, image_stage, expected):
-    set_container_stages(monkeypatch, function_stage, image_stage)
+def test_matching_stages_pick_the_lifecycle(
+    module, monkeypatch, function_stage, image_stage, function_gpu, image_gpu, expected
+):
+    set_container_stages(monkeypatch, function_stage, image_stage, function_gpu, image_gpu)
 
     assert module.resolve_gpu_snapshot() is expected
 
 
 @pytest.mark.parametrize(
-    ("function_stage", "image_stage"),
+    ("function_stage", "image_stage", "function_gpu", "image_gpu"),
     [
-        (None, "staging"),  # staging 이미지인데 함수 env 가 전달되지 않음
-        ("production", "staging"),
-        ("staging", None),  # 함수 env 는 staging 인데 이미지가 staging 이 아님
-        ("staging", "production"),
-        ("stagin", "stagin"),  # 알 수 없는 값
+        (None, "staging", None, "true"),  # staging 이미지인데 함수 env 가 전달되지 않음
+        ("production", "staging", "true", "true"),
+        ("staging", None, "true", None),  # 함수 env 는 staging 인데 이미지가 staging 이 아님
+        ("staging", "production", "true", "true"),
+        ("stagin", "stagin", "true", "true"),  # 알 수 없는 값
+        ("staging", "staging", None, None),  # staging 인데 GPU snapshot 설정이 없음
+        # production GPU snapshot: 한쪽 경로의 GPU snapshot 값이 빠짐 → CPU 경로로 조용히 가지 않는다
+        ("production", "production", None, "true"),
+        ("production", "production", "true", None),
+        (None, None, "true", None),
     ],
     ids=["function-env-missing", "function-env-production", "image-env-missing", "image-env-production",
-         "unknown-stage"],
+         "unknown-stage", "staging-without-gpu-flags", "production-gpu-function-flag-missing",
+         "production-gpu-image-flag-missing", "production-gpu-only-function-flag"],
 )
-def test_mismatched_or_unknown_stages_fail_fast(module, monkeypatch, function_stage, image_stage):
-    set_container_stages(monkeypatch, function_stage, image_stage)
+def test_mismatched_or_unknown_stages_fail_fast(module, monkeypatch, function_stage, image_stage, function_gpu,
+                                                image_gpu):
+    set_container_stages(monkeypatch, function_stage, image_stage, function_gpu, image_gpu)
 
     with pytest.raises(module.StageConfigError):
         module.resolve_gpu_snapshot()
@@ -278,12 +303,12 @@ def test_staging_bakes_its_stage_into_the_image_and_production_does_not(monkeypa
         return original(self, vars)
 
     monkeypatch.setattr(modal.Image, "env", spy)
-    load()
+    load_production()
     production_envs = list(baked)
     baked.clear()
     load(BODY_IMAGE_WORKER_STAGE="staging")
 
-    assert {"BODY_IMAGE_WORKER_IMAGE_STAGE": "staging"} in baked
+    assert {"BODY_IMAGE_WORKER_IMAGE_STAGE": "staging", "BODY_IMAGE_WORKER_IMAGE_GPU_SNAPSHOT": "true"} in baked
     assert all("BODY_IMAGE_WORKER_IMAGE_STAGE" not in env for env in production_envs)  # production 이미지는 그대로
 
 
@@ -352,39 +377,89 @@ def test_staging_caps_containers_and_uses_staging_names():
     assert staging.SECRET_NAME == "lookddak-body-image-worker-staging"
     assert web_endpoint(staging).requested_suffix == "lookddak-body-image-staging"
     assert web_endpoint(staging).requires_proxy_auth is True
-    assert staging.WORKER_RESOURCES == load().WORKER_RESOURCES  # 나머지 자원은 production 과 같다
+    assert staging.WORKER_RESOURCES == load_production().WORKER_RESOURCES  # 나머지 자원은 production 과 같다
 
 
-def test_name_variables_override_the_defaults():
-    custom = load(
-        BODY_IMAGE_WORKER_STAGE="staging",
-        BODY_IMAGE_WORKER_APP_NAME="app-x",
-        BODY_IMAGE_WORKER_LABEL="label-x",
-        BODY_IMAGE_WORKER_SECRET_NAME="secret-x",
-    )
-
-    assert (custom.app.name, custom.SECRET_NAME) == ("app-x", "secret-x")
-    assert web_endpoint(custom).requested_suffix == "label-x"
+@pytest.mark.parametrize("name", ["APP_NAME", "LABEL", "SECRET_NAME", "PROXY_AUTH"])
+@pytest.mark.parametrize("stage", ["staging", "production"])
+@pytest.mark.parametrize("value", ["lookddak-body-image-worker", "lookddak-body-image-worker-staging", "false", ""])
+def test_name_and_proxy_overrides_are_rejected_before_deploy(name, stage, value):
+    # 이름은 stage 로만 정해진다. 상대 stage 이름·임의 값·빈 값·proxy 인증 끄기 모두 배포 전에 거절한다.
+    with pytest.raises(ValueError, match="지원하지 않는 배포 환경변수"):
+        load(BODY_IMAGE_WORKER_STAGE=stage, **{PREFIX + name: value})
 
 
-def test_empty_name_variables_fall_back_to_the_defaults():
-    loaded = load(BODY_IMAGE_WORKER_APP_NAME="", BODY_IMAGE_WORKER_LABEL="", BODY_IMAGE_WORKER_SECRET_NAME="")
+@pytest.mark.parametrize("name", ["BODY_IMAGE_WORKER_GPU_SNAPHOT", "BODY_IMAGE_WORKER_IMAGE_STAGE",
+                                  "BODY_IMAGE_WORKER_IMAGE_GPU_SNAPSHOT"])
+def test_typos_and_container_only_variables_are_rejected_before_deploy(name):
+    with pytest.raises(ValueError, match="지원하지 않는 배포 환경변수"):
+        load(BODY_IMAGE_WORKER_STAGE="staging", **{name: "true"})
 
-    assert (loaded.app.name, loaded.SECRET_NAME) == ("lookddak-body-image-worker", "lookddak-body-image-worker")
+
+@pytest.mark.parametrize("env", [{}, {"BODY_IMAGE_WORKER_STAGE": ""}, {"BODY_IMAGE_WORKER_STAGE": "  "}],
+                         ids=["missing", "empty", "blank"])
+def test_deploy_without_a_stage_stops_instead_of_choosing_production(env):
+    with pytest.raises(ValueError, match="BODY_IMAGE_WORKER_STAGE"):
+        load(**env)
+
+
+@pytest.mark.parametrize("stage", ["stagin", "prod", "dev"])
+def test_unknown_stages_stop_before_deploy(stage):
+    with pytest.raises(ValueError, match="production 또는 staging"):
+        load(BODY_IMAGE_WORKER_STAGE=stage)
+
+
+def test_modal_profile_does_not_choose_the_stage(monkeypatch):
+    # MODAL_PROFILE 은 Workspace 만 고른다. 팀 profile 이어도 stage 를 대신하지 않는다.
+    monkeypatch.setenv("MODAL_PROFILE", "lookddak")
+    with pytest.raises(ValueError, match="BODY_IMAGE_WORKER_STAGE"):
+        load()
+    assert load(BODY_IMAGE_WORKER_STAGE="staging").APP_NAME == "lookddak-body-image-worker-staging"
+
+
+def test_staging_and_production_share_no_names(module):
+    production, staging = module.DEPLOY_TARGETS["production"], module.DEPLOY_TARGETS["staging"]
+    assert set(production.values()).isdisjoint(staging.values())
+    for stage, target in module.DEPLOY_TARGETS.items():
+        loaded = module if stage == "production" else load(BODY_IMAGE_WORKER_STAGE=stage)
+        assert (loaded.APP_NAME, loaded.ENDPOINT_LABEL, loaded.SECRET_NAME) == (
+            target["app_name"], target["label"], target["secret_name"])
 
 
 @pytest.mark.parametrize(
-    "env",
-    [
-        {"BODY_IMAGE_WORKER_STAGE": "staging", "BODY_IMAGE_WORKER_APP_NAME": "lookddak-body-image-worker"},
-        {"BODY_IMAGE_WORKER_STAGE": "staging", "BODY_IMAGE_WORKER_LABEL": "lookddak-body-image"},
-        {"BODY_IMAGE_WORKER_STAGE": "stagin"},
-    ],
-    ids=["staging-with-production-app", "staging-with-production-label", "unknown-stage"],
+    ("stage", "flag", "expected"),
+    [("staging", None, True), ("staging", "true", True), ("production", None, False), ("production", "false", False),
+     ("production", "true", True)],
 )
-def test_unsafe_or_unknown_stage_settings_stop_before_deploy(env):
-    with pytest.raises(ValueError):
-        load(**env)
+def test_snapshot_mode_table(module, stage, flag, expected):
+    env = {"BODY_IMAGE_WORKER_STAGE": stage, "BODY_IMAGE_WORKER_MAX_CONTAINERS": "2" if stage == "production" else ""}
+    if flag is not None:
+        env["BODY_IMAGE_WORKER_GPU_SNAPSHOT"] = flag
+    config = module.resolve_deploy_config(env, in_container=False)
+
+    assert config.gpu_snapshot is expected
+    assert config.max_containers == (1 if stage == "staging" else 2)
+
+
+def test_deploy_config_is_resolved_once_and_exposed(module):
+    assert module.CONFIG == module.resolve_deploy_config({"BODY_IMAGE_WORKER_STAGE": "production"}, in_container=False)
+    assert (module.STAGE, module.APP_NAME, module.SECRET_NAME, module.GPU_SNAPSHOT, module.MAX_CONTAINERS) == (
+        module.CONFIG.stage, module.CONFIG.app_name, module.CONFIG.secret_name, module.CONFIG.gpu_snapshot,
+        module.CONFIG.max_containers)
+
+
+def test_invalid_diagnostics_value_stops_before_deploy():
+    with pytest.raises(ValueError, match="true 또는 false"):
+        load(BODY_IMAGE_WORKER_STAGE="staging", BODY_IMAGE_WORKER_DIAGNOSTICS="yes")
+
+
+def test_container_config_does_not_require_deploy_only_settings(module):
+    # 컨테이너: stage 가 없으면(CPU snapshot production 은 함수 env 를 등록하지 않는다) production. 상한·진단은 보지 않는다.
+    assert module.resolve_deploy_config({}, in_container=True).stage == "production"
+    config = module.resolve_deploy_config(
+        {"BODY_IMAGE_WORKER_STAGE": "production", "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "true",
+         "BODY_IMAGE_WORKER_IMAGE_STAGE": "production"}, in_container=True)
+    assert config.gpu_snapshot is True and config.max_containers is None
 
 
 def load_as_in_container(**env):
@@ -394,15 +469,7 @@ def load_as_in_container(**env):
     """
     namespace = {"__name__": "body_image_worker", "__file__": "/root/body_image_worker.py"}
     code = compile(WORKER_FILE.read_text(), "/root/body_image_worker.py", "exec")
-    saved = {name: os.environ.pop(name, None) for name in _NAME_VARS}
-    os.environ.update(env)
-    try:
-        exec(code, namespace)  # noqa: S102 - 배포 파일 자체를 컨테이너 경로로 실행한다
-    finally:
-        for name in _NAME_VARS:
-            os.environ.pop(name, None)
-            if saved[name] is not None:
-                os.environ[name] = saved[name]
+    _with_env(env, lambda: exec(code, namespace))  # noqa: S102 - 배포 파일 자체를 컨테이너 경로로 실행한다
     return namespace
 
 
@@ -422,7 +489,8 @@ def test_import_from_the_container_path_does_not_depend_on_the_local_layout():
 def test_staging_container_picks_the_gpu_snapshot_lifecycle_from_its_env(monkeypatch):
     # staging 배포는 env={"BODY_IMAGE_WORKER_STAGE": "staging"} 을 넘기므로 컨테이너도 같은 lifecycle 을 고른다.
     staging = load(BODY_IMAGE_WORKER_STAGE="staging")
-    loaded = load_as_in_container(**staging.STAGE_ENV["env"], BODY_IMAGE_WORKER_IMAGE_STAGE="staging")
+    loaded = load_as_in_container(**staging.STAGE_ENV["env"], BODY_IMAGE_WORKER_IMAGE_STAGE="staging",
+                                  BODY_IMAGE_WORKER_IMAGE_GPU_SNAPSHOT="true")
 
     assert loaded["GPU_SNAPSHOT"] is True
 
@@ -447,7 +515,7 @@ def registered_options(monkeypatch, **env):
         return original(*args, **kwargs)
 
     monkeypatch.setattr(functions._Function, "_from_local", staticmethod(spy))
-    load(**env)
+    load(**{"BODY_IMAGE_WORKER_STAGE": "production", **env})  # STAGE 를 주지 않으면 production 으로 불러온다
     return seen
 
 
@@ -474,7 +542,7 @@ def test_production_keeps_gpu_snapshot_off(monkeypatch):
     options = registered_options(monkeypatch)
 
     assert not options["experimental_options"]  # CPU memory snapshot 만
-    production = load()
+    production = load_production()
     assert production.GPU_SNAPSHOT is False
     assert production.STAGE_SNAPSHOT == {} and production.STAGE_ENV == {}
 
@@ -490,7 +558,7 @@ def test_staging_enables_gpu_snapshot_and_passes_its_stage_to_the_container(monk
     # App.cls(env=...) 는 env 를 Secret 하나로 바꿔 넘긴다. production 보다 하나 많다.
     assert len(options["secrets"]) == production_secrets + 1
     assert load(BODY_IMAGE_WORKER_STAGE="staging").STAGE_ENV == {
-        "env": {"BODY_IMAGE_WORKER_STAGE": "staging"}
+        "env": {"BODY_IMAGE_WORKER_STAGE": "staging", "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "true"}
     }
 
 
@@ -498,7 +566,9 @@ def test_staging_enables_gpu_snapshot_and_passes_its_stage_to_the_container(monk
 
 
 def test_diagnostics_are_off_unless_requested():
-    assert load(BODY_IMAGE_WORKER_STAGE="staging").STAGE_ENV == {"env": {"BODY_IMAGE_WORKER_STAGE": "staging"}}
+    assert load(BODY_IMAGE_WORKER_STAGE="staging").STAGE_ENV == {
+        "env": {"BODY_IMAGE_WORKER_STAGE": "staging", "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "true"}
+    }
 
 
 def test_staging_diagnostics_pass_profiling_settings_to_the_container():
@@ -506,11 +576,137 @@ def test_staging_diagnostics_pass_profiling_settings_to_the_container():
 
     assert staging.STAGE_ENV == {"env": {
         "BODY_IMAGE_WORKER_STAGE": "staging",
+        "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "true",
         "BODY_IMAGE_DIAGNOSTICS": "true",
         "BODY_IMAGE_REMBG_PROFILE_RUNS": "2",  # snapshot 전 warm-up 1번 + 복원 뒤 첫 요청 1번
     }}
 
 
 def test_production_refuses_diagnostics():
-    with pytest.raises(ValueError):
-        load(BODY_IMAGE_WORKER_DIAGNOSTICS="true")
+    with pytest.raises(ValueError, match="staging 배포에서만"):
+        load_production(BODY_IMAGE_WORKER_DIAGNOSTICS="true")
+
+
+# --- production GPU snapshot (배포 시점에 BODY_IMAGE_WORKER_GPU_SNAPSHOT=true 를 명시했을 때만) ---
+
+# 테스트용 상한(2). 운영값은 production AI Server task 수 기준으로 정한다.
+PRODUCTION_GPU = {"BODY_IMAGE_WORKER_STAGE": "production", "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "true",
+                  "BODY_IMAGE_WORKER_MAX_CONTAINERS": "2"}
+
+
+def test_production_gpu_snapshot_is_off_unless_explicitly_enabled():
+    for flag in (None, "", "false"):
+        env = {} if flag is None else {"BODY_IMAGE_WORKER_GPU_SNAPSHOT": flag}
+        production = load_production(**env)
+        assert production.GPU_SNAPSHOT is False
+        assert production.STAGE_SNAPSHOT == {} and production.STAGE_ENV == {}
+
+
+def test_production_gpu_snapshot_registers_the_staging_style_configuration(monkeypatch):
+    import modal
+
+    baked = []
+    original = modal.Image.env
+    monkeypatch.setattr(modal.Image, "env", lambda self, vars: baked.append(dict(vars)) or original(self, vars))
+    options = registered_options(monkeypatch, **PRODUCTION_GPU)
+    production = load(**PRODUCTION_GPU)
+
+    assert options["experimental_options"] == {"enable_gpu_snapshot": "True"}
+    assert options["gpu"] == "T4" and (options["cpu"], options["memory"]) == (4, 8192)
+    assert options["max_containers"] == 2 and options["min_containers"] == 0  # 배포 때 준 상한
+    assert production.APP_NAME == "lookddak-body-image-worker"
+    assert production.SECRET_NAME == "lookddak-body-image-worker"
+    assert production.STAGE_ENV == {"env": {"BODY_IMAGE_WORKER_STAGE": "production",
+                                             "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "true"}}
+    assert {"BODY_IMAGE_WORKER_IMAGE_STAGE": "production", "BODY_IMAGE_WORKER_IMAGE_GPU_SNAPSHOT": "true"} in baked
+
+
+def test_production_gpu_snapshot_uses_the_staging_lifecycle(fake_worker, monkeypatch):
+    calls = fake_worker["calls"]
+    production = as_production_gpu_container(monkeypatch, load(**PRODUCTION_GPU))
+    _, pre, post, exit_hooks = lifecycle(production)
+
+    run(pre)
+    assert calls == [("prepare_gpu_snapshot", (), {"require_cuda": True})]  # CUDA·rembg·nvJPEG·warm-up 까지
+    run(post)
+    # 복원 뒤에는 secret·S3·limiter 로 runtime 만 만든다(GPU 모델을 다시 만들지 않는다).
+    assert calls[1:] == [("start_restored_runtime", (fake_worker["models"], fake_worker["warmup"]))]
+    run(exit_hooks)
+    assert calls[2:] == [("close", ())]
+
+
+def test_production_gpu_snapshot_model_failure_fails_fast(fake_worker, monkeypatch):
+    from app.body_image_validation import worker
+
+    monkeypatch.setattr(worker, "prepare_gpu_snapshot", lambda require_cuda: (None, None))
+    production = as_production_gpu_container(monkeypatch, load(**PRODUCTION_GPU))
+    _, pre, _, _ = lifecycle(production)
+
+    with pytest.raises(production.SnapshotStateError):
+        run(pre)
+
+
+def test_production_gpu_deploy_whose_container_lost_the_flag_fails_fast(fake_worker, monkeypatch):
+    # GPU snapshot 으로 배포했는데 함수 env 가 빠지면 CPU 경로(prepare_cpu)로 가지 않고 멈춘다.
+    production = load(**PRODUCTION_GPU)
+    set_container_stages(monkeypatch, None, "production", None, "true")
+    _, pre, _, _ = lifecycle(production)
+
+    with pytest.raises(production.StageConfigError):
+        run(pre)
+    assert fake_worker["calls"] == []
+
+
+def test_production_cpu_default_keeps_the_existing_lifecycle(module, fake_worker, monkeypatch):
+    set_container_stages(monkeypatch, None, None, None, None)
+    calls = fake_worker["calls"]
+    _, pre, post, _ = lifecycle(module)
+
+    run(pre)
+    run(post)
+    assert calls == [("prepare_cpu", ()), ("start_gpu", fake_worker["detectors"])]
+
+
+@pytest.mark.parametrize(("env", "message"), [
+    ({"BODY_IMAGE_WORKER_STAGE": "production", "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "yes"}, "true 또는 false"),
+    ({"BODY_IMAGE_WORKER_STAGE": "staging", "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "false"}, "끌 수 없습니다"),
+], ids=["invalid-flag", "staging-off"])
+def test_invalid_gpu_snapshot_flags_stop_before_deploy(env, message):
+    with pytest.raises(ValueError, match=message):
+        load(**env)
+
+
+# --- max_containers 안전장치 ---
+
+
+def test_production_gpu_snapshot_without_a_container_cap_stops_before_deploy():
+    with pytest.raises(ValueError, match="BODY_IMAGE_WORKER_MAX_CONTAINERS 가 필요"):
+        load_production(BODY_IMAGE_WORKER_GPU_SNAPSHOT="true")
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "abc", "1.5", "21"])
+def test_invalid_container_caps_stop_before_deploy(value):
+    with pytest.raises(ValueError, match="1~20 정수"):
+        load_production(BODY_IMAGE_WORKER_GPU_SNAPSHOT="true", BODY_IMAGE_WORKER_MAX_CONTAINERS=value)
+
+
+def test_production_cpu_keeps_no_cap_by_default_and_accepts_an_explicit_one():
+    assert load_production().STAGE_SCALING == {}  # 기존 그대로(상한 없음)
+    assert load_production(BODY_IMAGE_WORKER_MAX_CONTAINERS="3").STAGE_SCALING == {"max_containers": 3}
+
+
+def test_staging_cap_is_fixed_to_one():
+    assert load(BODY_IMAGE_WORKER_STAGE="staging").STAGE_SCALING == {"max_containers": 1}
+    assert load(BODY_IMAGE_WORKER_STAGE="staging", BODY_IMAGE_WORKER_MAX_CONTAINERS="1").STAGE_SCALING == {
+        "max_containers": 1
+    }
+    with pytest.raises(ValueError, match="1 로 고정"):
+        load(BODY_IMAGE_WORKER_STAGE="staging", BODY_IMAGE_WORKER_MAX_CONTAINERS="2")
+
+
+def test_production_gpu_container_import_does_not_require_the_cap():
+    # 컨테이너에는 로컬 배포 환경변수(MAX_CONTAINERS)가 없다. 함수 env 만으로 import 가 되어야 한다(상한은 이미 등록됨).
+    production = load(**PRODUCTION_GPU)
+    loaded = load_as_in_container(**production.STAGE_ENV["env"])
+
+    assert loaded["GPU_SNAPSHOT"] is True and loaded["LOCAL_PROJECT_ROOT"] is None

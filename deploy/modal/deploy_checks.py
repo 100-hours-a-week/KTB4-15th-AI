@@ -1,38 +1,10 @@
-"""BodyImageWorker 배포 전 검사(preflight)·검사 후 배포(deploy)·배포 후 smoke test(smoke).
-
-Modal 공개 CLI(`modal profile/app/container/function`)와 공개 SDK(`modal.Image`, `modal.Secret.from_name`)만 쓴다.
-비밀값(Secret·proxy token·API key)은 읽어도 출력하지 않는다.
-
-  # 배포 전 검사만 (실패하면 exit 1)
-  python deploy/modal/deploy_checks.py preflight --stage staging --workspace leejein
-  # 검사를 통과할 때만 배포
-  python deploy/modal/deploy_checks.py deploy --stage staging --workspace leejein [--diagnostics]
-  # 배포 후 smoke test (staging 전용). 인증 값은 파일/환경변수에서 읽는다(아래 CREDENTIAL_NAMES).
-  python deploy/modal/deploy_checks.py smoke --workspace leejein --image <정상 전신사진.jpg> \\
-      --credentials-file <proxy token 파일> --credentials-file <staging API key 파일> [--on-failure rollback]
-
-판정 기준(smoke):
-- snapshot 생성: /health 를 처리한 컨테이너 로그에 `Creating GPU memory snapshot`, `stage=staging gpu_snapshot=True`,
-  `snap=True done ... gpu=<GPU 이름>`, `snap=False done ... runtime=ready` 가 모두 있어야 한다.
-- 복원: 컨테이너 0 이후 검증 요청을 처리한 새 컨테이너 로그가 `Restoring Function from memory snapshot` 이면 HIT,
-  `Creating GPU memory snapshot` 이면 MISS(일시적일 수 있어 정해진 횟수만큼 다시 확인), 둘 다 없거나
-  `Creating CPU memory snapshot` 이면 snapshot 비활성(설정 누락)으로 바로 실패.
-- 시작 실패: Modal 이 컨테이너를 계속 다시 띄우므로 timeout 까지 기다리지 않고 중단한다.
-  `Failed creating Function memory snapshot`(snapshot 생성 실패)은 1번에 바로, `Runner failed with exception`(enter hook
-  예외)과 원인이 확인되지 않은 `Runner killed (SIGKILL), exit code: 137` 은 합쳐서 2번에 중단한다. Runner killed 는 같은
-  컨테이너에 snapshot 실패 로그가 있을 때만 snapshot 실패로 본다. 요청 전에 로그를 남긴 컨테이너(이전 배포·단계)는 보지 않는다.
-
-Modal 의 컨테이너 재시작은 애플리케이션 코드로 막을 수 없다. `retries` 는 입력(요청) 재시도, `startup_timeout` 은
-한 번의 시작 시간 상한이라 재시작 횟수를 제한하지 않는다. 그래서 smoke 는 시간·횟수 상한에서 멈추고, 개인
-Workspace 에서 명시적으로 허용했을 때만(--on-failure) 이전 버전으로 rollback 하거나 App 을 멈춘다.
-"""
-
 import argparse
 import ast
 import importlib.util
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -42,20 +14,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 WORKER_FILE = Path(__file__).resolve().parent / "body_image_worker.py"
+DOTENV_FILE = Path(__file__).resolve().parents[2] / ".env"  # modal deploy 는 읽지 않는다. 충돌 검사만 한다
+# 기대 이름. 배포 파일의 DEPLOY_TARGETS 와 따로 적어 두고 비교한다(같은 표를 읽으면 검사가 되지 않는다).
 APP_NAMES = {"production": "lookddak-body-image-worker", "staging": "lookddak-body-image-worker-staging"}
+LABELS = {"production": "lookddak-body-image", "staging": "lookddak-body-image-staging"}
+SECRET_NAMES = {"production": "lookddak-body-image-worker", "staging": "lookddak-body-image-worker-staging"}
+PRODUCTION_WORKSPACE = "lookddak"  # production 은 이 Workspace 에만 배포한다
 EXPECTED_GPU = "T4"
 # 팀 Workspace. 여기서는 smoke 의 자동 rollback/stop 을 하지 않는다(사람이 판단한다).
 PROTECTED_WORKSPACES = frozenset({"lookddak"})
 REQUIRED_SECRET_KEYS = ("INTERNAL_API_KEY", "S3_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
 STAGING_BUCKET_PREFIX = "lookddak-dev-images"
-_NAME_VARS = (
-    "BODY_IMAGE_WORKER_STAGE",
-    "BODY_IMAGE_WORKER_APP_NAME",
-    "BODY_IMAGE_WORKER_LABEL",
-    "BODY_IMAGE_WORKER_SECRET_NAME",
-    "BODY_IMAGE_WORKER_DIAGNOSTICS",
-    "BODY_IMAGE_WORKER_IMAGE_STAGE",
-)
+DEPLOY_VAR_PREFIX = "BODY_IMAGE_WORKER_"
+MODAL_TARGET_OVERRIDES = ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "MODAL_ENVIRONMENT")
 _IMAGE_METHODS = ("env", "run_commands", "pip_install", "apt_install", "add_local_file", "add_local_dir")
 
 
@@ -69,8 +40,34 @@ class Check:
 # ---------------------------------------------------------------- preflight
 
 
-def load_worker(stage: str, diagnostics: bool = False):
-    """배포 파일을 stage 환경변수로 불러온다(Modal 에 보내지 않음). 공개 Image 메서드 호출 순서·env 를 기록한다."""
+def deploy_env(stage: str, diagnostics: bool = False, gpu_snapshot: bool = False,
+               max_containers: int | None = None) -> dict[str, str]:
+    """배포에 쓸 BODY_IMAGE_WORKER_* 전부. 검사(load_worker)·staging 배포·production 수동 명령이 이 값을 같이 쓴다.
+
+    네 값을 모두 명시한다. 셸에 같은 이름이 남아 있어도 이 값이 덮어쓴다(빈 상한은 "상한 없음").
+    """
+    return {
+        "BODY_IMAGE_WORKER_STAGE": stage,
+        "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "true" if stage == "staging" or gpu_snapshot else "false",
+        "BODY_IMAGE_WORKER_MAX_CONTAINERS": "" if max_containers is None else str(max_containers),
+        "BODY_IMAGE_WORKER_DIAGNOSTICS": "true" if diagnostics else "false",
+    }
+
+
+def deploy_process_env(wanted: dict[str, str], profile: str, environ=None) -> dict[str, str]:
+    """`modal deploy` 에 넘길 환경. 셸의 BODY_IMAGE_WORKER_* 는 버리고 검사한 값(wanted)만 넣는다."""
+    environ = os.environ if environ is None else environ
+    base = {name: value for name, value in environ.items() if not name.startswith(DEPLOY_VAR_PREFIX)}
+    return {**base, **wanted, "MODAL_PROFILE": profile}
+
+
+def manual_deploy_command(wanted: dict[str, str]) -> str:
+    """production 수동 배포 명령. 검사한 네 값을 모두 명시한다(셸에 남은 값이 끼어들지 않게)."""
+    assigns = " ".join(f"{name}={shlex.quote(value)}" for name, value in wanted.items())
+    return f"MODAL_PROFILE=<{PRODUCTION_WORKSPACE} profile> {assigns} modal deploy deploy/modal/body_image_worker.py"
+
+
+def load_worker(stage: str, diagnostics: bool = False, gpu_snapshot: bool = False, max_containers: int | None = None):
     import modal
 
     calls: list[tuple[str, object]] = []
@@ -82,10 +79,8 @@ def load_worker(stage: str, diagnostics: bool = False):
             return original(self, *args, **kwargs)
         return spy
 
-    saved = {name: os.environ.pop(name, None) for name in _NAME_VARS}
-    os.environ["BODY_IMAGE_WORKER_STAGE"] = stage
-    if diagnostics:
-        os.environ["BODY_IMAGE_WORKER_DIAGNOSTICS"] = "true"
+    saved = {name: os.environ.pop(name) for name in list(os.environ) if name.startswith(DEPLOY_VAR_PREFIX)}
+    os.environ.update(deploy_env(stage, diagnostics, gpu_snapshot, max_containers))
     try:
         for name, original in originals.items():
             setattr(modal.Image, name, make_spy(name, original))
@@ -96,41 +91,64 @@ def load_worker(stage: str, diagnostics: bool = False):
     finally:
         for name, original in originals.items():
             setattr(modal.Image, name, original)
-        for name in _NAME_VARS:
-            os.environ.pop(name, None)
-            if saved[name] is not None:
-                os.environ[name] = saved[name]
+        for name in [name for name in os.environ if name.startswith(DEPLOY_VAR_PREFIX)]:
+            del os.environ[name]
+        os.environ.update(saved)
 
 
-def check_deploy_config(module, calls, stage: str) -> list[Check]:
-    """배포 파일이 stage 에 맞는 설정을 Modal 에 넘기는지(모듈 상수와 이미지 구성) 확인한다."""
+def check_deploy_config(module, calls, stage: str, gpu_snapshot: bool = False,
+                        max_containers: int | None = None) -> list[Check]:
+    expect_gpu = stage == "staging" or gpu_snapshot
     checks = [
         Check("stage", module.STAGE == stage, f"STAGE={module.STAGE!r}"),
         Check("app name", module.APP_NAME == APP_NAMES[stage], f"APP_NAME={module.APP_NAME!r}"),
+        Check("label", module.ENDPOINT_LABEL == LABELS[stage], f"label={module.ENDPOINT_LABEL!r}"),
+        Check("secret name", module.SECRET_NAME == SECRET_NAMES[stage], f"SECRET_NAME={module.SECRET_NAME!r}"),
+        Check("proxy auth", module.REQUIRES_PROXY_AUTH is True, f"requires_proxy_auth={module.REQUIRES_PROXY_AUTH!r}"),
         Check("gpu", module.WORKER_GPU == EXPECTED_GPU, f"gpu={module.WORKER_GPU!r}"),
+        Check("cpu/memory", (module.WORKER_RESOURCES.get("cpu"), module.WORKER_RESOURCES.get("memory")) == (4, 8192),
+              f"cpu={module.WORKER_RESOURCES.get('cpu')!r} memory={module.WORKER_RESOURCES.get('memory')!r}"),
         Check("cpu memory snapshot", module.WORKER_RESOURCES.get("enable_memory_snapshot") is True,
               f"enable_memory_snapshot={module.WORKER_RESOURCES.get('enable_memory_snapshot')!r}"),
         Check("min containers", module.WORKER_RESOURCES.get("min_containers") == 0,
               f"min_containers={module.WORKER_RESOURCES.get('min_containers')!r}"),
+        Check("gpu snapshot mode", module.GPU_SNAPSHOT is expect_gpu, f"GPU_SNAPSHOT={module.GPU_SNAPSHOT!r}"),
     ]
     names = [name for name, _ in calls]
     checks.append(Check("code layer last", bool(names) and names[-1] == "add_local_dir" and names.count("add_local_dir") == 1,
                         f"image build order ends with {names[-3:]}"))
     baked = [env for name, env in calls if name == "env" and env and module.IMAGE_STAGE_VAR in env]
-    if stage == "staging":
+    function_env = module.STAGE_ENV.get("env", {})
+    if expect_gpu:
         checks += [
             Check("gpu snapshot", module.STAGE_SNAPSHOT == {"experimental_options": {"enable_gpu_snapshot": True}},
                   f"STAGE_SNAPSHOT={module.STAGE_SNAPSHOT!r}"),
-            Check("function stage env", module.STAGE_ENV.get("env", {}).get("BODY_IMAGE_WORKER_STAGE") == "staging",
-                  f"env stage={module.STAGE_ENV.get('env', {}).get('BODY_IMAGE_WORKER_STAGE')!r}"),
-            Check("image stage env", baked == [{module.IMAGE_STAGE_VAR: "staging"}], f"image env={baked!r}"),
-            Check("max containers", module.STAGE_SCALING.get("max_containers") == 1, f"{module.STAGE_SCALING!r}"),
+            Check("function stage env", function_env.get("BODY_IMAGE_WORKER_STAGE") == stage
+                  and function_env.get(module.GPU_SNAPSHOT_VAR) == "true",
+                  f"env stage={function_env.get('BODY_IMAGE_WORKER_STAGE')!r} "
+                  f"gpu_snapshot={function_env.get(module.GPU_SNAPSHOT_VAR)!r}"),
+            Check("image stage env",
+                  baked == [{module.IMAGE_STAGE_VAR: stage, module.IMAGE_GPU_SNAPSHOT_VAR: "true"}],
+                  f"image env={baked!r}"),
         ]
     else:
         checks += [
             Check("gpu snapshot off", module.STAGE_SNAPSHOT == {}, f"STAGE_SNAPSHOT={module.STAGE_SNAPSHOT!r}"),
             Check("no stage env", module.STAGE_ENV == {}, f"STAGE_ENV={module.STAGE_ENV!r}"),
             Check("no image stage env", baked == [], f"image env={baked!r}"),
+        ]
+    if stage == "staging":
+        checks.append(Check("max containers", module.STAGE_SCALING.get("max_containers") == 1, f"{module.STAGE_SCALING!r}"))
+    else:
+        registered = module.STAGE_SCALING.get("max_containers")
+        if gpu_snapshot:
+            ok = isinstance(registered, int) and registered >= 1 and registered == max_containers
+            detail = f"max_containers={registered!r} (expected {max_containers!r}; GPU snapshot 에는 필수)"
+        else:
+            ok = registered == max_containers  # 주지 않으면 None(상한 없음, 기존 그대로)
+            detail = f"max_containers={registered!r} (expected {max_containers!r})"
+        checks += [
+            Check("production max containers", ok, detail),
             Check("no diagnostics", module.DIAGNOSTICS is False, f"DIAGNOSTICS={module.DIAGNOSTICS!r}"),
         ]
     return checks
@@ -192,6 +210,40 @@ def check_secret(secret_name: str) -> Check:
     return Check("secret", True, f"{secret_name}: required keys {', '.join(REQUIRED_SECRET_KEYS)} present")
 
 
+def check_modal_target_env(environ) -> Check:
+    """MODAL_PROFILE 이 아닌 경로로 Workspace·environment 를 바꾸는 변수가 없는지(있으면 확인할 수 없어 실패)."""
+    found = [name for name in MODAL_TARGET_OVERRIDES if environ.get(name)]
+    return Check("modal target env", not found,
+                 f"셸에 {found} 가 있습니다. unset 한 뒤 MODAL_PROFILE 로만 선택하세요" if found else "none")
+
+
+def read_dotenv_deploy_vars(path: Path) -> dict[str, str]:
+    """.env 에서 BODY_IMAGE_WORKER_* 줄만 읽는다(다른 값은 읽지도 출력하지도 않는다)."""
+    if not path.is_file():
+        return {}
+    found = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if not line.startswith(DEPLOY_VAR_PREFIX) or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        found[name.strip()] = value.strip().strip("'\"")
+    return found
+
+
+def check_env_sources(wanted: dict[str, str], environ, dotenv: dict[str, str]) -> Check:
+    """셸·.env 의 BODY_IMAGE_WORKER_* 가 검사할 값과 다르면 실패한다(조용히 하나를 고르지 않는다)."""
+    conflicts = [
+        f"{source}:{name}={value!r}(검사값 {wanted.get(name)!r})"
+        for source, values in (("shell", environ), (".env", dotenv))
+        for name, value in values.items()
+        if name.startswith(DEPLOY_VAR_PREFIX) and value != wanted.get(name)
+    ]
+    return Check("deploy env sources", not conflicts, "; ".join(conflicts) or "shell·.env 에 다른 값 없음")
+
+
 def modal_cli(*args: str, profile: str | None = None, timeout: float = 120) -> str:
     env = dict(os.environ)
     if profile:
@@ -204,18 +256,29 @@ def modal_cli(*args: str, profile: str | None = None, timeout: float = 120) -> s
     return result.stdout
 
 
-def preflight(stage: str, workspace: str, diagnostics: bool = False) -> tuple[str | None, list[Check]]:
+def preflight(stage: str, workspace: str, diagnostics: bool = False, gpu_snapshot: bool = False,
+              max_containers: int | None = None) -> tuple[str | None, list[Check]]:
+    """읽기 전용 배포 전 검사. production 은 Workspace 가 PRODUCTION_WORKSPACE 여야 한다.
+
+    배포 대상(Workspace·셸/.env 값)이 확인되지 않으면 Secret 을 조회하지 않는다.
+    """
+    wanted = deploy_env(stage, diagnostics, gpu_snapshot, max_containers)
     profiles = json.loads(modal_cli("profile", "list", "--json"))
     profile, workspace_check = resolve_profile(workspace, profiles, os.environ.get("MODAL_PROFILE"))
-    checks = [workspace_check]
+    checks = [workspace_check, check_modal_target_env(os.environ)]
+    if stage == "production":
+        checks.append(Check("production workspace", workspace == PRODUCTION_WORKSPACE,
+                            f"--workspace={workspace!r} (production 은 {PRODUCTION_WORKSPACE!r})"))
+    checks.append(check_env_sources(wanted, os.environ, read_dotenv_deploy_vars(DOTENV_FILE)))
+    target_ok = all(check.ok for check in checks)
     try:
-        module, calls = load_worker(stage, diagnostics)
+        module, calls = load_worker(stage, diagnostics, gpu_snapshot, max_containers)
     except Exception as error:  # noqa: BLE001 - 배포 파일 자체의 설정 오류(staging 이름 충돌 등)도 검사 실패다
         return profile, checks + [Check("load deploy file", False, f"{type(error).__name__}: {error}")]
-    checks += check_deploy_config(module, calls, stage)
+    checks += check_deploy_config(module, calls, stage, gpu_snapshot, max_containers)
     checks.append(check_lifecycle_decorators())
     checks.append(check_no_private_modal_api())
-    if profile and workspace_check.ok:
+    if profile and target_ok:
         os.environ["MODAL_PROFILE"] = profile  # SDK 호출(Secret 확인)도 같은 profile 로
         checks.append(check_secret(module.SECRET_NAME))
     return profile, checks
@@ -663,6 +726,10 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--stage", choices=sorted(APP_NAMES), required=True)
         command.add_argument("--workspace", required=True, help="배포할 Modal Workspace(현재 profile 과 같아야 한다)")
         command.add_argument("--diagnostics", action="store_true", help="staging 진단 모드")
+        command.add_argument("--gpu-snapshot", action="store_true",
+                             help="production 을 GPU snapshot 으로 검사(배포 시 BODY_IMAGE_WORKER_GPU_SNAPSHOT=true)")
+        command.add_argument("--max-containers", type=int,
+                             help="production max_containers(배포 시 BODY_IMAGE_WORKER_MAX_CONTAINERS). GPU snapshot 에 필수")
     smoke_cmd = sub.add_parser("smoke")
     smoke_cmd.add_argument("--workspace", required=True)
     smoke_cmd.add_argument("--image", required=True, type=Path, help="정상 전신사진(JPEG)")
@@ -673,17 +740,24 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command in ("preflight", "deploy"):
-        profile, checks = preflight(args.stage, args.workspace, args.diagnostics)
+        wanted = deploy_env(args.stage, args.diagnostics, args.gpu_snapshot, args.max_containers)
+        if args.command == "deploy" and args.stage == "production":
+            # 공유 production App 은 이 도구로 배포하지 않는다(자동 배포·중단·롤백 없음). 검사만 한다.
+            print("production 은 이 도구로 배포하지 않습니다. preflight 로 검사한 뒤 승인을 받아 직접 실행하세요:\n"
+                  f"  {manual_deploy_command(wanted)}")
+            return 2
+        profile, checks = preflight(args.stage, args.workspace, args.diagnostics, args.gpu_snapshot,
+                                    args.max_containers)
         if not print_checks(checks):
             print("preflight FAILED: 배포하지 않습니다.")
             return 1
         print(f"preflight PASSED (profile={profile})")
         if args.command == "preflight":
+            if args.stage == "production":
+                print(f"검사한 설정의 수동 배포 명령(승인 후, 같은 값으로만):\n  {manual_deploy_command(wanted)}")
             return 0
-        env = {**os.environ, "MODAL_PROFILE": profile, "BODY_IMAGE_WORKER_STAGE": args.stage}
-        env.pop("BODY_IMAGE_WORKER_DIAGNOSTICS", None)
-        if args.diagnostics:
-            env["BODY_IMAGE_WORKER_DIAGNOSTICS"] = "true"
+        # 검사한 것과 같은 값(wanted)으로만 배포한다. 셸의 BODY_IMAGE_WORKER_* 는 물려주지 않는다.
+        env = deploy_process_env(wanted, profile)
         return subprocess.run(["modal", "deploy", str(WORKER_FILE)], env=env, check=False).returncode
 
     profiles = json.loads(modal_cli("profile", "list", "--json"))
