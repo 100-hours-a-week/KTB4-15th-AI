@@ -16,7 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from app.body_image_validation import router, runtime, worker
+from app.body_image_validation import inference, router, runtime, worker
 from app.body_image_validation.concurrency import BodyValidationLimiter
 from app.body_image_validation.remote import (
     RemoteBodyImageValidationService,
@@ -315,9 +315,11 @@ def remote_mode(monkeypatch):
     def must_not_build(*args, **kwargs):
         raise AssertionError("remote 모드에서는 로컬 모델·S3 를 만들지 않는다")
 
-    for name in ("S3ImageStorage", "MediaPipePersonDetector", "MediaPipePoseDetector",
-                 "RembgBackgroundRemover", "GpuJpegDecoder", "get_s3_bucket"):
+    for name in ("S3ImageStorage", "get_s3_bucket"):
         monkeypatch.setattr(runtime, name, must_not_build)
+    for name in ("MediaPipePersonDetector", "MediaPipePoseDetector", "RembgBackgroundRemover",
+                 "GpuJpegDecoder"):
+        monkeypatch.setattr(inference, name, must_not_build)
     monkeypatch.setattr(config, "VALIDATION_MODE", "remote")
     monkeypatch.setattr(config, "REMOTE_URL", WORKER)
     monkeypatch.setattr(config, "REMOTE_TIMEOUT_SECONDS", 30.0)
@@ -359,7 +361,7 @@ def test_unknown_mode_is_runtime_unavailable(monkeypatch):
 def test_remote_runtime_rejects_prebuilt_models(remote_mode):
     manager = BodyImageRuntimeManager()
 
-    manager.start(person_detector=object(), pose_detector=object())
+    manager.start(models=object())
 
     assert manager.runtime is None
 
