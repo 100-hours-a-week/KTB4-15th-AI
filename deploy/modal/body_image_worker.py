@@ -1,16 +1,7 @@
-"""Modal T4 전신 이미지 검증 worker.
-
-Backend 가 직접 부르는 HTTP API(EC2 AI Server 와 같은 endpoint·응답)를 Modal T4 컨테이너에서 띄운다.
-검증 로직은 app/ 의 router·service 를 그대로 쓰고, 이 파일은 이미지·자원·초기화 순서만 정한다.
-
-  배포:  modal deploy deploy/modal/body_image_worker.py   (저장소 루트에서)
-  문서:  deploy/modal/README.md
-
-자원과 cold start 설정은 T4 benchmark 로 정한 값이다. 바꾸기 전에 benchmark 를 다시 돌린다.
-"""
-
 import os
 import time
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 import modal
@@ -21,6 +12,7 @@ import modal
 # - Modal 컨테이너: 이 파일만 /root/body_image_worker.py 로 올라온다. app 패키지는 이미지의
 #   /root/app(PYTHONPATH=/root), 모델은 /app/models/body_image_validation 에 있다. 이미지는 이미
 #   빌드돼 있어 로컬 경로를 읽지 않으므로, 저장소 구조를 가정해 경로를 계산하면 안 된다.
+# 배포 설정 검증도 이 구분을 쓴다(LOCAL_PROJECT_ROOT 가 None 이면 컨테이너, 아래 resolve_deploy_config).
 _THIS_FILE = Path(__file__).resolve()
 _IN_REPOSITORY = _THIS_FILE.parent.name == "modal" and _THIS_FILE.parent.parent.name == "deploy"
 LOCAL_PROJECT_ROOT = _THIS_FILE.parents[2] if _IN_REPOSITORY else None
@@ -29,34 +21,103 @@ ROOT = LOCAL_PROJECT_ROOT or _THIS_FILE.parent
 MODEL_DIR = "/app/models/body_image_validation"
 NUMBA_CACHE_DIR = "/opt/numba_cache"
 
-# 배포 대상. 기본은 production 이고, staging 은 이름 기본값·컨테이너 수 상한·GPU fallback·GPU snapshot 이 다르다.
-STAGE = (os.environ.get("BODY_IMAGE_WORKER_STAGE") or "production").strip().lower()
-_DEFAULT_NAMES = {
-    # (app 이름, URL label, Modal Secret 이름)
-    "production": ("lookddak-body-image-worker", "lookddak-body-image", "lookddak-body-image-worker"),
-    "staging": (
-        "lookddak-body-image-worker-staging",
-        "lookddak-body-image-staging",
-        "lookddak-body-image-worker-staging",
-    ),
+# --- 배포 설정 ---------------------------------------------------------------------------------------
+# 배포 대상별 이름. App·URL label·Modal Secret 은 stage 로만 정한다(이름을 바꾸는 환경변수는 두지 않는다).
+DEPLOY_TARGETS = {
+    "production": {
+        "app_name": "lookddak-body-image-worker",
+        "label": "lookddak-body-image",
+        "secret_name": "lookddak-body-image-worker",
+    },
+    "staging": {
+        "app_name": "lookddak-body-image-worker-staging",
+        "label": "lookddak-body-image-staging",
+        "secret_name": "lookddak-body-image-worker-staging",
+    },
 }
-if STAGE not in _DEFAULT_NAMES:
-    raise ValueError(f"BODY_IMAGE_WORKER_STAGE 는 production 또는 staging 이어야 합니다: {STAGE!r}")
-_app_default, _label_default, _secret_default = _DEFAULT_NAMES[STAGE]
+STAGE_VAR = "BODY_IMAGE_WORKER_STAGE"
+GPU_SNAPSHOT_VAR = "BODY_IMAGE_WORKER_GPU_SNAPSHOT"
+MAX_CONTAINERS_VAR = "BODY_IMAGE_WORKER_MAX_CONTAINERS"
+DIAGNOSTICS_VAR = "BODY_IMAGE_WORKER_DIAGNOSTICS"
+DEPLOY_VARS = (STAGE_VAR, GPU_SNAPSHOT_VAR, MAX_CONTAINERS_VAR, DIAGNOSTICS_VAR)
+MAX_CONTAINERS_SANITY_LIMIT = 20
+IMAGE_STAGE_VAR = "BODY_IMAGE_WORKER_IMAGE_STAGE"
+IMAGE_GPU_SNAPSHOT_VAR = "BODY_IMAGE_WORKER_IMAGE_GPU_SNAPSHOT"
 
-# 빈 문자열은 지정하지 않은 것으로 본다.
-APP_NAME = os.environ.get("BODY_IMAGE_WORKER_APP_NAME") or _app_default
-# INTERNAL_API_KEY, S3_BUCKET, AWS_REGION, AWS 자격증명을 담은 Modal Secret 이름.
-SECRET_NAME = os.environ.get("BODY_IMAGE_WORKER_SECRET_NAME") or _secret_default
-# Modal proxy auth(Modal-Key / Modal-Secret 헤더). 인증 없는 요청이 T4 컨테이너를 깨우지 않게
-# Modal 앞단에서 막는다. INTERNAL_API_KEY Bearer 검사는 이와 별개로 앱에서 항상 한다.
-REQUIRES_PROXY_AUTH = os.environ.get("BODY_IMAGE_WORKER_PROXY_AUTH", "true").lower() != "false"
-ENDPOINT_LABEL = os.environ.get("BODY_IMAGE_WORKER_LABEL") or _label_default
 
-_production_app, _production_label, _ = _DEFAULT_NAMES["production"]
-if STAGE == "staging" and (APP_NAME == _production_app or ENDPOINT_LABEL == _production_label):
-    # staging 배포가 production app·URL 을 덮어쓰지 않게 막는다.
-    raise ValueError("staging 배포에 production app 이름이나 label 을 쓸 수 없습니다.")
+@dataclass(frozen=True)
+class DeployConfig:
+    """한 번 정한 배포 설정. 이 파일과 deploy_checks.py(preflight·staging 배포)가 같은 함수로 만든다."""
+
+    stage: str
+    app_name: str
+    label: str
+    secret_name: str
+    gpu_snapshot: bool
+    max_containers: int | None
+    diagnostics: bool
+
+
+def _flag(environ: Mapping[str, str], name: str) -> str:
+    value = (environ.get(name) or "").strip().lower()
+    if value not in ("", "true", "false"):
+        raise ValueError(f"{name} 는 true 또는 false 여야 합니다: {value!r}")
+    return value
+
+
+def resolve_deploy_config(environ: Mapping[str, str], *, in_container: bool) -> DeployConfig:
+    if in_container:
+        stage = (environ.get(STAGE_VAR) or "production").strip().lower()
+    else:
+        unknown = sorted(name for name in environ if name.startswith("BODY_IMAGE_WORKER_") and name not in DEPLOY_VARS)
+        if unknown:
+            raise ValueError(
+                f"지원하지 않는 배포 환경변수입니다: {unknown}. App·label·Secret 은 {STAGE_VAR} 로 정해지고 "
+                "proxy 인증은 끌 수 없습니다. 셸에 남은 값이면 unset 한 뒤 다시 실행하세요."
+            )
+        stage = (environ.get(STAGE_VAR) or "").strip().lower()
+        if not stage:
+            raise ValueError(f"{STAGE_VAR}(staging|production)를 지정해야 배포할 수 있습니다. 기본값은 없습니다.")
+    if stage not in DEPLOY_TARGETS:
+        raise ValueError(f"{STAGE_VAR} 는 production 또는 staging 이어야 합니다: {stage!r}")
+
+    gpu_flag = _flag(environ, GPU_SNAPSHOT_VAR)
+    if stage == "staging" and gpu_flag == "false":
+        raise ValueError("staging 은 GPU snapshot 을 끌 수 없습니다(검증 환경).")
+    gpu_snapshot = stage == "staging" or gpu_flag == "true"
+
+    max_containers = None
+    diagnostics = False
+    if not in_container:
+        raw = (environ.get(MAX_CONTAINERS_VAR) or "").strip()
+        if raw and not (raw.isdigit() and 1 <= int(raw) <= MAX_CONTAINERS_SANITY_LIMIT):
+            raise ValueError(f"{MAX_CONTAINERS_VAR} 는 1~{MAX_CONTAINERS_SANITY_LIMIT} 정수여야 합니다: {raw!r}")
+        max_containers = int(raw) if raw else None
+        if stage == "staging" and max_containers not in (None, 1):
+            raise ValueError("staging 의 max_containers 는 1 로 고정입니다.")
+        if stage == "production" and gpu_snapshot and max_containers is None:
+            raise ValueError(
+                f"production GPU snapshot 배포에는 {MAX_CONTAINERS_VAR} 가 필요합니다(production AI Server task 수 기준)."
+            )
+        diagnostics = _flag(environ, DIAGNOSTICS_VAR) == "true"
+        if diagnostics and stage != "staging":
+            raise ValueError(f"{DIAGNOSTICS_VAR} 는 staging 배포에서만 켤 수 있습니다.")
+    if stage == "staging":
+        max_containers = 1  # 비용·테스트 통제
+    return DeployConfig(stage=stage, **DEPLOY_TARGETS[stage], gpu_snapshot=gpu_snapshot,
+                        max_containers=max_containers, diagnostics=diagnostics)
+
+
+CONFIG = resolve_deploy_config(os.environ, in_container=LOCAL_PROJECT_ROOT is None)
+if LOCAL_PROJECT_ROOT is not None:
+    # 배포하는 사람이 Modal 로 보내기 전에 대상을 볼 수 있게 남긴다(비밀값 없음).
+    print(f"body image worker deploy config: {CONFIG}", flush=True)
+
+STAGE = CONFIG.stage
+APP_NAME = CONFIG.app_name
+ENDPOINT_LABEL = CONFIG.label
+SECRET_NAME = CONFIG.secret_name
+REQUIRES_PROXY_AUTH = True
 
 # T4 benchmark 로 검증한 CUDA 조합. requirements.txt(EC2 CPU 이미지)와 별도로 여기서만 설치한다.
 ONNXRUNTIME_GPU = "onnxruntime-gpu[cuda,cudnn]==1.30.0"
@@ -65,7 +126,7 @@ TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu130"
 
 # 단일 요청 peak: CPU 2.92 core, RAM 6.46GiB, VRAM 1.37GiB. 컨테이너당 동시 요청은 기본값 1 이다
 # (동시 요청 데코레이터를 쓰지 않는다). 공통 자원은 CPU memory snapshot 까지다. GPU snapshot 은 아래
-# STAGE_SNAPSHOT 으로 staging 에서만 켠다.
+# GPU_SNAPSHOT 일 때만 STAGE_SNAPSHOT 으로 켠다.
 WORKER_RESOURCES = {
     "gpu": "T4",
     "cpu": 4,
@@ -75,25 +136,25 @@ WORKER_RESOURCES = {
     "enable_memory_snapshot": True,
 }
 
-# staging 에서만 GPU 컨테이너를 1개로 제한한다(비용·테스트 통제). production 은 Modal 기본값 그대로다.
-STAGE_SCALING = {"max_containers": 1} if STAGE == "staging" else {}
+# 컨테이너 수 상한(max_containers). 배포 시점에 Modal 에 등록되는 값이다(실행 중 변경은 Modal 대시보드·
+# update_autoscaler 같은 별도 조작이 필요하고, 다음 배포 때 이 값으로 돌아간다).
+MAX_CONTAINERS = CONFIG.max_containers
+STAGE_SCALING = {"max_containers": MAX_CONTAINERS} if MAX_CONTAINERS else {}
 # staging 도 T4 로 고정한다. GPU snapshot 을 production·benchmark 와 같은 GPU 조건에서 검증하기 위해서다.
 # (L4 fallback 과 T4↔L4 snapshot 호환성은 별도로 검증한 뒤에 다시 켠다.)
 WORKER_GPU = WORKER_RESOURCES["gpu"]
-# staging 에서만 GPU memory snapshot 을 켠다(experimental). 켜면 snap=True 단계에서 GPU 를 쓸 수 있어
-# CUDA·rembg CUDA session·nvJPEG·warm-up 까지 snapshot 에 담는다. production 은 CPU memory snapshot 그대로다.
-GPU_SNAPSHOT = STAGE == "staging"
+# GPU memory snapshot(experimental). 켜면 snap=True 단계에서 GPU 를 쓸 수 있어 CUDA·rembg CUDA session·nvJPEG·
+# warm-up 까지 snapshot 에 담는다. 배포 시점에 Modal 에 등록되는 값이라 실행 중에는 바꿀 수 없다.
+GPU_SNAPSHOT = CONFIG.gpu_snapshot
 STAGE_SNAPSHOT = {"experimental_options": {"enable_gpu_snapshot": True}} if GPU_SNAPSHOT else {}
-# 컨테이너는 이 파일을 다시 import 해 lifecycle 을 고른다. 로컬 환경변수는 컨테이너에 없으므로 staging 은
-# stage 를 컨테이너 환경변수로 넘긴다(production 은 기본값이 production 이라 넘기지 않는다).
+# 컨테이너는 이 파일을 다시 import 해 lifecycle 을 고른다. 로컬 환경변수는 컨테이너에 없으므로 GPU snapshot 배포는
+# stage 와 GPU snapshot 여부를 컨테이너 환경변수로 넘긴다(CPU snapshot production 은 넘기지 않는다).
 # staging 검증용 진단(요청별 단계 시간 로그 + rembg ONNX Runtime profiling). 배포할 때
 # BODY_IMAGE_WORKER_DIAGNOSTICS=true 로만 켠다. profiling 은 snapshot 전 warm-up(1번째)과 복원 뒤 첫
 # 요청(2번째)까지만 기록하고 끝낸다. production 에서는 켤 수 없다.
-DIAGNOSTICS = os.environ.get("BODY_IMAGE_WORKER_DIAGNOSTICS", "").strip().lower() == "true"
-if DIAGNOSTICS and STAGE != "staging":
-    raise ValueError("BODY_IMAGE_WORKER_DIAGNOSTICS 는 staging 배포에서만 켤 수 있습니다.")
+DIAGNOSTICS = CONFIG.diagnostics
 DIAGNOSTIC_ENV = {"BODY_IMAGE_DIAGNOSTICS": "true", "BODY_IMAGE_REMBG_PROFILE_RUNS": "2"} if DIAGNOSTICS else {}
-STAGE_ENV = {"env": {"BODY_IMAGE_WORKER_STAGE": STAGE, **DIAGNOSTIC_ENV}} if GPU_SNAPSHOT else {}
+STAGE_ENV = {"env": {STAGE_VAR: STAGE, GPU_SNAPSHOT_VAR: "true", **DIAGNOSTIC_ENV}} if GPU_SNAPSHOT else {}
 
 WORKER_ENV = {
     "PYTHONUNBUFFERED": "1",
@@ -135,12 +196,11 @@ image = (
     # rembg import 가 PyMatting 함수를 컴파일하며 Numba cache 를 만든다. 비어 있으면 빌드를 멈춘다.
     .run_commands(f"mkdir -p {NUMBA_CACHE_DIR}", 'python -c "import rembg"', _CHECK_NUMBA_CACHE)
 )
-# staging 이미지에만 stage 를 굽는다. 함수 env(STAGE_ENV)와 다른 경로로 전달되는 값이라 컨테이너에서 둘을
-# 비교해 한쪽이 빠지거나 다르면 멈춘다(resolve_gpu_snapshot). production 이미지는 바꾸지 않는다.
-# env 도 build step 이라 코드 layer(add_local_dir, copy 없음) 앞에 둔다(뒤에 두면 modal deploy 가 거절한다).
-IMAGE_STAGE_VAR = "BODY_IMAGE_WORKER_IMAGE_STAGE"
+# GPU snapshot 이미지에만 stage 와 GPU snapshot 여부를 굽는다. 함수 env(STAGE_ENV)와 다른 경로로 전달되는 값이라
+# 컨테이너에서 둘을 비교해 한쪽이 빠지거나 다르면 멈춘다(resolve_gpu_snapshot). CPU snapshot production 이미지는
+# 바꾸지 않는다. env 도 build step 이라 코드 layer(add_local_dir, copy 없음) 앞에 둔다(뒤에 두면 modal deploy 가 거절한다).
 if GPU_SNAPSHOT:
-    image = image.env({IMAGE_STAGE_VAR: STAGE})
+    image = image.env({IMAGE_STAGE_VAR: STAGE, IMAGE_GPU_SNAPSHOT_VAR: "true"})
 # 코드는 마지막 layer 다. 코드만 바뀌면 의존성·모델·cache layer 를 다시 만들지 않는다.
 image = image.add_local_dir(ROOT / "app", "/root/app", ignore=["**/__pycache__", "**/*.pyc"])
 
@@ -165,7 +225,7 @@ def _stage_from(name: str) -> str:
 
 def container_stage() -> str:
     """함수 env(@app.cls(env=...), Modal 이 Secret 으로 넣는다)로 받은 stage."""
-    return _stage_from("BODY_IMAGE_WORKER_STAGE")
+    return _stage_from(STAGE_VAR)
 
 
 def image_stage() -> str:
@@ -173,24 +233,23 @@ def image_stage() -> str:
     return _stage_from(IMAGE_STAGE_VAR)
 
 
+def _flag_from(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() == "true"
+
+
 def resolve_gpu_snapshot() -> bool:
-    """snap=True 에서 GPU snapshot 경로를 쓸지 정한다. Modal 공개 API 로 넘긴 값만 쓴다.
-
-    배포가 서로 다른 두 경로(이미지 env·함수 env)로 넘긴 stage 를 비교해, 하나가 빠지거나 다르면
-    StageConfigError 로 멈춘다(staging 으로 배포했는데 production 경로로 조용히 가지 않는다).
-    production 은 둘 다 없어 기존 경로 그대로다.
-
-    한계: 두 값 모두 같은 배포 코드가 정하므로 "Modal 에 GPU snapshot 옵션이 실제로 등록됐는지"는 여기서 알 수
-    없다. 그것은 배포 설정 테스트(experimental_options 등록)와, staging snap=True 에서 CUDA 를 실제로 쓰는지
-    (prepare_gpu_snapshot(require_cuda=True)), 그리고 Modal 로그(Creating/Restoring)로 확인한다.
-    """
     stages = {"image": image_stage(), "function": container_stage()}
-    unknown = {where: stage for where, stage in stages.items() if stage not in _DEFAULT_NAMES}
+    unknown = {where: stage for where, stage in stages.items() if stage not in DEPLOY_TARGETS}
     if unknown:
         raise StageConfigError(f"알 수 없는 stage 입니다: {unknown}")
     if stages["image"] != stages["function"]:
         raise StageConfigError(f"이미지 stage 와 함수 stage 가 다릅니다: {stages}")
-    gpu_snapshot = stages["function"] == "staging"
+    flags = {"image": _flag_from(IMAGE_GPU_SNAPSHOT_VAR), "function": _flag_from(GPU_SNAPSHOT_VAR)}
+    if flags["image"] != flags["function"]:
+        raise StageConfigError(f"이미지와 함수의 GPU snapshot 설정이 다릅니다: {flags}")
+    gpu_snapshot = flags["function"]
+    if stages["function"] == "staging" and not gpu_snapshot:
+        raise StageConfigError("staging 컨테이너인데 GPU snapshot 설정이 없습니다.")
     print(f"body image worker lifecycle: stage={stages['function']} gpu_snapshot={gpu_snapshot}", flush=True)
     return gpu_snapshot
 
@@ -216,11 +275,6 @@ def _cuda_device_name() -> str | None:
 class BodyImageWorker:
     @modal.enter(snap=True)
     def prepare_snapshot(self) -> None:
-        """snapshot 에 담긴다. secret·S3 client·limiter 는 만들지 않는다.
-
-        production: import·MediaPipe(CPU)만. CUDA 를 건드리지 않는다.
-        staging(GPU snapshot): 여기에 더해 CUDA·rembg CUDA session·nvJPEG 생성과 warm-up 까지 한다.
-        """
         from app.body_image_validation import worker
 
         started = time.time()
@@ -244,11 +298,6 @@ class BodyImageWorker:
 
     @modal.enter(snap=False)
     def start_after_restore(self) -> None:
-        """snapshot 복원 뒤 매번. secret 확인·S3 client·service(limiter)·runtime 등록은 여기서 새로 한다.
-
-        snap=True 가 detector 만 만들었으면(production) 기존 start_gpu 로 GPU 초기화·warm-up 까지 한다.
-        staging 은 snapshot 에 담긴 모델을 그대로 쓰고 다시 만들지 않는다.
-        """
         from app.body_image_validation import worker
 
         started = time.time()

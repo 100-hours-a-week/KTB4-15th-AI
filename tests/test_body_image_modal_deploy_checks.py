@@ -1,8 +1,3 @@
-"""deploy/modal/deploy_checks.py: 배포 전 검사·smoke 판정. Modal 원격 호출 없이 돈다.
-
-로그 판정 테스트의 줄은 2026-10-25 leejein staging(T4)에서 실제로 받은 `modal app logs` 출력이다.
-"""
-
 import importlib.util
 import json
 from datetime import UTC, datetime
@@ -20,6 +15,17 @@ dc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(dc)
 
 SINCE = datetime(2026, 10, 25, 9, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def clean_deploy_env(monkeypatch, tmp_path):
+    """테스트가 개발자 셸·저장소 .env 의 값에 기대지 않게 한다."""
+    import os
+
+    for name in list(os.environ):
+        if name.startswith("BODY_IMAGE_WORKER_") or name in dc.MODAL_TARGET_OVERRIDES:
+            monkeypatch.delenv(name)
+    monkeypatch.setattr(dc, "DOTENV_FILE", tmp_path / "missing.env")
 
 # 4-C: /health 로 GPU snapshot 생성(정상)
 WARMUP_OK = """\
@@ -470,3 +476,247 @@ def test_miss_retries_and_limits_are_unchanged():
 
     assert (limits.max_miss_retries, limits.health_timeout_s, limits.validation_timeout_s) == (2, 150, 120)
     assert (limits.max_init_failures, limits.max_snapshot_failures) == (2, 1)
+
+
+# --- production preflight (읽기 전용. production 은 deploy 하지 않는다) ---
+
+
+def test_production_gpu_snapshot_config_passes_when_explicitly_enabled():
+    module, calls = dc.load_worker("production", gpu_snapshot=True, max_containers=2)
+
+    checks = dc.check_deploy_config(module, calls, "production", gpu_snapshot=True, max_containers=2)
+
+    assert all(check.ok for check in checks), [c for c in checks if not c.ok]
+
+
+def test_production_mode_confusion_fails_the_config_check():
+    cpu_module, cpu_calls = dc.load_worker("production")
+    gpu_module, gpu_calls = dc.load_worker("production", gpu_snapshot=True, max_containers=2)
+
+    # CPU 로 불러온 배포를 GPU 로 검사하거나 그 반대면 실패한다.
+    assert "gpu snapshot mode" in [
+        c.name for c in dc.check_deploy_config(cpu_module, cpu_calls, "production", True, 2) if not c.ok]
+    assert "gpu snapshot mode" in [
+        c.name for c in dc.check_deploy_config(gpu_module, gpu_calls, "production", False, 2) if not c.ok]
+
+
+def test_production_preflight_requires_the_production_workspace(monkeypatch):
+    profiles = [{"name": "leejein", "workspace": "leejein", "active": True}]
+    monkeypatch.setattr(dc, "modal_cli", lambda *args, **kwargs: json.dumps(profiles))
+    monkeypatch.delenv("MODAL_PROFILE", raising=False)
+    monkeypatch.setattr(dc, "check_secret", lambda name: pytest.fail("secret 을 조회하면 안 된다"))
+
+    _, checks = dc.preflight("production", "leejein", gpu_snapshot=True)
+
+    assert "production workspace" in [c.name for c in checks if not c.ok]
+
+
+def test_production_preflight_passes_in_lookddak_with_the_production_secret(monkeypatch):
+    profiles = [{"name": "lookddak", "workspace": "lookddak", "active": True}]
+    monkeypatch.setattr(dc, "modal_cli", lambda *args, **kwargs: json.dumps(profiles))
+    monkeypatch.delenv("MODAL_PROFILE", raising=False)
+    seen = []
+    monkeypatch.setattr(dc, "check_secret", lambda name: seen.append(name) or dc.Check("secret", True, name))
+
+    _, checks = dc.preflight("production", "lookddak", gpu_snapshot=True, max_containers=2)
+
+    assert all(c.ok for c in checks), [c for c in checks if not c.ok]
+    assert seen == ["lookddak-body-image-worker"]  # staging Secret 이 아니다
+
+
+@pytest.mark.parametrize("gpu", [[], ["--gpu-snapshot"]])
+def test_deploy_command_refuses_production(monkeypatch, capsys, gpu):
+    monkeypatch.setattr(dc, "preflight", lambda *args: pytest.fail("production deploy 는 검사·배포를 시작하지 않는다"))
+    monkeypatch.setattr(dc.subprocess, "run", lambda *a, **k: pytest.fail("배포하면 안 된다"))
+
+    assert dc.main(["deploy", "--stage", "production", "--workspace", "lookddak", *gpu]) == 2
+    assert "preflight" in capsys.readouterr().out
+
+
+
+# --- production max_containers 검사 ---
+
+
+def test_production_gpu_preflight_fails_without_a_container_cap(monkeypatch):
+    profiles = [{"name": "lookddak", "workspace": "lookddak", "active": True}]
+    monkeypatch.setattr(dc, "modal_cli", lambda *args, **kwargs: json.dumps(profiles))
+    monkeypatch.delenv("MODAL_PROFILE", raising=False)
+    monkeypatch.setattr(dc, "check_secret", lambda name: pytest.fail("설정이 틀리면 secret 을 조회하지 않아도 된다"))
+
+    _, checks = dc.preflight("production", "lookddak", gpu_snapshot=True)  # --max-containers 없음
+
+    failed = [c for c in checks if not c.ok]
+    assert [c.name for c in failed] == ["load deploy file"]
+    assert "BODY_IMAGE_WORKER_MAX_CONTAINERS" in failed[0].detail
+
+
+def test_production_gpu_cap_must_match_the_expected_value():
+    module, calls = dc.load_worker("production", gpu_snapshot=True, max_containers=3)
+
+    failed = [c.name for c in dc.check_deploy_config(module, calls, "production", True, 2) if not c.ok]
+
+    assert failed == ["production max containers"]
+
+
+def test_production_cpu_cap_is_optional_and_checked_when_given():
+    module, calls = dc.load_worker("production")
+    assert all(c.ok for c in dc.check_deploy_config(module, calls, "production"))
+
+    capped, capped_calls = dc.load_worker("production", max_containers=3)
+    assert all(c.ok for c in dc.check_deploy_config(capped, capped_calls, "production", max_containers=3))
+    assert "production max containers" in [
+        c.name for c in dc.check_deploy_config(capped, capped_calls, "production") if not c.ok]
+
+
+def test_deploy_refusal_prints_the_cap_in_the_manual_command(monkeypatch, capsys):
+    monkeypatch.setattr(dc.subprocess, "run", lambda *a, **k: pytest.fail("배포하면 안 된다"))
+
+    code = dc.main(["deploy", "--stage", "production", "--workspace", "lookddak", "--gpu-snapshot",
+                    "--max-containers", "2"])
+
+    out = capsys.readouterr().out
+    assert code == 2
+    assert ("BODY_IMAGE_WORKER_STAGE=production BODY_IMAGE_WORKER_GPU_SNAPSHOT=true "
+            "BODY_IMAGE_WORKER_MAX_CONTAINERS=2 BODY_IMAGE_WORKER_DIAGNOSTICS=false modal deploy") in out
+
+
+# --- 검사한 설정 = 실제 배포 설정 ---
+
+
+def lookddak_profile(monkeypatch, secret_ok=True):
+    profiles = [{"name": "lookddak", "workspace": "lookddak", "active": True}]
+    monkeypatch.setattr(dc, "modal_cli", lambda *args, **kwargs: json.dumps(profiles))
+    monkeypatch.delenv("MODAL_PROFILE", raising=False)
+    seen = []
+    monkeypatch.setattr(dc, "check_secret", lambda name: seen.append(name) or dc.Check("secret", secret_ok, name))
+    return seen
+
+
+def resolved(env):
+    """배포 파일의 resolve_deploy_config 로 env 를 해석한 값(필드 dict. 모듈을 다시 불러와도 비교할 수 있게)."""
+    from dataclasses import asdict
+
+    module, _ = dc.load_worker("production")
+    return asdict(module.resolve_deploy_config(env, in_container=False))
+
+
+def config_of(module):
+    from dataclasses import asdict
+
+    return asdict(module.CONFIG)
+
+
+def test_deploy_env_states_every_deploy_variable():
+    module, _ = dc.load_worker("staging")
+    assert set(dc.deploy_env("staging")) == set(module.DEPLOY_VARS)
+    assert dc.deploy_env("production") == {
+        "BODY_IMAGE_WORKER_STAGE": "production", "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "false",
+        "BODY_IMAGE_WORKER_MAX_CONTAINERS": "", "BODY_IMAGE_WORKER_DIAGNOSTICS": "false",
+    }
+
+
+def test_staging_deploy_runs_modal_with_exactly_the_checked_settings(monkeypatch):
+    lookddak_profile(monkeypatch)
+    # 셸에 남은 값: 같은 값의 STAGE 는 통과, 배포 환경에는 검사값만 들어가야 한다
+    monkeypatch.setenv("BODY_IMAGE_WORKER_STAGE", "staging")
+    ran = {}
+    monkeypatch.setattr(dc.subprocess, "run",
+                        lambda cmd, env, check: ran.update(cmd=cmd, env=env) or type("R", (), {"returncode": 0}))
+
+    assert dc.main(["deploy", "--stage", "staging", "--workspace", "lookddak"]) == 0
+
+    deployed = {k: v for k, v in ran["env"].items() if k.startswith("BODY_IMAGE_WORKER_")}
+    assert deployed == dc.deploy_env("staging")
+    assert ran["env"]["MODAL_PROFILE"] == "lookddak"
+    module, _ = dc.load_worker("staging")
+    assert resolved(deployed) == config_of(module)  # 같은 함수·같은 값 → 같은 설정
+
+
+def test_shell_leftovers_are_not_passed_to_modal_deploy():
+    env = dc.deploy_process_env(dc.deploy_env("staging"), "p", environ={
+        "PATH": "/bin", "BODY_IMAGE_WORKER_SECRET_NAME": "lookddak-body-image-worker",
+        "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "false"})
+
+    assert env["PATH"] == "/bin" and "BODY_IMAGE_WORKER_SECRET_NAME" not in env
+    assert env["BODY_IMAGE_WORKER_GPU_SNAPSHOT"] == "true"
+
+
+@pytest.mark.parametrize(("name", "value"), [
+    ("BODY_IMAGE_WORKER_STAGE", "production"),  # 다른 stage
+    ("BODY_IMAGE_WORKER_SECRET_NAME", "lookddak-body-image-worker"),  # staging 에 production Secret
+    ("BODY_IMAGE_WORKER_PROXY_AUTH", "false"),
+    ("BODY_IMAGE_WORKER_MAX_CONTAINERS", "3"),
+])
+def test_conflicting_shell_values_fail_preflight_before_the_secret_check(monkeypatch, name, value):
+    seen = lookddak_profile(monkeypatch)
+    monkeypatch.setenv(name, value)
+
+    _, checks = dc.preflight("staging", "lookddak")
+
+    assert [c.name for c in checks if not c.ok] == ["deploy env sources"]
+    assert seen == []  # 대상이 확인되지 않으면 Secret 을 조회하지 않는다
+
+
+def test_conflicting_dotenv_values_fail_preflight(monkeypatch, tmp_path):
+    lookddak_profile(monkeypatch)
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("DATABASE_URL=postgresql://user:pw@h/db\nexport BODY_IMAGE_WORKER_STAGE='staging'\n")
+    monkeypatch.setattr(dc, "DOTENV_FILE", dotenv)
+
+    _, checks = dc.preflight("production", "lookddak")
+
+    [failed] = [c for c in checks if not c.ok]
+    assert failed.name == "deploy env sources" and ".env:BODY_IMAGE_WORKER_STAGE" in failed.detail
+    assert "pw" not in failed.detail  # 다른 .env 값은 읽어 보여 주지 않는다
+
+
+def test_matching_dotenv_and_shell_values_pass(monkeypatch, tmp_path):
+    lookddak_profile(monkeypatch)
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("BODY_IMAGE_WORKER_STAGE=production\n")
+    monkeypatch.setattr(dc, "DOTENV_FILE", dotenv)
+    monkeypatch.setenv("BODY_IMAGE_WORKER_GPU_SNAPSHOT", "true")
+    monkeypatch.setenv("BODY_IMAGE_WORKER_MAX_CONTAINERS", "2")
+
+    _, checks = dc.preflight("production", "lookddak", gpu_snapshot=True, max_containers=2)
+
+    assert all(c.ok for c in checks), [c for c in checks if not c.ok]
+
+
+@pytest.mark.parametrize("name", ["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "MODAL_ENVIRONMENT"])
+def test_workspace_that_cannot_be_confirmed_fails_preflight(monkeypatch, name):
+    seen = lookddak_profile(monkeypatch)
+    monkeypatch.setenv(name, "x")
+
+    _, checks = dc.preflight("production", "lookddak")
+
+    assert [c.name for c in checks if not c.ok] == ["modal target env"]
+    assert "x" not in checks[1].detail.replace("unset", "") and seen == []
+
+
+def test_disabled_proxy_auth_fails_the_config_check():
+    module, calls = dc.load_worker("staging")
+    module.REQUIRES_PROXY_AUTH = False
+
+    assert [c.name for c in dc.check_deploy_config(module, calls, "staging") if not c.ok] == ["proxy auth"]
+
+
+def test_production_preflight_prints_a_manual_command_that_reproduces_the_checked_config(monkeypatch, capsys):
+    lookddak_profile(monkeypatch)
+    monkeypatch.setattr(dc.subprocess, "run", lambda *a, **k: pytest.fail("production 은 배포하지 않는다"))
+
+    assert dc.main(["preflight", "--stage", "production", "--workspace", "lookddak", "--gpu-snapshot",
+                    "--max-containers", "2"]) == 0
+
+    command = capsys.readouterr().out.splitlines()[-1]
+    assigns = dict(word.split("=", 1) for word in command.split() if word.startswith("BODY_IMAGE_WORKER_"))
+    checked, _ = dc.load_worker("production", gpu_snapshot=True, max_containers=2)
+    assert resolved(assigns) == config_of(checked)
+
+
+def test_cpu_manual_command_overrides_a_leftover_gpu_flag():
+    command = dc.manual_deploy_command(dc.deploy_env("production"))
+    # 셸에 GPU_SNAPSHOT=true·MAX_CONTAINERS 가 남아 있어도 명령의 값이 덮어쓴다
+    assert "BODY_IMAGE_WORKER_GPU_SNAPSHOT=false" in command and "BODY_IMAGE_WORKER_MAX_CONTAINERS=''" in command
+    assert resolved({"BODY_IMAGE_WORKER_STAGE": "production", "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "false",
+                     "BODY_IMAGE_WORKER_MAX_CONTAINERS": "", "BODY_IMAGE_WORKER_DIAGNOSTICS": "false"})["gpu_snapshot"] is False
