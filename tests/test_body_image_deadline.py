@@ -7,6 +7,7 @@
   스스로 멈추는 것만 worker 쪽 테스트로 확인한다.
 """
 
+import asyncio
 import logging
 import time
 
@@ -39,6 +40,24 @@ from tests.test_body_image_worker import (  # noqa: F401 (pytest fixture)
 )
 
 URL = "/api/v1/validation/body-image"
+
+
+class CancelTrackingWorker(FakeWorker):
+    """정상 응답 완료와 HTTP coroutine 에 전달된 실제 취소를 따로 기록한다."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.cancelled = False
+        self.completed = False
+
+    async def _handle(self, request):
+        try:
+            response = await super()._handle(request)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        self.completed = True
+        return response
 
 
 def deadline_service(fake, deadline_seconds, wall_start=1_000_000.0):
@@ -74,28 +93,29 @@ def test_deadline_header_is_the_absolute_time_on_post_and_redirect(remote_client
 
 
 def test_within_50s_is_200_and_nothing_is_cancelled(remote_client, monkeypatch, caplog):  # noqa: F811
-    fake = FakeWorker(steps=[(40 * SCALE, 200, {}, SUCCESS)])
+    fake = CancelTrackingWorker(steps=[(40 * SCALE, 200, {}, SUCCESS)])
     use(monkeypatch, deadline_service(fake, 50 * SCALE))
 
     with caplog.at_level(logging.INFO, logger="app.body_image_validation.remote"):
         response = remote_post(remote_client, jpeg())
 
     assert response.status_code == 200
+    assert fake.completed is True
+    assert fake.cancelled is False
     assert "http_cancelled=False" in caplog.text and "remote_stopped=n/a" in caplog.text
 
 
 def test_over_50s_cancels_the_http_call_and_answers_504_once(remote_client, monkeypatch, caplog):  # noqa: F811
-    fake = FakeWorker(steps=[(60 * SCALE, 200, {}, SUCCESS)])
+    fake = CancelTrackingWorker(steps=[(60 * SCALE, 200, {}, SUCCESS)])
     use(monkeypatch, deadline_service(fake, 50 * SCALE))
 
-    started = time.monotonic()
     with caplog.at_level(logging.INFO, logger="app.body_image_validation.remote"):
         response = remote_post(remote_client, jpeg())
-    elapsed = time.monotonic() - started
 
     assert response.status_code == 504
     assert response.json() == TIMEOUT
-    assert elapsed < 60 * SCALE  # worker 응답(60초)까지 기다리지 않았다
+    assert fake.cancelled is True  # 응답 시간 대신 대기 중인 HTTP coroutine 의 실제 취소를 확인한다
+    assert fake.completed is False  # worker 의 정상 응답 완료와 구분한다
     assert len(fake.calls) == 1  # 재시도나 새 GPU 작업 요청이 없다
     summary = next(r.getMessage() for r in caplog.records if "body image worker call" in r.getMessage())
     assert "outcome=deadline_exceeded" in summary
