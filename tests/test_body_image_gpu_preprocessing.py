@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from PIL import ExifTags, Image, ImageOps
 
-from app.body_image_validation import runtime
+from app.body_image_validation import inference
 from app.body_image_validation import service as service_module
 from app.body_image_validation.exceptions import UserImageValidationError
 from app.body_image_validation.gpu_preprocessing import (
@@ -278,7 +278,7 @@ def test_gpu_preprocessing_is_off_by_default(monkeypatch):
     monkeypatch.delenv("BODY_IMAGE_GPU_PREPROCESSING", raising=False)
     try:
         assert importlib.reload(config).GPU_PREPROCESSING is False
-        assert runtime.build_gpu_preprocessor() is None
+        assert inference.build_gpu_preprocessor() is None
     finally:
         monkeypatch.undo()
         importlib.reload(config)
@@ -289,17 +289,17 @@ def test_unavailable_gpu_leaves_the_runtime_on_pillow(monkeypatch, caplog):
         raise GpuPreprocessingUnavailableError("CUDA 를 사용할 수 없습니다.")
 
     monkeypatch.setattr(config, "GPU_PREPROCESSING", True)
-    monkeypatch.setattr(runtime, "GpuJpegDecoder", unavailable)
+    monkeypatch.setattr(inference, "GpuJpegDecoder", unavailable)
 
-    with caplog.at_level(logging.WARNING, logger="app.body_image_validation.runtime"):
-        assert runtime.build_gpu_preprocessor() is None
+    with caplog.at_level(logging.WARNING, logger="app.body_image_validation.inference"):
+        assert inference.build_gpu_preprocessor() is None
     assert "using Pillow only" in caplog.text
 
 
 def test_enabled_gpu_is_passed_to_the_service(monkeypatch):
     monkeypatch.setattr(config, "GPU_PREPROCESSING", True)
-    monkeypatch.setattr(runtime, "GpuJpegDecoder", FakeDecoder)
+    monkeypatch.setattr(inference, "GpuJpegDecoder", FakeDecoder)
 
-    preprocessor = runtime.build_gpu_preprocessor()
+    preprocessor = inference.build_gpu_preprocessor()
 
     assert isinstance(preprocessor, GpuImagePreprocessor)

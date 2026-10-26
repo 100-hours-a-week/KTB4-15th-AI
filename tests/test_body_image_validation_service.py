@@ -457,3 +457,67 @@ def test_processing_image_stays_open_until_encoding_and_is_closed_by_validate(
     assert is_closed(opened_images["decoded"][0])
     assert all(is_closed(image) for image in remover.results)
     assert (target.limiter.running, target.limiter.waiting) == (0, 0)
+
+
+# --- 진단: 단계별 처리 시간 로그 ---
+
+
+def _diagnostic_service(diagnostics):
+    from app.body_image_validation.service import BodyImageValidationService
+
+    return BodyImageValidationService(
+        FakePersonDetector(), FakePoseDetector(), FakeBackgroundRemover(), FakeStorage(),
+        diagnostics=diagnostics,
+    )
+
+
+def _diag_jpeg():
+    from io import BytesIO
+
+    from PIL import Image
+
+    output = BytesIO()
+    Image.new("RGB", (600, 800), (180, 170, 160)).save(output, format="JPEG")
+    return output.getvalue()
+
+
+def test_diagnostics_log_each_stage_without_changing_the_result(caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="app.body_image_validation.service"):
+        result = _diagnostic_service(True).validate(_diag_jpeg())
+
+    assert result.s3_key.startswith("body-images/")
+    [line] = [r.getMessage() for r in caplog.records if "body image validation timings" in r.getMessage()]
+    assert "outcome=success" in line
+    for stage in ("preprocess", "person", "pose", "brightness", "rembg", "png", "s3_upload", "total"):
+        assert f"'{stage}'" in line
+
+
+def test_diagnostics_log_the_failure_code_and_reraise(caplog):
+    import logging
+
+    import pytest
+
+    from app.body_image_validation.exceptions import UserImageValidationError
+
+    service = _diagnostic_service(True)
+    service.person_detector.detect = lambda image: []
+
+    with (
+        caplog.at_level(logging.INFO, logger="app.body_image_validation.service"),
+        pytest.raises(UserImageValidationError),
+    ):
+        service.validate(_diag_jpeg())
+
+    assert "outcome=PERSON_NOT_FOUND" in caplog.text
+    assert "'rembg'" not in caplog.text  # 배경 제거 전에 끝났다
+
+
+def test_diagnostics_are_off_by_default(caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="app.body_image_validation.service"):
+        _diagnostic_service(False).validate(_diag_jpeg())
+
+    assert "body image validation timings" not in caplog.text

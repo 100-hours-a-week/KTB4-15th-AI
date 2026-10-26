@@ -41,3 +41,4 @@ scripts/db/load_products.sql
 /tests/real_sqs_local/build_check/
 /tests/local_be_ai/
 /tests/real_sqs_local/
+/deploy/modal/README.md

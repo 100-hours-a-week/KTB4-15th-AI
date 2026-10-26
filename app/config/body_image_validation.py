@@ -56,6 +56,12 @@ REMBG_ENABLE_CPU_MEM_ARENA = os.getenv("REMBG_ENABLE_CPU_MEM_ARENA", "false").lo
 REMBG_PROVIDERS = tuple(
     name.strip() for name in os.getenv("BODY_IMAGE_REMBG_PROVIDERS", "").split(",") if name.strip()
 )
+# 진단(staging 검증용, 기본 꺼짐). 켜면 요청마다 단계별 처리 시간(ms)을 INFO 로그 한 줄로 남긴다.
+# API 응답은 바꾸지 않는다.
+DIAGNOSTICS = os.getenv("BODY_IMAGE_DIAGNOSTICS", "false").lower() == "true"
+# 0 보다 크면 rembg ONNX Runtime session 을 profiling 을 켜고 만들고, 이 횟수만큼 실행한 뒤 profiling 을 끝내
+# 실행별 provider(CUDA/CPU) 노드 수와 추론 시간을 로그로 남긴다. 그 뒤 실행은 profiling 하지 않는다(기본 0).
+REMBG_PROFILE_RUNS = int(os.getenv("BODY_IMAGE_REMBG_PROFILE_RUNS", "0"))
 
 PERSON_SCORE_THRESHOLD = float(os.getenv("PERSON_SCORE_THRESHOLD", "0.40"))
 PERSON_HEIGHT_RATIO_THRESHOLD = float(os.getenv("PERSON_HEIGHT_RATIO_THRESHOLD", "0.55"))

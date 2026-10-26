@@ -260,3 +260,124 @@ def test_rembg_providers_config(monkeypatch, value, expected):
     finally:
         monkeypatch.undo()
         importlib.reload(config)
+
+
+# --- 진단: rembg ONNX Runtime profiling ---
+
+
+def write_profile(tmp_path, events):
+    path = tmp_path / "profile.json"
+    path.write_text(__import__("json").dumps(events))
+    return str(path)
+
+
+def node(provider, dur):
+    return {"cat": "Node", "name": "Conv_kernel_time", "dur": dur, "args": {"provider": provider}}
+
+
+def model_run(dur):
+    return {"cat": "Session", "name": "model_run", "dur": dur}
+
+
+def test_profile_summary_splits_events_by_run_in_recorded_order(tmp_path):
+    from app.body_image_validation.background import summarize_ort_profile
+
+    events = [
+        {"cat": "Session", "name": "session_initialization", "dur": 5000},
+        node("CUDAExecutionProvider", 100), node("CUDAExecutionProvider", 200),
+        {"cat": "Node", "name": "Conv_fence_before", "dur": 1, "args": {}},  # provider 없는 이벤트는 세지 않는다
+        model_run(1500),
+        node("CUDAExecutionProvider", 50), node("CPUExecutionProvider", 30),
+        model_run(900),
+    ]
+
+    runs = summarize_ort_profile(write_profile(tmp_path, events))
+
+    assert runs == [
+        {"run": 1, "model_run_ms": 1.5, "nodes": {"CUDAExecutionProvider": 2},
+         "node_ms": {"CUDAExecutionProvider": 0.3}},
+        {"run": 2, "model_run_ms": 0.9, "nodes": {"CUDAExecutionProvider": 1, "CPUExecutionProvider": 1},
+         "node_ms": {"CUDAExecutionProvider": 0.05, "CPUExecutionProvider": 0.03}},
+    ]
+
+
+class _ProfilingSession:
+    def __init__(self, path):
+        self.path = path
+        self.ended = 0
+        self.inner_session = self
+
+    def end_profiling(self):
+        self.ended += 1
+        return self.path
+
+
+def test_profiling_ends_after_the_configured_runs_and_logs_the_summary(fake_rembg, tmp_path, caplog):
+    import logging
+
+    path = write_profile(tmp_path, [node("CUDAExecutionProvider", 10), model_run(20)])
+    session = _ProfilingSession(path)
+    fake_rembg.new_session = lambda name, model_path, sess_opts: session
+    remover = RembgBackgroundRemover("model.onnx", profile_runs=2)
+    image = Image.new("RGB", (8, 8))
+
+    with caplog.at_level(logging.INFO, logger="app.body_image_validation.background"):
+        remover.remove(image)
+        assert session.ended == 0
+        remover.remove(image)
+        remover.remove(image)  # 끝난 뒤에는 다시 끝내지 않는다
+
+    assert session.ended == 1
+    assert "rembg onnxruntime profile" in caplog.text and "CUDAExecutionProvider" in caplog.text
+    assert not Path(path).exists()  # profile 파일은 정리한다
+
+
+def test_profiling_is_off_by_default(fake_rembg):
+    RembgBackgroundRemover("model.onnx")
+
+    assert fake_rembg.sess_opts.enable_profiling is False
+
+
+def test_profiling_failure_does_not_fail_the_request(fake_rembg, caplog):
+    import logging
+
+    class Broken:
+        inner_session = None
+
+        def __init__(self):
+            self.inner_session = self
+
+        def end_profiling(self):
+            raise RuntimeError("profiler broke")
+
+    fake_rembg.new_session = lambda name, model_path, sess_opts: Broken()
+    remover = RembgBackgroundRemover("model.onnx", profile_runs=1)
+
+    with caplog.at_level(logging.WARNING, logger="app.body_image_validation.background"):
+        result = remover.remove(Image.new("RGB", (8, 8)))
+
+    assert result.mode == "RGBA"
+    assert "profiling summary failed" in caplog.text
+
+
+@pytest.mark.skipif(_rembg_model() is None, reason="u2netp.onnx 모델 파일이 없다")
+def test_real_session_profile_counts_nodes_per_run(monkeypatch, caplog):
+    import json
+    import logging
+    import re
+
+    model = _rembg_model()
+    monkeypatch.setenv("REMBG_HOME", str(model.parent))
+    remover = RembgBackgroundRemover(str(model), profile_runs=2)
+    image = Image.new("RGB", (64, 96), "white")
+
+    with caplog.at_level(logging.INFO, logger="app.body_image_validation.background"):
+        remover.remove(image)
+        remover.remove(image)
+
+    [line] = [r.getMessage() for r in caplog.records if "rembg onnxruntime profile" in r.getMessage()]
+    runs = json.loads(re.search(r"runs=(\[.*\]) parse_ms", line).group(1))
+    assert [run["run"] for run in runs] == [1, 2]
+    for run in runs:  # 로컬은 CPU provider 만 있다(Modal T4 에서는 CUDA 로 나와야 한다)
+        assert sum(run["nodes"].values()) > 0 and run["model_run_ms"] > 0
+    remover.remove(image)  # profiling 이 끝난 뒤에도 같은 session 으로 계속 동작한다
