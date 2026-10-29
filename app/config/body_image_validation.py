@@ -39,6 +39,23 @@ REMOTE_TIMEOUT_SECONDS = 120.0
 # redirect 를 따라가도 다시 시작하지 않고, 넘으면 재시도 없이 504 BODY_IMAGE_WORKER_TIMEOUT.
 # Modal 의 303 redirect(150초)보다 짧으므로 정상적으로는 303 을 받기 전에 끝난다.
 REMOTE_TOTAL_DEADLINE_SECONDS = 120.0
+# warm-up(worker 의 GET /health) 호출 시간 제한(초). 연결·전송·응답 대기·읽기 각 단계와 호출 전체에 같은 값을 쓴다.
+# 컨테이너가 0 이면 GPU 컨테이너 기동·snapshot 복원(enter hook)이 끝나야 응답이 오므로 그 시간까지 포함한다.
+# Modal 의 303 redirect(150초)보다 짧게 둔다. 90초는 초기 제안값이고 staging 실측 후 조정한다.
+WARMUP_TIMEOUT_SECONDS = 90.0
+# warm-up 성공(호출 완료 시점)부터 이 시간(초) 동안은 다시 부르지 않는다. Modal scaledown_window(30초)보다 짧게 둔다.
+# 이 시간 안이라도 컨테이너가 살아 있다는 보장은 아니다(다른 요청이 없으면 마지막 input 뒤 30초에 내려간다).
+WARMUP_COOLDOWN_SECONDS = 20.0
+# warm-up 실패(호출 완료 시점) 뒤 다시 부를 수 있을 때까지의 최소 간격(초). 그 전 요청은 RATE_LIMITED.
+WARMUP_MIN_RETRY_INTERVAL_SECONDS = 10.0
+# 시간 초과(NETWORK_TIMEOUT·DEADLINE_EXCEEDED) 뒤의 최소 간격(초). 연결을 끊어도 Modal input 은 계속 진행되므로
+# 일반 실패보다 길게 둔다. Modal 쪽 중복 실행을 완전히 막지는 못한다. staging 실측 후 조정한다.
+WARMUP_TIMEOUT_RETRY_INTERVAL_SECONDS = 30.0
+# 프로세스 전체에서 WARMUP_START_WINDOW_SECONDS 동안 새로 시작할 수 있는 warm-up 호출 수. 넘으면 RATE_LIMITED.
+# 성공만 이어지면 cooldown(20초) 때문에 60초에 3번을 넘지 않아 닿지 않는다. 빠른 실패(401 등)가 이어지면
+# 재시도 간격(10초)만으로는 60초에 6번이라 이 상한(4번)이 걸린다. 사용자별 제한은 Backend 몫이다.
+WARMUP_MAX_STARTS_PER_WINDOW = 4
+WARMUP_START_WINDOW_SECONDS = 60.0
 # 무거운 검증(모델 추론·rembg)의 프로세스 내 동시 실행 수와 대기 수. 넘치면 즉시 429.
 MAX_CONCURRENT_BODY_VALIDATIONS = int(os.getenv("MAX_CONCURRENT_BODY_VALIDATIONS", "1"))
 MAX_WAITING_BODY_VALIDATIONS = int(os.getenv("MAX_WAITING_BODY_VALIDATIONS", "1"))
