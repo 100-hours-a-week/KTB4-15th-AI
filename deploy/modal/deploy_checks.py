@@ -296,6 +296,9 @@ LOG_LINE = re.compile(r"^(?P<ts>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d[+-]\d\d:\d\d) (?P
 INIT_FAILURE_MARKER = "Runner failed with exception"  # enter hook 등 사용자 코드 예외
 # Modal 이 snapshot 을 만들다 실패했다(2026-10-25 L4 실측). 이어서 Runner killed 가 오기도, 로그가 끊기기도 한다.
 SNAPSHOT_FAILURE_MARKER = "Failed creating Function memory snapshot"
+# Modal 이 snapshot 복원에 실패했다(2026-10-30 T4 실측: "Transient snapshot error: failed to restore container from
+# snapshot with exit code 137. Will retry with no snapshots."). 같은 컨테이너가 snapshot 없이 다시 초기화한다.
+_RESTORE_FAILURE = re.compile(r"Transient snapshot error|failed to restore container from snapshot")
 # 프로세스가 신호로 죽었다. 원인(메모리·snapshot·기타)은 이 줄만으로 알 수 없다.
 _RUNNER_KILLED = re.compile(r"Runner killed \((?P<signal>\w+)\), exit code: (?P<code>\d+)")
 _GPU_NAME = re.compile(r"snap=True done .* gpu=(?P<gpu>.+?) warmup_ms=")
@@ -312,11 +315,13 @@ class ContainerLog:
     creating_gpu: bool = False
     creating_cpu: bool = False
     restoring: bool = False
+    restore_error: str | None = None  # 복원 실패 줄(이 줄 뒤의 snap=True·runtime=ready 는 재초기화 결과다)
     init_failures: list[str] = field(default_factory=list)
     snapshot_failed: bool = False
     runner_killed: str | None = None  # 예: "SIGKILL exit 137"
     stage_ok: bool = False
     gpu_name: str | None = None
+    snap_true_done: bool = False
     runtime_ready: bool = False
     requests: list[tuple[str, str, int]] = field(default_factory=list)
     request_times: dict[str, dict[str, float]] = field(default_factory=dict)
@@ -343,6 +348,10 @@ def summarize_logs(lines: list[str], since: datetime) -> dict[str, ContainerLog]
             log.creating_cpu = True
         elif "Restoring Function from memory snapshot" in msg:
             log.restoring = True
+        if _RESTORE_FAILURE.search(msg):
+            log.restore_error = msg[:200]
+            # 실패 앞의 준비 완료 표시는 버린다. 재초기화가 끝났는지는 이 줄 뒤의 로그로만 본다.
+            log.snap_true_done = log.runtime_ready = False
         if INIT_FAILURE_MARKER in msg:
             log.init_failures.append(msg.split(INIT_FAILURE_MARKER, 1)[1].strip(": ")[:200])
         if SNAPSHOT_FAILURE_MARKER in msg:
@@ -351,6 +360,8 @@ def summarize_logs(lines: list[str], since: datetime) -> dict[str, ContainerLog]
             log.runner_killed = f"{killed['signal']} exit {killed['code']}"
         if "lifecycle: stage=staging gpu_snapshot=True" in msg:
             log.stage_ok = True
+        if "snap=True done" in msg:
+            log.snap_true_done = True
         if (gpu := _GPU_NAME.search(msg)) and gpu["gpu"] != "None":
             log.gpu_name = gpu["gpu"]
         if "snap=False done" in msg and "runtime=ready" in msg:
@@ -390,6 +401,8 @@ def startup_failures(containers: dict[str, ContainerLog]) -> list[dict]:
             kind, detail = "runner_killed", f"runner killed ({c.runner_killed}), cause not confirmed by other logs"
         else:
             continue
+        if c.restore_error:
+            detail += " (snapshot 복원 실패 뒤 재초기화 중)"
         failures.append({"kind": kind, "container": c.container, "detail": detail})
     return failures
 
@@ -415,10 +428,58 @@ def _served(containers, method: str, path: str) -> ContainerLog | None:
     return None
 
 
+def snapshot_state(log: ContainerLog) -> tuple[str, str]:
+    """한 컨테이너의 snapshot 상태와 이유. 그 컨테이너의 줄만 본다(다른 컨테이너 줄은 summarize_logs 가 나눈다).
+
+    - snapshot_creation_failed: `Failed creating Function memory snapshot` 이 있다.
+    - restore_failed_fallback: 복원 시도 → 복원 오류(Transient snapshot error) → 그 뒤 runtime=ready.
+      Modal 이 snapshot 없이 다시 초기화해 성공한 경우다. 복원 오류가 있으면 HIT 보다 이 판정이 먼저다.
+    - snapshot_hit: 복원 시도, 복원 오류 없음, snap=True 재실행 없음, runtime=ready.
+    - snapshot_miss: GPU snapshot 을 새로 만들고(처음이든 다시든) snap=True(GPU 이름)·runtime=ready 까지 끝났다.
+    그 밖에 init_failure(Runner failed/killed), snapshot_disabled(복원·GPU snapshot 생성 표시 없음),
+    incomplete(판정에 필요한 줄이 없음). 줄이 모자라면 정상 상태로 추측하지 않는다.
+    """
+    name = f"container={log.container}"
+    if log.snapshot_failed:
+        return "snapshot_creation_failed", f"{name} Failed creating Function memory snapshot (gpu={log.gpu_name})"
+    if log.init_failures or log.runner_killed:
+        cause = log.init_failures[0] if log.init_failures else f"runner killed ({log.runner_killed})"
+        after = " (snapshot 복원 실패 뒤 재초기화 중)" if log.restore_error else ""
+        return "init_failure", f"{name} {cause}{after}"
+    if log.restore_error:
+        if not log.restoring:
+            return "incomplete", f"{name} 복원 오류가 있지만 'Restoring Function from memory snapshot' 이 없습니다"
+        if not log.runtime_ready:
+            return "incomplete", f"{name} 복원 실패 뒤 재초기화 완료(runtime=ready) 로그가 없습니다"
+        return "restore_failed_fallback", f"{name} snapshot 복원 실패 후 snapshot 없이 재초기화: {log.restore_error}"
+    if log.restoring:
+        if log.snap_true_done:
+            return "incomplete", f"{name} 복원 표시 뒤 snap=True 가 다시 실행됐지만 복원 오류 로그가 없습니다"
+        if not log.runtime_ready:
+            return "incomplete", f"{name} 복원 뒤 runtime=ready 로그가 없습니다"
+        return "snapshot_hit", name
+    if log.creating_cpu or not log.creating_gpu:
+        return "snapshot_disabled", f"{name} 에 Restoring/Creating GPU snapshot 이 없습니다"
+    missing = [n for n, ok in (("gpu name", log.gpu_name), ("runtime ready", log.runtime_ready)) if not ok]
+    if missing:
+        return "incomplete", f"{name} snapshot 생성 lifecycle 로그 누락: {missing}"
+    return "snapshot_miss", f"{name} gpu={log.gpu_name} (새 snapshot 을 만들었다)"
+
+
+# judge_* 가 돌려주던 이름은 그대로 둔다(smoke 보고서·호출처 호환).
+_JUDGE_STATUS = {"snapshot_hit": "hit", "snapshot_miss": "miss", "snapshot_creation_failed": "snapshot_failed"}
+
+
+def _note_other_restore_failures(containers, served: ContainerLog, reason: str) -> str:
+    """응답한 컨테이너만 판정하되, 같은 구간의 다른 컨테이너 복원 실패는 이유에 남긴다(숨기지 않는다)."""
+    others = [c.container for c in containers.values() if c is not served and c.restore_error]
+    return f"{reason}; 다른 컨테이너의 snapshot 복원 실패: {others}" if others else reason
+
+
 def judge_warmup(containers: dict[str, ContainerLog]) -> tuple[str, str]:
     """/health 로 snapshot 이 만들어졌는지.
 
-    ("ok"|"snapshot_failed"|"init_failure"|"snapshot_disabled"|"incomplete", 이유).
+    ("ok"|"restore_failed_fallback"|"snapshot_failed"|"init_failure"|"snapshot_disabled"|"incomplete", 이유).
     """
     if failed := _failure_status(containers):
         # 실패 뒤 다른 컨테이너가 snapshot 없이 200 을 내도(Modal 재시도) 성공으로 보지 않는다.
@@ -426,34 +487,30 @@ def judge_warmup(containers: dict[str, ContainerLog]) -> tuple[str, str]:
     served = _served(containers, "GET", "/health")
     if served is None:
         return "incomplete", "GET /health 200 로그가 없습니다"
-    if served.restoring and served.stage_ok and served.runtime_ready:
+    state, reason = snapshot_state(served)
+    if state in ("snapshot_hit", "snapshot_miss", "restore_failed_fallback") and not served.stage_ok:
+        return "incomplete", f"container={served.container} lifecycle 로그 누락: ['stage']"
+    if state == "snapshot_hit":
         # 이미 이 배포의 snapshot 이 있어 복원됐다(다시 실행한 경우). snap=True 로그(GPU 이름)는 없다.
-        return "ok", f"container={served.container} snapshot already prepared (restored)"
-    if served.creating_cpu or not served.creating_gpu:
-        return "snapshot_disabled", "health 컨테이너에 'Creating GPU memory snapshot' 이 없습니다"
-    missing = [name for name, ok in (("stage", served.stage_ok), ("gpu name", served.gpu_name),
-                                      ("runtime ready", served.runtime_ready)) if not ok]
-    if missing:
-        return "incomplete", f"lifecycle 로그 누락: {missing}"
-    return "ok", f"container={served.container} gpu={served.gpu_name}"
+        reason, state = f"container={served.container} snapshot already prepared (restored)", "ok"
+    elif state == "snapshot_miss":
+        reason, state = f"container={served.container} gpu={served.gpu_name}", "ok"
+    return _JUDGE_STATUS.get(state, state), _note_other_restore_failures(containers, served, reason)
 
 
 def judge_validation(containers: dict[str, ContainerLog]) -> tuple[str, str]:
-    """검증 요청을 처리한 컨테이너가 snapshot 에서 복원됐는지.
+    """검증 요청을 처리한 컨테이너가 snapshot 에서 복원됐는지(snapshot_state 를 기존 이름으로 돌려준다).
 
-    ("hit"|"miss"|"snapshot_failed"|"init_failure"|"snapshot_disabled"|"incomplete", 이유). miss 는 snapshot 을 새로
-    만들었지만 실패하지 않은 경우다(정상 MISS).
+    ("hit"|"miss"|"restore_failed_fallback"|"snapshot_failed"|"init_failure"|"snapshot_disabled"|"incomplete", 이유).
+    miss 는 snapshot 을 새로 만들었지만 실패하지 않은 경우다(정상 MISS). restore_failed_fallback 은 HIT 가 아니다.
     """
     if failed := _failure_status(containers):
         return failed
     served = _served(containers, "POST", "/api/v1/validation/body-image")
     if served is None:
         return "incomplete", "POST 200 로그가 없습니다"
-    if served.restoring:
-        return "hit", f"container={served.container}"
-    if served.creating_gpu:
-        return "miss", f"container={served.container} (새 snapshot 을 만들었다)"
-    return "snapshot_disabled", f"container={served.container} 에 Restoring/Creating GPU snapshot 이 없습니다"
+    state, reason = snapshot_state(served)
+    return _JUDGE_STATUS.get(state, state), _note_other_restore_failures(containers, served, reason)
 
 
 def cuda_check(containers: dict[str, ContainerLog]) -> tuple[bool | None, str]:
@@ -530,7 +587,7 @@ class SmokeLimits:
     max_snapshot_failures: int = 1  # snapshot 생성 실패는 치명적이라 이만큼(기본 1번) 보이면 바로 멈춘다
     scaledown_timeout_s: float = 180
     validation_timeout_s: float = 120
-    max_miss_retries: int = 2  # 일시적 MISS 로 보고 다시 확인할 횟수(이후에도 HIT 가 없으면 실패)
+    max_miss_retries: int = 2  # 일시적 MISS·복원 실패 fallback 으로 보고 다시 확인할 횟수(이후에도 HIT 가 없으면 실패)
     poll_interval_s: float = 5
     log_settle_s: float = 6  # 응답 직후 로그가 모일 때까지 기다리는 시간
 
@@ -653,7 +710,8 @@ def smoke(ops, app_name: str, credentials: dict, image_path: Path, limits: Smoke
     report["snapshot_creation"] = {"status": status, "reason": reason}
     if status == "snapshot_failed":
         raise SmokeFailure("snapshot", reason)
-    if response.status_code != 200 or status != "ok":
+    # restore_failed_fallback: 복원할 snapshot 은 있었다. 쓸 수 있는지는 아래 검증 요청의 HIT 로 확인한다.
+    if response.status_code != 200 or status not in ("ok", "restore_failed_fallback"):
         raise SmokeFailure("warmup", f"health={response.status_code} snapshot={status}: {reason}")
 
     body = image_path.read_bytes()
@@ -688,9 +746,11 @@ def smoke(ops, app_name: str, credentials: dict, image_path: Path, limits: Smoke
             raise SmokeFailure("cuda", cuda_detail)
         if status == "hit":
             break
+        # miss·restore_failed_fallback 은 일시적일 수 있어 다시 확인한다.
     report["validation"] = attempts
     if attempts[-1]["snapshot"] != "hit":
-        raise SmokeFailure("restore", f"{len(attempts)}번 모두 MISS 입니다(장기 HIT 율 문제인지 확인 필요)")
+        statuses = [a["snapshot"] for a in attempts]
+        raise SmokeFailure("restore", f"{len(attempts)}번 모두 HIT 가 아닙니다 {statuses}(장기 HIT 율 문제인지 확인 필요)")
 
     key = (response.json().get("data") or {}).get("s3_key")
     if not key:

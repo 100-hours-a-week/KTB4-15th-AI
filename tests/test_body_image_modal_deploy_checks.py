@@ -46,12 +46,51 @@ VALIDATION_HIT = """\
 2026-10-25 18:37:17+09:00 ta-01M5S6QKJGMY9TS6F0MW2B6X9R    POST /api/v1/validation/body-image -> 200 OK  (duration: 7.37 s, execution: 2.71 s)
 """.splitlines()
 
-# 4-A: 검증 요청이 새 snapshot 을 만든 경우(MISS)
+# 5단계 A0(2026-10-30 T4): 배포 뒤 첫 검증 요청이 snapshot 을 처음 만든 경우(MISS). 현재 lifecycle 로그 형식.
+# (4-A 의 옛 fixture 는 snap=True·runtime=ready 줄이 없어 이제 incomplete 로 판정된다.)
 VALIDATION_MISS = """\
-2026-10-25 18:11:46+09:00 ta-01M5S591CYFJ5A0FBE1RWKTEVR Creating GPU memory snapshot for Function.
-2026-10-25 18:11:48+09:00 ta-01M5S591CYFJ5A0FBE1RWKTEVR body image worker lifecycle: stage=staging gpu_snapshot=True gpu=T4
-2026-10-25 18:12:04+09:00 ta-01M5S591CYFJ5A0FBE1RWKTEVR    POST /api/v1/validation/body-image -> 200 OK  (duration: 23.6 s, execution: 2.29 s)
+2026-10-30 09:07:14+09:00 ta-01M6523JZA17Q90AJ6H2H6ZJWR Creating GPU memory snapshot for Function.
+2026-10-30 09:07:17+09:00 ta-01M6523JZA17Q90AJ6H2H6ZJWR body image worker lifecycle: stage=staging gpu_snapshot=True
+2026-10-30 09:07:28+09:00 ta-01M6523JZA17Q90AJ6H2H6ZJWR body image worker lifecycle: snap=True done start=1793318837.403 end=1793318848.776 gpu_snapshot=True gpu=Tesla T4 warmup_ms={'preprocess': 132.8, 'person_pose': 59.4, 'rembg': 1098.6, 'png': 73.5}
+2026-10-30 09:07:30+09:00 ta-01M6523JZA17Q90AJ6H2H6ZJWR body image worker lifecycle: stage=staging gpu_snapshot=True
+2026-10-30 09:07:30+09:00 ta-01M6523JZA17Q90AJ6H2H6ZJWR body image worker lifecycle: snap=False done start=1793318850.493 end=1793318850.796 runtime=ready warmup_ms={'preprocess': 132.8, 'person_pose': 59.4, 'rembg': 1098.6, 'png': 73.5}
+2026-10-30 09:07:33+09:00 ta-01M6523JZA17Q90AJ6H2H6ZJWR    POST /api/v1/validation/body-image -> 200 OK  (duration: 20.6 s, execution: 2.20 s)
 """.splitlines()
+
+# 5단계 A1: 컨테이너 0 뒤 검증 요청이 GPU snapshot 에서 복원(HIT).
+RESTORED_A1 = """\
+2026-10-30 09:08:58+09:00 ta-01M6526R9X0STAYGBHZM5KT38R Restoring Function from memory snapshot.
+2026-10-30 09:09:01+09:00 ta-01M6526R9X0STAYGBHZM5KT38R body image worker lifecycle: stage=staging gpu_snapshot=True
+2026-10-30 09:09:01+09:00 ta-01M6526R9X0STAYGBHZM5KT38R body image worker lifecycle: snap=False done start=1793318941.298 end=1793318941.665 runtime=ready warmup_ms={'preprocess': 132.8, 'person_pose': 59.4, 'rembg': 1098.6, 'png': 73.5}
+2026-10-30 09:09:05+09:00 ta-01M6526R9X0STAYGBHZM5KT38R    POST /api/v1/validation/body-image -> 200 OK  (duration: 8.74 s, execution: 2.75 s)
+""".splitlines()
+
+# 5단계 B1: A1~A3 에서 복원되던 snapshot 이 있는데도 /health 컨테이너가 snapshot 을 다시 만들었다(재생성 MISS).
+RECREATED_B1 = """\
+2026-10-30 09:10:51+09:00 ta-01M652A69TT0CATRSX2RY93P0R Creating GPU memory snapshot for Function.
+2026-10-30 09:10:54+09:00 ta-01M652A69TT0CATRSX2RY93P0R body image worker lifecycle: stage=staging gpu_snapshot=True
+2026-10-30 09:11:07+09:00 ta-01M652A69TT0CATRSX2RY93P0R body image worker lifecycle: snap=True done start=1793319054.808 end=1793319067.097 gpu_snapshot=True gpu=Tesla T4 warmup_ms={'preprocess': 125.4, 'person_pose': 101.3, 'rembg': 1233.7, 'png': 83.0}
+2026-10-30 09:11:09+09:00 ta-01M652A69TT0CATRSX2RY93P0R body image worker lifecycle: stage=staging gpu_snapshot=True
+2026-10-30 09:11:09+09:00 ta-01M652A69TT0CATRSX2RY93P0R body image worker lifecycle: snap=False done start=1793319069.245 end=1793319069.728 runtime=ready warmup_ms={'preprocess': 125.4, 'person_pose': 101.3, 'rembg': 1233.7, 'png': 83.0}
+2026-10-30 09:11:10+09:00 ta-01M652A69TT0CATRSX2RY93P0R     GET /health -> 200 OK  (duration: 51.6 s, execution: 269.5 ms)
+2026-10-30 09:11:14+09:00 ta-01M652A69TT0CATRSX2RY93P0R    POST /api/v1/validation/body-image -> 200 OK  (duration: 3.05 s, execution: 2.78 s)
+""".splitlines()
+
+# 5단계 SH: 복원 시도 → Transient snapshot error(exit 137) → 같은 컨테이너가 snapshot 없이 재초기화 → /health·검증 200.
+# 기존 판정은 'Restoring' 줄만 보고 HIT 로 잘못 분류했다.
+SH_RESTORE_FALLBACK = """\
+2026-10-30 09:23:02+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR Restoring Function from memory snapshot.
+2026-10-30 09:23:03+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR Transient snapshot error: failed to restore container from snapshot with exit code 137. Will retry with no snapshots.
+2026-10-30 09:23:05+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR body image worker lifecycle: stage=staging gpu_snapshot=True
+2026-10-30 09:23:12+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR WARNING: Logging before InitGoogle() is written to STDERR
+2026-10-30 09:23:13+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR body image worker lifecycle: snap=True done start=1793319785.772 end=1793319793.937 gpu_snapshot=True gpu=Tesla T4 warmup_ms={'preprocess': 77.3, 'person_pose': 55.4, 'rembg': 713.4, 'png': 72.6}
+2026-10-30 09:23:13+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR body image worker lifecycle: stage=staging gpu_snapshot=True
+2026-10-30 09:23:14+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR body image worker lifecycle: snap=False done start=1793319793.938 end=1793319794.210 runtime=ready warmup_ms={'preprocess': 77.3, 'person_pose': 55.4, 'rembg': 713.4, 'png': 72.6}
+2026-10-30 09:23:14+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR     GET /health -> 200 OK  (duration: 14.3 s, execution: 95.3 ms)
+2026-10-30 09:23:18+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR    POST /api/v1/validation/body-image -> 200 OK  (duration: 2.99 s, execution: 2.90 s)
+""".splitlines()
+SH_CONTAINER = "ta-01M6530G7TAJPWTWD0BQVRVCAR"
+SINCE_1030 = datetime(2026, 10, 30, 0, 0, tzinfo=UTC)  # 09:00 KST
 
 # 4-C v5: GPU snapshot 옵션 누락 → 1회차 실패, Modal 이 snapshot 없이 다시 띄워 /health 200
 SNAPSHOT_OPTION_MISSING = """\
@@ -476,6 +515,139 @@ def test_miss_retries_and_limits_are_unchanged():
 
     assert (limits.max_miss_retries, limits.health_timeout_s, limits.validation_timeout_s) == (2, 150, 120)
     assert (limits.max_init_failures, limits.max_snapshot_failures) == (2, 1)
+
+
+# --- snapshot 상태 4분류 (5단계 Staging 실측 로그) ---
+
+
+def states(lines, since=SINCE_1030):
+    return {c: dc.snapshot_state(log)[0] for c, log in dc.summarize_logs(lines, since).items()}
+
+
+def without(lines, *markers):
+    return [line for line in lines if not any(marker in line for marker in markers)]
+
+
+def test_a_real_gpu_snapshot_restore_is_a_hit():
+    assert states(RESTORED_A1) == {"ta-01M6526R9X0STAYGBHZM5KT38R": "snapshot_hit"}
+    assert dc.judge_validation(dc.summarize_logs(RESTORED_A1, SINCE_1030))[0] == "hit"
+
+
+def test_the_first_snapshot_creation_is_a_miss():
+    assert states(VALIDATION_MISS) == {"ta-01M6523JZA17Q90AJ6H2H6ZJWR": "snapshot_miss"}
+
+
+def test_recreating_an_existing_snapshot_is_a_miss():
+    # A1 의 복원 컨테이너는 측정 구간(09:10 KST) 전에 로그를 남겼으므로 판정에서 빠진다.
+    containers = dc.summarize_logs(RESTORED_A1 + RECREATED_B1, datetime(2026, 10, 30, 0, 10, tzinfo=UTC))
+
+    assert {c: dc.snapshot_state(log)[0] for c, log in containers.items()} == {
+        "ta-01M652A69TT0CATRSX2RY93P0R": "snapshot_miss"}
+    assert dc.judge_warmup(containers)[0] == "ok"
+    assert dc.judge_validation(containers)[0] == "miss"
+
+
+def test_sh_restore_failure_then_reinit_is_a_fallback_not_a_hit():
+    # 회귀: 기존 로직은 'Restoring' 줄만 보고 hit 로 판정했다.
+    containers = dc.summarize_logs(SH_RESTORE_FALLBACK, SINCE_1030)
+
+    state, reason = dc.snapshot_state(containers[SH_CONTAINER])
+    assert state == "restore_failed_fallback" and "exit code 137" in reason
+    assert dc.judge_validation(containers)[0] == "restore_failed_fallback"
+    assert dc.judge_warmup(containers)[0] == "restore_failed_fallback"
+    assert dc.startup_failures(containers) == []  # Modal 이 스스로 복구했다(시작 실패가 아니다)
+
+
+def test_snapshot_creation_failure_is_its_own_state():
+    assert states(L4_SNAPSHOT_FAILURE, SINCE) == {"ta-01M5SK7F6GBYGG8XZJXK6AXZ9R": "snapshot_creation_failed"}
+    assert dc.judge_validation(dc.summarize_logs(LIST_L4_REQUEST, SINCE))[0] == "snapshot_failed"
+
+
+@pytest.mark.parametrize(
+    "failure_line",
+    [
+        f"2026-10-30 09:23:10+09:00 {SH_CONTAINER} Runner failed with exception: RuntimeError('model load failed')",
+        f"2026-10-30 09:23:10+09:00 {SH_CONTAINER} Runner killed (SIGKILL), exit code: 137.",
+    ],
+)
+def test_a_failed_reinit_after_a_restore_failure_is_not_a_fallback(failure_line):
+    lines = SH_RESTORE_FALLBACK[:3] + [failure_line]
+    containers = dc.summarize_logs(lines, SINCE_1030)
+
+    state, reason = dc.snapshot_state(containers[SH_CONTAINER])
+    assert state == "init_failure" and "복원 실패 뒤" in reason
+    [failure] = dc.startup_failures(containers)
+    assert "복원 실패 뒤" in failure["detail"]
+    # 재초기화가 실패했다면 뒤에 다른 컨테이너가 200 을 내도 정상으로 보지 않는다.
+    retried = [line.replace(SH_CONTAINER, "ta-01M6530RETRY0000000000000R") for line in SH_RESTORE_FALLBACK[2:]]
+    assert dc.judge_validation(dc.summarize_logs(lines + retried, SINCE_1030))[0] == "init_failure"
+
+
+def test_restore_error_and_readiness_from_different_containers_are_not_combined():
+    other = "ta-01M6530OTHER000000000000R"
+    # X 는 복원 실패만, Y 는 (복원 표시 없이) 준비 완료·200 만 남겼다. 합쳐서 fallback 으로 보지 않는다.
+    mixed = SH_RESTORE_FALLBACK[:2] + [line.replace(SH_CONTAINER, other) for line in SH_RESTORE_FALLBACK[2:]]
+    containers = dc.summarize_logs(mixed, SINCE_1030)
+
+    assert states(mixed) == {SH_CONTAINER: "incomplete", other: "snapshot_disabled"}
+    status, reason = dc.judge_validation(containers)
+    assert status == "snapshot_disabled" and SH_CONTAINER in reason  # 다른 컨테이너의 복원 실패도 이유에 남긴다
+
+
+def test_a_clean_restore_is_still_a_hit_next_to_another_containers_restore_failure():
+    lines = SH_RESTORE_FALLBACK[:2] + RESTORED_A1
+
+    status, reason = dc.judge_validation(dc.summarize_logs(lines, SINCE_1030))
+
+    assert status == "hit" and f"복원 실패: ['{SH_CONTAINER}']" in reason
+
+
+@pytest.mark.parametrize(
+    ("lines", "removed"),
+    [
+        (SH_RESTORE_FALLBACK, ("Transient snapshot error",)),  # 오류 줄이 빠지면 hit 로 추측하지 않는다
+        (SH_RESTORE_FALLBACK, ("runtime=ready",)),  # 재초기화 완료를 확인할 수 없다
+        (SH_RESTORE_FALLBACK, ("Restoring Function",)),  # 복원 시도를 확인할 수 없다
+        (RESTORED_A1, ("runtime=ready",)),  # 복원 뒤 준비 완료를 확인할 수 없다
+        (VALIDATION_MISS, ("snap=True done", "snap=False done")),  # 4-A 의 옛 형식처럼 lifecycle 줄이 없다
+        (VALIDATION_MISS, ("runtime=ready",)),
+    ],
+)
+def test_missing_lines_never_produce_a_normal_state(lines, removed):
+    partial = without(lines, *removed)
+
+    assert set(states(partial).values()) == {"incomplete"}
+    assert dc.judge_validation(dc.summarize_logs(partial, SINCE_1030))[0] == "incomplete"
+
+
+def test_readiness_logged_before_a_restore_error_does_not_count():
+    # 복원 오류 앞에 찍힌 준비 완료 줄은 재초기화 결과가 아니다.
+    ready = next(line for line in SH_RESTORE_FALLBACK if "runtime=ready" in line).replace("09:23:14", "09:23:02")
+    lines = [SH_RESTORE_FALLBACK[0], ready, SH_RESTORE_FALLBACK[1], SH_RESTORE_FALLBACK[-1]]
+
+    assert states(lines) == {SH_CONTAINER: "incomplete"}
+
+
+def test_smoke_retries_after_a_restore_fallback_and_then_passes(tmp_path):
+    report = run_smoke(FakeOps([WARMUP_OK, SH_RESTORE_FALLBACK, VALIDATION_HIT]), FakeHttp, tmp_path)
+
+    assert report["result"] == "PASS"
+    assert [a["snapshot"] for a in report["validation"]] == ["restore_failed_fallback", "hit"]
+
+
+def test_smoke_continues_when_the_health_container_fell_back(tmp_path):
+    # /health 가 fallback 이면 snapshot 은 있었다. 쓸 수 있는지는 검증 요청의 HIT 로 확인한다.
+    report = run_smoke(FakeOps([SH_RESTORE_FALLBACK, VALIDATION_HIT]), FakeHttp, tmp_path)
+
+    assert report["snapshot_creation"]["status"] == "restore_failed_fallback"
+    assert report["result"] == "PASS"
+
+
+def test_smoke_fails_when_every_attempt_falls_back(tmp_path):
+    with pytest.raises(dc.SmokeFailure) as failure:
+        run_smoke(FakeOps([WARMUP_OK, SH_RESTORE_FALLBACK]), FakeHttp, tmp_path)
+
+    assert failure.value.stage == "restore" and "restore_failed_fallback" in failure.value.reason
 
 
 # --- production preflight (읽기 전용. production 은 deploy 하지 않는다) ---
