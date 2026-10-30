@@ -14,14 +14,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 WORKER_FILE = Path(__file__).resolve().parent / "body_image_worker.py"
-DOTENV_FILE = Path(__file__).resolve().parents[2] / ".env"  # modal deploy 는 읽지 않는다. 충돌 검사만 한다
-# 기대 이름. 배포 파일의 DEPLOY_TARGETS 와 따로 적어 두고 비교한다(같은 표를 읽으면 검사가 되지 않는다).
+DOTENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 APP_NAMES = {"production": "lookddak-body-image-worker", "staging": "lookddak-body-image-worker-staging"}
 LABELS = {"production": "lookddak-body-image", "staging": "lookddak-body-image-staging"}
 SECRET_NAMES = {"production": "lookddak-body-image-worker", "staging": "lookddak-body-image-worker-staging"}
-PRODUCTION_WORKSPACE = "lookddak"  # production 은 이 Workspace 에만 배포한다
+PRODUCTION_WORKSPACE = "lookddak" 
 EXPECTED_GPU = "T4"
-# 팀 Workspace. 여기서는 smoke 의 자동 rollback/stop 을 하지 않는다(사람이 판단한다).
 PROTECTED_WORKSPACES = frozenset({"lookddak"})
 REQUIRED_SECRET_KEYS = ("INTERNAL_API_KEY", "S3_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
 STAGING_BUCKET_PREFIX = "lookddak-dev-images"
