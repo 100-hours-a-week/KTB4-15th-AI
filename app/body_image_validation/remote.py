@@ -4,7 +4,9 @@ import http.cookiejar
 import json
 import logging
 import time
+import uuid
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 
 import httpx
 from anyio import to_thread
@@ -12,7 +14,7 @@ from anyio import to_thread
 from app.body_image_validation import deadline as worker_deadline
 from app.body_image_validation.async_concurrency import AsyncBodyValidationLimiter
 from app.body_image_validation.concurrency import SlotWaitTimeout
-from app.body_image_validation.exceptions import BodyImageValidationError
+from app.body_image_validation.exceptions import BodyImageValidationError, ServerBusyError
 from app.body_image_validation.image_io import open_image
 from app.body_image_validation.models import BodyImageValidationResult
 
@@ -32,6 +34,26 @@ _CONTENT_TYPES = {"JPEG": ("image/jpeg", "jpg"), "PNG": ("image/png", "png")}
 MODAL_REDIRECT_AFTER_SECONDS = 150
 # 한 요청에서 따라갈 303 의 최대 횟수(Modal 결과 조회 polling 포함). deadline 이 먼저 끝나는 것이 보통이다.
 MAX_REDIRECTS = 5
+# 로그에 남기는 HTTP 실패 원인. 예외 원문에는 URL·헤더가 들어갈 수 있어 남기지 않고 이 이름만 남긴다.
+# 뒤의 두 항목은 위 목록에 없는 httpx 예외를 받는다(type(error).__mro__ 순서로 찾는다).
+_ERROR_TYPES = {
+    httpx.ConnectTimeout: "connect_timeout",
+    httpx.ReadTimeout: "read_timeout",
+    httpx.WriteTimeout: "write_timeout",
+    httpx.PoolTimeout: "pool_timeout",
+    httpx.ConnectError: "connect_error",
+    httpx.ReadError: "read_error",
+    httpx.WriteError: "write_error",
+    httpx.CloseError: "close_error",
+    httpx.RemoteProtocolError: "remote_protocol_error",
+    httpx.LocalProtocolError: "local_protocol_error",
+    httpx.ProxyError: "proxy_error",
+    httpx.UnsupportedProtocol: "unsupported_protocol",
+    httpx.TimeoutException: "timeout",
+    httpx.TransportError: "transport_error",
+}
+# 이 쪽에서 HTTP 호출을 끊은 결과. Modal 작업이 멈췄는지는 알 수 없다.
+_HTTP_CANCELLED_OUTCOMES = frozenset({"deadline_exceeded", "cancelled", "network_timeout"})
 
 
 class RemoteWorkerConfigError(ValueError):
@@ -57,6 +79,30 @@ def _timeout() -> RelayedWorkerError:
 
 def _origin(url: httpx.URL) -> tuple[str, str, int | None]:
     return url.scheme, url.host, url.port
+
+
+def _error_type(error: httpx.TransportError) -> str:
+    return next(_ERROR_TYPES[cls] for cls in type(error).__mro__ if cls in _ERROR_TYPES)
+
+
+def _seconds(value: float | None) -> str:
+    return "-" if value is None else f"{value:.3f}s"
+
+
+@dataclass
+class _RequestLog:
+    """요청 하나의 요약 로그. 지나가지 않은 단계의 시간은 None 이다(로그에는 - 로 남는다)."""
+
+    request_id: str
+    outcome: str = "error"
+    error: str | None = None
+    code: str | None = None
+    status: int | None = None
+    redirects: int = 0
+    input_check: float | None = None
+    queue_wait: float | None = None
+    http: float | None = None
+    budget: float | None = None
 
 
 def _image_format(image_body: bytes) -> str:
@@ -137,37 +183,79 @@ class RemoteBodyImageValidationService:
         # 전체 deadline 은 요청마다 여기서 한 번만 만든다(endpoint 가 service 를 부른 시점, monotonic).
         # 입력 검사·threadpool 대기·대기열 대기·Modal 연결·실행·303·응답 수신이 모두 이 하나의 deadline 을 나눠 쓴다.
         received = self._clock()
+        log = _RequestLog(request_id=uuid.uuid4().hex[:16])
+        try:
+            result = await self._validate(image_body, received, log)
+            log.code = SUCCESS_CODE
+            return result
+        except asyncio.CancelledError:
+            log.outcome = log.error = "cancelled"
+            raise
+        except BodyImageValidationError as error:
+            log.code = error.code
+            raise
+        except Exception as error:
+            log.error = type(error).__name__  # 예상 밖 오류는 원문 없이 종류만 남긴다
+            raise
+        finally:
+            self._log_request(log, self._clock() - received)
+
+    async def _validate(
+        self, image_body: bytes, received: float, log: _RequestLog
+    ) -> BodyImageValidationResult:
         deadline_at = received + self.total_deadline
         try:
             async with asyncio.timeout(self.total_deadline):
                 image_format = await to_thread.run_sync(_image_format, image_body)
-        except TimeoutError as error:
-            logger.info("body image request timed out in input check: deadline=%ss", self.total_deadline)
-            raise _timeout() from error
+        except TimeoutError:
+            raise self._deadline_exceeded(log) from None
+        except BodyImageValidationError:
+            log.outcome = "invalid_input"
+            raise
+        finally:
+            log.input_check = self._clock() - received
         remaining = deadline_at - self._clock()
         if remaining <= 0:
-            raise _timeout()
+            raise self._deadline_exceeded(log)
         queue_limit = self.limiter.max_wait_seconds
         async with contextlib.AsyncExitStack() as stack:
             queued = self._clock()
             try:
                 # 대기열에서는 최대 대기시간과 남은 deadline 중 짧은 쪽까지만 기다린다.
                 await stack.enter_async_context(self.limiter.slot(max_wait=remaining))
-            except SlotWaitTimeout as error:
-                waited = self._clock() - queued
+            except SlotWaitTimeout:
                 if queue_limit is None or remaining <= queue_limit:
                     # deadline 이 먼저 끝났다. Modal 은 부르지 않는다.
-                    logger.info("body image request timed out in queue: waited=%.2fs deadline=%ss",
-                                waited, self.total_deadline)
-                    raise _timeout() from error
-                logger.info("body image request gave up in queue: waited=%.2fs limit=%ss", waited, queue_limit)
+                    raise self._deadline_exceeded(log) from None
+                log.outcome = "queue_timeout"
                 raise
-            queue_wait = self._clock() - queued
+            except ServerBusyError:
+                log.outcome = "queue_full"
+                raise
+            finally:
+                log.queue_wait = self._clock() - queued
             if deadline_at - self._clock() <= 0:
-                logger.info("body image request has no time left after queue: waited=%.2fs", queue_wait)
-                raise _timeout()
-            status, body = await self._call(image_body, image_format, deadline_at, queue_wait)
+                raise self._deadline_exceeded(log)
+            status, body = await self._call(image_body, image_format, deadline_at, log)
         return self._result(status, body)
+
+    @staticmethod
+    def _deadline_exceeded(log: _RequestLog) -> "RelayedWorkerError":
+        log.outcome = log.error = "deadline_exceeded"
+        return _timeout()
+
+    def _log_request(self, log: _RequestLog, total: float) -> None:
+        http_cancelled = log.http is not None and log.outcome in _HTTP_CANCELLED_OUTCOMES
+        # http_cancelled: 이 쪽 연결을 끊었다. remote_cancel: Modal 작업 취소 API 는 부르지 않는다(HTTP 로는
+        # 없음). remote_stopped: 알 수 없음 — worker 가 deadline header 를 보고 다음 단계 전에 스스로 멈춘다.
+        logger.info(
+            "body image request: request_id=%s outcome=%s error=%s code=%s status=%s redirects=%s "
+            "input_check=%s queue_wait=%s http=%s total=%s budget=%s deadline=%ss http_cancelled=%s "
+            "remote_cancel=not_requested remote_stopped=%s",
+            log.request_id, log.outcome, log.error or "-", log.code or "-", log.status or "-", log.redirects,
+            _seconds(log.input_check), _seconds(log.queue_wait), _seconds(log.http), _seconds(total),
+            _seconds(log.budget), self.total_deadline, http_cancelled, "unknown" if http_cancelled else "n/a",
+        )
 
     async def aopen(self) -> None:
         """공유 client 를 이 event loop 에서 만든다. 이미 열려 있으면 아무것도 하지 않는다."""
@@ -191,10 +279,15 @@ class RemoteBodyImageValidationService:
         client, self._shared_client = self._shared_client, None
         if client is None:
             return
+        in_flight, started = self._shared_calls, self._clock()
         try:
             await self._shared_idle.wait()
         finally:
             self._shared_loop = None
+            logger.info(
+                "body image worker client closing: in_flight=%s left=%s waited=%s",
+                in_flight, self._shared_calls, _seconds(self._clock() - started),
+            )
             await client.aclose()
 
     def _check_shared_loop(self) -> None:
@@ -202,50 +295,35 @@ class RemoteBodyImageValidationService:
             raise RuntimeError("공유 HTTP client 는 만든 event loop 에서만 쓸 수 있습니다.")
 
     async def _call(
-        self, image_body: bytes, image_format: str, deadline_at: float, queue_wait: float = 0.0
+        self, image_body: bytes, image_format: str, deadline_at: float, log: _RequestLog
     ) -> tuple[int, bytes]:
         start = self._clock()
-        remaining = deadline_at - start
+        remaining = log.budget = deadline_at - start
         # worker 에는 같은 deadline 을 절대 시각(epoch 초)으로 보낸다. 지금 wall clock + monotonic 으로 잰 남은
         # 시간이라 대기열에서 쓴 시간이 빠져 있고, 호출을 시작했다고 늘어나지 않는다. redirect 에도 같은 값.
         headers = {
             **self._headers,
             worker_deadline.HEADER: f"{self._wall_clock() + remaining:.3f}",
         }
-        state = {"redirects": 0, "status": None, "outcome": "error"}
         try:
             async with asyncio.timeout(remaining):
-                status, body = await self._exchange(image_body, image_format, deadline_at, state, headers)
-            state.update(status=status, outcome="response")
+                status, body = await self._exchange(image_body, image_format, deadline_at, log, headers)
+            log.status, log.outcome = status, "response"
             return status, body
-        except asyncio.CancelledError:
-            # 호출자가 취소했다. 소켓 작업은 멈췄고 다른 오류로 바꾸지 않는다.
-            state["outcome"] = "cancelled"
-            raise
-        except TimeoutError as error:
+        except TimeoutError:
             # asyncio.timeout 이 진행 중인 소켓 작업을 취소하고 TimeoutError 로 바꾼다.
-            state["outcome"] = "deadline_exceeded"
-            raise _timeout() from error
+            raise self._deadline_exceeded(log) from None
+        # httpx 예외 원문은 router 의 traceback 로 나가지 않게 체인을 끊는다. 원인은 log.error 로 남는다.
         except httpx.TimeoutException as error:
-            state["outcome"] = f"network_timeout:{type(error).__name__}"
-            raise _timeout() from error
-        except httpx.TransportError as error:  # 연결 실패·끊김
-            state["outcome"] = f"connection_failed:{type(error).__name__}"
-            raise _unavailable(SERVICE_UNAVAILABLE) from error
+            log.outcome, log.error = "network_timeout", _error_type(error)
+            raise _timeout() from None
+        except httpx.TransportError as error:  # 연결 실패·끊김. keep-alive 재사용 탓인지는 여기서 알 수 없다.
+            log.outcome, log.error = "connection_failed", _error_type(error)
+            raise _unavailable(SERVICE_UNAVAILABLE) from None
         finally:
-            http_cancelled = state["outcome"] in ("deadline_exceeded", "cancelled") or state[
-                "outcome"
-            ].startswith("network_timeout")
-            # http_cancelled: 이 쪽 연결을 끊었다. remote_cancel: Modal 작업 취소 API 는 부르지 않는다(HTTP 로는
-            # 없음). remote_stopped: 알 수 없음 — worker 가 deadline header 를 보고 다음 단계 전에 스스로 멈춘다.
-            logger.info(
-                "body image worker call: outcome=%s status=%s redirects=%s queue_wait=%.2fs elapsed=%.2fs "
-                "budget=%.2fs deadline=%ss http_cancelled=%s remote_cancel=not_requested remote_stopped=%s",
-                state["outcome"], state["status"], state["redirects"], queue_wait, self._clock() - start,
-                remaining, self.total_deadline, http_cancelled, "unknown" if http_cancelled else "n/a",
-            )
+            log.http = self._clock() - start
 
-    async def _exchange(self, image_body, image_format, deadline_at, state, headers) -> tuple[int, bytes]:
+    async def _exchange(self, image_body, image_format, deadline_at, log, headers) -> tuple[int, bytes]:
         content_type, extension = _CONTENT_TYPES.get(image_format, ("application/octet-stream", "bin"))
         # 이 호출의 cookie. 303 을 따라갈 때만 쓰고 호출이 끝나면 버린다.
         cookies = httpx.Cookies()
@@ -267,9 +345,9 @@ class RemoteBodyImageValidationService:
                     cookies.extract_cookies(response)
                 finally:
                     await response.aclose()
-                state["redirects"] += 1
-                state["status"] = 303
-                target = self._redirect_target(request.url, location, visited, state["redirects"])
+                log.redirects += 1
+                log.status = 303
+                target = self._redirect_target(request.url, location, visited, log.redirects)
                 # 303 은 GET 으로 바꾼다. 이미지 본문과 Content-Type·Content-Length 는 보내지 않는다.
                 request = client.build_request(
                     "GET", target, headers=headers, cookies=cookies, timeout=self._network_timeout(deadline_at)

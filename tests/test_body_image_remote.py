@@ -460,9 +460,21 @@ class LocalWorkerHandler(BaseHTTPRequestHandler):
         self.server.connections += 1  # 받아들인 TCP 연결
 
     def do_POST(self):
+        if self.server.reject_upload:  # 본문을 읽지 않고 끊는다
+            self.server.rejected += 1
+            self.close_connection = True
+            return
         self.rfile.read(int(self.headers["content-length"]))
         self.server.requests += 1
         self.server.seen_cookies.append(self.headers.get("cookie"))
+        if self.server.truncate_next:  # 응답을 보내다가 끊는다
+            self.server.truncate_next = False
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(SUCCESS)))
+            self.end_headers()
+            self.wfile.write(SUCCESS[:10])
+            self.close_connection = True
+            return
         if self.server.delays:
             time.sleep(self.server.delays.pop(0))
         if self.server.drop_next:  # 요청을 받고 응답 없이 끊는다
@@ -479,6 +491,7 @@ class LocalWorkerHandler(BaseHTTPRequestHandler):
         with contextlib.suppress(ConnectionError):  # 취소된 요청은 이미 끊겼다
             self.wfile.write(SUCCESS)
         if self.server.close_silently:  # keep-alive 를 약속한 뒤 유휴 연결을 서버가 닫는다
+            time.sleep(self.server.close_after)  # 이 사이에 도착한 요청은 읽지 않고 버린다
             self.close_connection = True
 
     def log_message(self, *args):
@@ -496,8 +509,12 @@ class LocalWorker(ThreadingHTTPServer):
         self.delays = []
         self.keep_alive = True
         self.close_silently = False
+        self.close_after = 0.0
         self.drop_next = False
+        self.truncate_next = False
         self.set_cookie = False
+        self.reject_upload = False
+        self.rejected = 0
 
 
 @pytest.fixture
@@ -528,11 +545,14 @@ def test_consecutive_requests_work_over_real_connections(client, monkeypatch, lo
 
 
 def test_request_after_a_cancelled_call_works_over_real_connections(client, monkeypatch, local_worker):
-    local_worker.delays = [0.5]
-    use(monkeypatch, tcp_service(local_worker, limiter=AsyncBodyValidationLimiter(1, 0), timeout=0.1, deadline=0.1))
+    local_worker.delays = [1.0]
+    # 첫 요청이 서버에 닿은 뒤 끊기도록 제한을 넉넉히 둔다(먼저 끊기면 지연을 다음 요청이 받는다).
+    service = tcp_service(local_worker, limiter=AsyncBodyValidationLimiter(1, 0), timeout=0.4, deadline=0.4)
+    use(monkeypatch, service)
 
     assert post(client, jpeg()).status_code == 504
 
+    service.total_deadline = service.timeout = 5.0  # 짧은 제한은 첫 요청만을 위한 것이다
     assert post(client, jpeg()).status_code == 200
     assert local_worker.requests == 2
 
@@ -924,9 +944,9 @@ def test_call_summary_is_logged_without_secrets_or_urls(client, monkeypatch, cap
     with caplog.at_level(logging.INFO, logger="app.body_image_validation.remote"):
         post(client, jpeg())
 
-    [summary] = [r.getMessage() for r in caplog.records if "body image worker call" in r.getMessage()]
+    [summary] = [r.getMessage() for r in caplog.records if "body image request:" in r.getMessage()]
     assert "outcome=response" in summary and "status=200" in summary and "redirects=1" in summary
-    assert "elapsed=" in summary
+    assert "http=" in summary
     for secret in ("wk-test", "ws-test", "worker-key", KEY, "fc-test123", "__modal_function_call_id", WORKER):
         assert secret not in caplog.text
 
@@ -934,9 +954,9 @@ def test_call_summary_is_logged_without_secrets_or_urls(client, monkeypatch, cap
 @pytest.mark.parametrize(
     ("fake", "outcome"),
     [
-        (FakeWorker(steps=[(1.0, 200, {}, SUCCESS)]), "deadline_exceeded"),
-        (FakeWorker(error=httpx.ReadTimeout("t")), "network_timeout:ReadTimeout"),
-        (FakeWorker(error=httpx.ConnectError("refused")), "connection_failed:ConnectError"),
+        (FakeWorker(steps=[(1.0, 200, {}, SUCCESS)]), "outcome=deadline_exceeded error=deadline_exceeded"),
+        (FakeWorker(error=httpx.ReadTimeout("t")), "outcome=network_timeout error=read_timeout"),
+        (FakeWorker(error=httpx.ConnectError("refused")), "outcome=connection_failed error=connect_error"),
     ],
 )
 def test_timeout_kinds_are_logged(client, monkeypatch, caplog, fake, outcome):
@@ -945,7 +965,7 @@ def test_timeout_kinds_are_logged(client, monkeypatch, caplog, fake, outcome):
     with caplog.at_level(logging.INFO, logger="app.body_image_validation.remote"):
         post(client, jpeg())
 
-    assert f"outcome={outcome}" in caplog.text
+    assert outcome in caplog.text
 
 
 def test_misconfigured_network_timeout_below_modal_redirect_is_warned(caplog):

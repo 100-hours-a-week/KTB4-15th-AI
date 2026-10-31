@@ -651,7 +651,7 @@ def test_cancelled_http_call_stays_a_cancellation_and_returns_the_slot(caplog):
     with caplog.at_level(logging.INFO, logger="app.body_image_validation.remote"):
         run(scenario)
 
-    summary = next(r.getMessage() for r in caplog.records if "body image worker call" in r.getMessage())
+    summary = next(r.getMessage() for r in caplog.records if "body image request:" in r.getMessage())
     assert "outcome=cancelled" in summary
     assert "http_cancelled=True" in summary  # 이 쪽 연결은 끊었다
     assert "remote_cancel=not_requested" in summary
@@ -820,12 +820,14 @@ def test_refused_connection_is_503_over_a_real_socket(local_worker):  # noqa: F8
 
 
 def test_request_after_a_deadline_works_over_real_connections(local_worker):  # noqa: F811
-    local_worker.delays = [0.5]
+    local_worker.delays = [1.0]
 
     async def scenario():
-        svc = await opened(tcp_service(local_worker, timeout=0.1, deadline=0.1))
+        # 첫 요청이 서버에 닿은 뒤 끊기도록 제한을 넉넉히 둔다(먼저 끊기면 지연을 다음 요청이 받는다).
+        svc = await opened(tcp_service(local_worker, timeout=0.4, deadline=0.4))
 
         assert await rejected(svc.avalidate(jpeg())) == TIMED_OUT
+        svc.total_deadline = svc.timeout = 5.0  # 짧은 제한은 첫 요청만을 위한 것이다
         assert (await svc.avalidate(jpeg())).s3_key == KEY
 
     run(scenario)

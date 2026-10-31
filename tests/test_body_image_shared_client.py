@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 
 import httpx
 import pytest
@@ -591,14 +592,71 @@ def test_connection_dropped_mid_request_is_503_without_a_retry(local_worker):  #
     assert local_worker.connections == 2
 
 
+def test_connection_lost_while_receiving_the_response_is_503_without_a_retry(local_worker):  # noqa: F811
+    async def scenario():
+        svc = await opened(tcp_service(local_worker))
+        await svc.avalidate(jpeg())
+        local_worker.truncate_next = True
+
+        assert await rejected(svc.avalidate(jpeg())) == UNAVAILABLE
+
+        assert (await svc.avalidate(jpeg())).s3_key == KEY
+        assert state(svc.limiter) == (0, 0)
+
+    run(scenario)
+
+    assert local_worker.requests == 3
+    assert local_worker.connections == 2
+
+
+def test_reused_connection_closing_as_the_request_arrives_is_503_without_a_resend(local_worker, caplog):  # noqa: F811
+    # 서버는 응답 뒤 0.2초 있다가 연결을 닫고, 그 사이에 도착한 요청은 읽지 않는다. 그 요청은 처리되지 않는다.
+    local_worker.close_silently = True
+    local_worker.close_after = 0.2
+
+    async def scenario():
+        svc = await opened(tcp_service(local_worker))
+        await svc.avalidate(jpeg())
+
+        assert await rejected(svc.avalidate(jpeg())) == UNAVAILABLE
+
+        assert state(svc.limiter) == (0, 0)
+        assert (await svc.avalidate(jpeg())).s3_key == KEY  # 다음 요청은 새 연결로 간다
+
+    with caplog.at_level(logging.INFO, logger="app.body_image_validation.remote"):
+        run(scenario)
+
+    assert local_worker.requests == 2  # 버려진 요청을 다시 보내지 않았다
+    assert local_worker.connections == 2
+    assert re.search(r"outcome=connection_failed error=(read_error|remote_protocol_error) ", caplog.text)
+
+
+def test_server_closing_during_the_upload_is_503_without_a_retry(local_worker, caplog):  # noqa: F811
+    local_worker.reject_upload = True
+    upload = jpeg() + b"\0" * (5 * 1024 * 1024)  # socket buffer 를 넘는 크기
+
+    async def scenario():
+        svc = await opened(tcp_service(local_worker))
+        assert await rejected(svc.avalidate(upload)) == UNAVAILABLE
+        assert state(svc.limiter) == (0, 0)
+
+    with caplog.at_level(logging.INFO, logger="app.body_image_validation.remote"):
+        run(scenario)
+
+    assert local_worker.rejected == 1
+    assert re.search(r"error=(write_error|read_error|remote_protocol_error) ", caplog.text)
+
+
 def test_deadline_over_a_reused_connection_is_504_and_the_next_request_works(local_worker):  # noqa: F811
     async def scenario():
-        svc = await opened(tcp_service(local_worker, timeout=0.1, deadline=0.1))
+        svc = await opened(tcp_service(local_worker))
         await svc.avalidate(jpeg())
-        local_worker.delays = [0.4]
+        local_worker.delays = [1.0]
+        svc.total_deadline = svc.timeout = 0.4  # 요청이 서버에 닿은 뒤 끊기도록 넉넉히 둔다
 
         assert await rejected(svc.avalidate(jpeg())) == TIMED_OUT
 
+        svc.total_deadline = svc.timeout = 5.0
         assert (await svc.avalidate(jpeg())).s3_key == KEY
 
     run(scenario)

@@ -108,7 +108,7 @@ def test_over_50s_cancels_the_http_call_and_answers_504_once(remote_client, monk
     assert fake.cancelled is True  # 응답 시간 대신 대기 중인 HTTP coroutine 의 실제 취소를 확인한다
     assert fake.completed is False  # worker 의 정상 응답 완료와 구분한다
     assert len(fake.calls) == 1  # 재시도나 새 GPU 작업 요청이 없다
-    summary = next(r.getMessage() for r in caplog.records if "body image worker call" in r.getMessage())
+    summary = next(r.getMessage() for r in caplog.records if "body image request:" in r.getMessage())
     assert "outcome=deadline_exceeded" in summary
     assert "http_cancelled=True" in summary  # 이 쪽 연결은 끊었다
     assert "remote_cancel=not_requested" in summary  # Modal 취소 API 는 부르지 않았다

@@ -383,6 +383,48 @@ def test_disconnect_before_the_post_still_calls_modal(live, monkeypatch):
     wait_until(lambda: server.slots == (0, 0))
 
 
+# --- 연결 종료가 다른 일과 겹칠 때 ---
+
+
+def test_disconnect_overlapping_the_response_leaves_no_trace(live, caplog):
+    server = live()
+    rounds = 15
+
+    for done in range(1, rounds + 1):
+        request = server.send()
+        wait_until(lambda: server.modal.started == done)  # noqa: B023 — 바로 기다린다
+        request.disconnect()
+        server.modal.release.set()  # 연결이 끊기는 순간 응답도 끝난다
+        wait_until(lambda: server.slots == (0, 0))
+        server.modal.release.clear()
+
+    assert server.modal.max_active == 1
+    assert "unhandled error" not in caplog.text
+    server.modal.release.set()
+    assert server.send().read().response()[0] == 200
+
+
+def test_disconnect_overlapping_the_slot_handover_still_runs_once(live, caplog):
+    server = live()
+    rounds = 10
+
+    for done in range(rounds):
+        first = server.send().read()
+        wait_until(lambda: server.modal.started == done * 2 + 1)  # noqa: B023 — 바로 기다린다
+        queued = server.send()
+        wait_until(lambda: server.limiter.waiting == 1)
+        queued.disconnect()
+        server.modal.release.set()  # 연결이 끊기는 순간 슬롯도 넘어간다
+        assert first.response()[0] == 200
+        wait_until(lambda: server.modal.finished == (done + 1) * 2)  # noqa: B023 — 바로 기다린다
+        wait_until(lambda: server.slots == (0, 0))
+        server.modal.release.clear()
+
+    assert server.modal.started == rounds * 2  # 끊긴 요청도 정확히 한 번씩 갔다
+    assert server.modal.max_active == 1
+    assert "unhandled error" not in caplog.text
+
+
 # --- deadline: 슬롯은 돌아오지만 이미 시작한 Modal 작업은 멈추지 않는다(A 방식에도 있던 위험) ---
 
 
