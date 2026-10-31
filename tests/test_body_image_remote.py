@@ -1,5 +1,3 @@
-"""AI Server(remote 모드) → Modal worker HTTP 연동. 실제 Modal 은 부르지 않고 httpx MockTransport 를 쓴다."""
-
 import asyncio
 import contextlib
 import json
@@ -439,18 +437,31 @@ def test_next_request_succeeds_after_the_deadline_cancelled_a_call(client, monke
 class LocalWorkerHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # keep-alive
 
+    def setup(self):
+        super().setup()
+        self.server.connections += 1  # 받아들인 TCP 연결
+
     def do_POST(self):
         self.rfile.read(int(self.headers["content-length"]))
         self.server.requests += 1
+        self.server.seen_cookies.append(self.headers.get("cookie"))
         if self.server.delays:
             time.sleep(self.server.delays.pop(0))
+        if self.server.drop_next:  # 요청을 받고 응답 없이 끊는다
+            self.server.drop_next = False
+            self.close_connection = True
+            return
         self.send_response(200)
         self.send_header("Content-Length", str(len(SUCCESS)))
+        if self.server.set_cookie:
+            self.send_header("Set-Cookie", f"sid={self.server.requests}; Path=/")
         if not self.server.keep_alive:
             self.send_header("Connection", "close")
         self.end_headers()
         with contextlib.suppress(ConnectionError):  # 취소된 요청은 이미 끊겼다
             self.wfile.write(SUCCESS)
+        if self.server.close_silently:  # keep-alive 를 약속한 뒤 유휴 연결을 서버가 닫는다
+            self.close_connection = True
 
     def log_message(self, *args):
         pass
@@ -462,8 +473,13 @@ class LocalWorker(ThreadingHTTPServer):
     def __init__(self):
         super().__init__(("127.0.0.1", 0), LocalWorkerHandler)
         self.requests = 0
+        self.connections = 0
+        self.seen_cookies = []
         self.delays = []
         self.keep_alive = True
+        self.close_silently = False
+        self.drop_next = False
+        self.set_cookie = False
 
 
 @pytest.fixture

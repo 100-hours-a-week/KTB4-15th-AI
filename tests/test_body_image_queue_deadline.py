@@ -1,9 +1,3 @@
-"""대기열 최대 대기시간과, 대기열 대기까지 포함한 요청당 하나의 전체 deadline(remote 모드).
-
-시간은 1초 → 10ms 로 줄여 실제 Condition.wait·asyncio.sleep·asyncio.timeout 을 그대로 쓴다(SCALE).
-설정: 실행 1 + 대기 1, 대기열 최대 10초, 전체 deadline 50초.
-"""
-
 import importlib
 import threading
 import time
@@ -239,6 +233,24 @@ def test_deadline_spent_on_the_input_check_is_504_without_calling_modal(monkeypa
     assert (call.error.status_code, call.error.code) == (504, "BODY_IMAGE_WORKER_TIMEOUT")
     assert fake.calls == []
     assert idle(svc.limiter)
+
+
+def test_deadline_spent_on_the_input_check_is_504_even_when_the_queue_is_full(monkeypatch):
+    now = [1000.0]
+    real_open = remote.open_image
+
+    def slow_open(body):
+        now[0] += DEADLINE
+        return real_open(body)
+
+    monkeypatch.setattr(remote, "open_image", slow_open)
+    limiter = BodyValidationLimiter(1, 0)
+    svc = service(FakeWorker(steps=[ok(1)]), limiter=limiter, clock=lambda: now[0])
+
+    with limiter.slot():  # 대기열이 찼어도 429 가 아니라 504 다
+        call = Call(svc).start().join()
+
+    assert (call.error.status_code, call.error.code) == (504, "BODY_IMAGE_WORKER_TIMEOUT")
 
 
 def test_no_time_left_after_the_queue_is_504_without_calling_modal():

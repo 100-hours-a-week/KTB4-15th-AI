@@ -1,0 +1,911 @@
+import asyncio
+import logging
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from app import main
+from app.body_image_validation import warmup_router
+from app.body_image_validation.async_concurrency import AsyncBodyValidationLimiter
+from app.body_image_validation.concurrency import BodyValidationLimiter
+from app.body_image_validation.remote import RemoteBodyImageValidationService
+from app.body_image_validation.runtime import BodyImageRuntimeManager, RemoteBodyImageRuntime
+from app.config import body_image_validation as config
+from app.config import settings
+from tests.test_body_image_async_concurrency import state, wait_for_queue, wait_until
+from tests.test_body_image_concurrent_api import HeldWorker
+from tests.test_body_image_remote import (
+    POLL,
+    SUCCESS,
+    FakeWorker,
+    jpeg,
+    local_worker,  # noqa: F401 (pytest fixture)
+    redirect,
+)
+from tests.test_body_image_remote import tcp_service as sync_tcp_service
+from tests.test_body_image_remote_async import (
+    KEY,
+    OK,
+    TIMED_OUT,
+    UNAVAILABLE,
+    opened,
+    rejected,
+    run,
+    service,
+    tcp_service,
+)
+from tests.test_body_image_warmup_api import (  # noqa: F401 (pytest fixture)
+    VALIDATE_URL,
+    StubManager,
+    real_validation,
+    remote,
+    runtime,
+    validate_jpeg,
+)
+
+
+class ClientSpy:
+    """httpx.AsyncClient 생성을 기록한다. 만든 client·send 횟수·event loop 를 본다."""
+
+    def __init__(self, monkeypatch):
+        spy = self
+        self.clients = []
+        self.sends = {}
+        self.loops = {"created": [], "closed": []}
+
+        class Spy(httpx.AsyncClient):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                spy.clients.append(self)
+                spy.sends[id(self)] = 0
+                try:
+                    spy.loops["created"].append(asyncio.get_running_loop())
+                except RuntimeError:
+                    spy.loops["created"].append(None)
+
+            async def send(self, *args, **kwargs):
+                spy.sends[id(self)] += 1
+                return await super().send(*args, **kwargs)
+
+            async def aclose(self):
+                spy.loops["closed"].append(asyncio.get_running_loop())
+                await super().aclose()
+
+        monkeypatch.setattr(httpx, "AsyncClient", Spy)
+
+
+@pytest.fixture
+def clients(monkeypatch):
+    return ClientSpy(monkeypatch)
+
+
+# --- 재사용 ---
+
+
+def test_requests_share_one_client_and_it_stays_open(clients):
+    fake = FakeWorker()
+
+    async def scenario():
+        svc = await opened(service(fake))
+        client = svc._shared_client
+
+        for _ in range(3):
+            assert (await svc.avalidate(jpeg())).s3_key == KEY
+
+        assert clients.clients == [client]  # 요청마다 만들지 않았다
+        assert svc._shared_client is client
+        assert not client.is_closed
+        assert clients.sends[id(client)] == 3
+
+    run(scenario)
+
+
+def test_tcp_connection_is_reused_across_requests(local_worker):  # noqa: F811
+    async def scenario():
+        svc = await opened(tcp_service(local_worker))
+        for _ in range(6):
+            assert (await svc.avalidate(jpeg())).s3_key == KEY
+
+    run(scenario)
+
+    assert (local_worker.requests, local_worker.connections) == (6, 1)
+
+
+def test_validate_still_opens_a_connection_per_request(local_worker):  # noqa: F811
+    svc = sync_tcp_service(local_worker, limiter=BodyValidationLimiter(1, 1))
+
+    for _ in range(3):
+        assert svc.validate(jpeg()).s3_key == KEY
+
+    assert (local_worker.requests, local_worker.connections) == (3, 3)
+
+
+def test_server_that_refuses_keep_alive_gets_a_new_connection_each_time(local_worker):  # noqa: F811
+    local_worker.keep_alive = False
+
+    async def scenario():
+        svc = await opened(tcp_service(local_worker))
+        for _ in range(4):
+            assert (await svc.avalidate(jpeg())).s3_key == KEY
+
+    run(scenario)
+
+    assert (local_worker.requests, local_worker.connections) == (4, 4)
+
+
+def test_idle_connection_closed_by_the_server_is_replaced(local_worker):  # noqa: F811
+    local_worker.close_silently = True
+
+    async def scenario():
+        svc = await opened(tcp_service(local_worker))
+        await svc.avalidate(jpeg())
+        await asyncio.sleep(0.05)  # 서버가 닫은 것을 client 가 볼 시간
+
+        assert (await svc.avalidate(jpeg())).s3_key == KEY
+
+    run(scenario)
+
+    assert (local_worker.requests, local_worker.connections) == (2, 2)
+
+
+def test_concurrent_requests_use_separate_connections_and_keep_them(local_worker):  # noqa: F811
+    local_worker.delays = [0.05, 0.05]
+
+    async def scenario():
+        svc = await opened(tcp_service(local_worker, limiter=AsyncBodyValidationLimiter(2, 0)))
+        await asyncio.gather(svc.avalidate(jpeg()), svc.avalidate(jpeg()))
+        await svc.avalidate(jpeg())
+
+    run(scenario)
+
+    assert (local_worker.requests, local_worker.connections) == (3, 2)
+
+
+# --- validate() 와의 분리 ---
+
+
+def test_validate_never_touches_the_shared_client(clients):
+    # 1-4 의 운영 상태와 같다. 공유 client 는 열려 있고 요청은 동기 경로로 온다.
+    fake = FakeWorker()
+
+    async def scenario():
+        svc = await opened(service(fake, limiter=BodyValidationLimiter(1, 1)))
+        shared = svc._shared_client
+
+        for _ in range(2):
+            assert (await asyncio.to_thread(svc.validate, jpeg())).s3_key == KEY
+
+        assert clients.sends[id(shared)] == 0
+        assert not shared.is_closed
+        others = [client for client in clients.clients if client is not shared]
+        assert len(others) == 2  # 요청마다 새로 만들었다
+        assert all(client.is_closed for client in others)
+
+    run(scenario)
+
+
+# --- 열림·닫힘 ---
+
+
+def test_avalidate_without_an_open_client_is_503_and_sends_nothing(caplog):
+    fake = FakeWorker()
+
+    async def scenario():
+        svc = service(fake)
+        assert await rejected(svc.avalidate(jpeg())) == UNAVAILABLE
+        assert state(svc.limiter) == (0, 0)
+
+    with caplog.at_level(logging.ERROR, logger="app.body_image_validation.remote"):
+        run(scenario)
+
+    assert "client is not open" in caplog.text
+    assert fake.calls == []
+
+
+def test_closed_client_is_never_used_again(clients):
+    fake = FakeWorker()
+
+    async def scenario():
+        svc = service(fake)
+        await svc.aopen()
+        client = svc._shared_client
+        await svc.aclose()
+
+        assert client.is_closed
+        assert await rejected(svc.avalidate(jpeg())) == UNAVAILABLE
+        assert clients.sends[id(client)] == 0
+        assert state(svc.limiter) == (0, 0)
+
+    run(scenario)
+
+    assert fake.calls == []
+
+
+def test_open_and_close_can_be_repeated(clients):
+    async def scenario():
+        svc = service(FakeWorker())
+        await svc.aopen()
+        first = svc._shared_client
+        await svc.aopen()
+        assert svc._shared_client is first  # 새로 만들지 않는다
+
+        await svc.aclose()
+        await svc.aclose()
+
+        assert len(clients.loops["closed"]) == 1
+        await svc.aclose()
+
+    run(scenario)
+
+
+def test_failing_client_close_still_leaves_the_service_closed(monkeypatch):
+    fake = FakeWorker()
+
+    async def scenario():
+        svc = service(fake)
+        await svc.aopen()
+
+        async def broken_close():
+            raise OSError("close failed")
+
+        monkeypatch.setattr(svc._shared_client, "aclose", broken_close)
+        with pytest.raises(OSError):
+            await svc.aclose()
+
+        assert svc._shared_client is None
+        assert await rejected(svc.avalidate(jpeg())) == UNAVAILABLE
+
+    run(scenario)
+
+    assert fake.calls == []
+
+
+# --- 진행 중인 호출과 종료 ---
+
+
+def test_close_waits_for_the_running_call_and_turns_new_ones_away():
+    async def scenario():
+        worker = HeldWorker()
+        svc = await opened(service(worker, limiter=AsyncBodyValidationLimiter(2, 0)))
+        client = svc._shared_client
+        running = asyncio.create_task(svc.avalidate(jpeg()))
+        await wait_until(worker.entered.is_set)
+
+        closing = asyncio.create_task(svc.aclose())
+        await asyncio.sleep(0.01)
+
+        assert not closing.done() and not client.is_closed  # 취소하지 않고 기다린다
+        assert await rejected(svc.avalidate(jpeg())) == UNAVAILABLE
+        assert worker.arrivals == 1
+        worker.released.set()
+        assert (await running).s3_key == KEY
+        await closing
+        assert client.is_closed
+
+    run(scenario)
+
+
+def test_call_in_flight_over_a_real_connection_finishes_before_the_close(local_worker):  # noqa: F811
+    local_worker.delays = [0.1]
+
+    async def scenario():
+        svc = await opened(tcp_service(local_worker))
+        running = asyncio.create_task(svc.avalidate(jpeg()))
+        await wait_until(lambda: local_worker.requests == 1)
+
+        await svc.aclose()
+
+        assert running.done()
+        assert running.result().s3_key == KEY
+
+    run(scenario)
+
+
+def test_request_waiting_in_the_queue_gets_503_after_the_close():
+    async def scenario():
+        worker = HeldWorker()
+        svc = await opened(service(worker))
+        running = asyncio.create_task(svc.avalidate(jpeg()))
+        await wait_until(worker.entered.is_set)
+        queued = asyncio.create_task(svc.avalidate(jpeg()))
+        await wait_for_queue(svc.limiter, 1)
+        closing = asyncio.create_task(svc.aclose())
+        await asyncio.sleep(0)
+
+        worker.released.set()
+
+        assert (await running).s3_key == KEY
+        assert await rejected(queued) == UNAVAILABLE
+        await closing
+        assert worker.arrivals == 1
+        assert state(svc.limiter) == (0, 0)
+
+    run(scenario)
+
+
+def test_failed_and_cancelled_calls_do_not_hold_the_close_back():
+    async def scenario():
+        fake = FakeWorker(steps=[httpx.ConnectError("refused"), (5.0, 200, {}, SUCCESS)])
+        svc = await opened(service(fake))
+        assert await rejected(svc.avalidate(jpeg())) == UNAVAILABLE
+        task = asyncio.create_task(svc.avalidate(jpeg()))
+        await wait_until(lambda: len(fake.calls) == 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        async with asyncio.timeout(1.0):
+            await svc.aclose()  # 호출 수가 어긋나면 여기서 멈춘다
+
+    run(scenario)
+
+
+def test_cancelled_close_still_closes_the_client_and_the_running_call_gets_503(local_worker):  # noqa: F811
+    local_worker.delays = [0.3]
+
+    async def scenario():
+        svc = await opened(tcp_service(local_worker))
+        client = svc._shared_client
+        running = asyncio.create_task(svc.avalidate(jpeg()))
+        await wait_until(lambda: local_worker.requests == 1)
+        closing = asyncio.create_task(svc.aclose())
+        await asyncio.sleep(0.01)
+
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+
+        assert client.is_closed
+        assert await rejected(running) == UNAVAILABLE
+        assert state(svc.limiter) == (0, 0)
+
+    run(scenario)
+
+
+# --- 이벤트 루프 ---
+
+
+def test_client_is_created_used_and_closed_on_one_event_loop(clients):
+    used = []
+
+    class LoopRecordingWorker(FakeWorker):
+        async def _handle(self, request):
+            used.append(asyncio.get_running_loop())
+            return await super()._handle(request)
+
+    async def scenario():
+        svc = service(LoopRecordingWorker())
+        await svc.aopen()
+        await svc.avalidate(jpeg())
+        await svc.aclose()
+        loop = asyncio.get_running_loop()
+
+        assert clients.loops == {"created": [loop], "closed": [loop]}
+        assert used == [loop]
+
+    run(scenario)
+
+
+def test_client_is_not_created_at_construction(clients):
+    service(FakeWorker())
+
+    assert clients.clients == []
+
+
+def test_avalidate_on_another_loop_is_refused_and_the_client_survives():
+    fake = FakeWorker()
+    svc = service(fake)
+
+    with asyncio.Runner() as owner, asyncio.Runner() as other:
+        owner.run(svc.aopen())
+        client = svc._shared_client
+
+        with pytest.raises(RuntimeError, match="event loop"):
+            other.run(svc.avalidate(jpeg()))
+
+        assert fake.calls == []
+        assert state(svc.limiter) == (0, 0)
+        assert svc._shared_client is client and not client.is_closed
+        owner.run(svc.aclose())
+
+    assert client.is_closed
+
+
+@pytest.mark.parametrize("method", ["aopen", "aclose"])
+def test_opening_or_closing_on_another_loop_is_refused(method):
+    svc = service(FakeWorker())
+
+    with asyncio.Runner() as owner, asyncio.Runner() as other:
+        owner.run(svc.aopen())
+        client = svc._shared_client
+
+        with pytest.raises(RuntimeError, match="event loop"):
+            other.run(getattr(svc, method)())
+
+        assert svc._shared_client is client and not client.is_closed
+        owner.run(svc.aclose())
+
+
+# --- Cookie ---
+
+
+def test_cookie_from_one_request_does_not_reach_the_next():
+    fake = FakeWorker(
+        steps=[(0, 200, {"set-cookie": "sid=1; Path=/"}, SUCCESS), OK]
+    )
+
+    async def scenario():
+        svc = await opened(service(fake))
+        await svc.avalidate(jpeg())
+        await svc.avalidate(jpeg())
+
+        assert len(svc._shared_client.cookies.jar) == 0
+
+    run(scenario)
+
+    assert "cookie" not in fake.calls[1].headers
+
+
+def test_cookie_from_a_redirect_stays_in_its_own_request():
+    fake = FakeWorker(
+        steps=[
+            (0, 303, {"location": POLL, "set-cookie": "sid=1; Path=/"}, b""),
+            OK,
+            redirect(POLL),  # 다음 요청도 303 을 받는다. cookie 가 남아 있으면 이 GET 에 실린다
+            OK,
+        ]
+    )
+
+    async def scenario():
+        svc = await opened(service(fake))
+        await svc.avalidate(jpeg())
+        await svc.avalidate(jpeg())
+
+        assert len(svc._shared_client.cookies.jar) == 0
+
+    run(scenario)
+
+    _, first_get, second_post, second_get = fake.calls
+    assert first_get.headers["cookie"] == "sid=1"  # 같은 요청의 303 에는 그대로 간다
+    assert "cookie" not in second_post.headers
+    assert "cookie" not in second_get.headers
+
+
+def test_cookies_of_concurrent_requests_do_not_mix():
+    arrived = []
+    seen = {}
+
+    async def handle(request):
+        await request.aread()
+        if request.method == "POST":
+            number = len(arrived)
+            arrived.append(number)
+            while len(arrived) < 2:  # 두 요청이 모두 진행 중일 때 응답한다
+                await asyncio.sleep(0.001)
+            await asyncio.sleep(0.002 * (2 - number))  # 늦게 온 요청이 먼저 303 을 받는다
+            return httpx.Response(
+                303,
+                headers={"location": f"{POLL}&n={number}", "set-cookie": f"c{number}=1; Path=/"},
+            )
+        seen[request.url.params["n"]] = request.headers.get("cookie")
+        await asyncio.sleep(0.002)
+        return httpx.Response(200, content=SUCCESS)
+
+    worker = FakeWorker()
+    worker.transport = httpx.MockTransport(handle)
+
+    async def scenario():
+        svc = await opened(service(worker, limiter=AsyncBodyValidationLimiter(2, 0)))
+        await asyncio.gather(svc.avalidate(jpeg()), svc.avalidate(jpeg()))
+
+    run(scenario)
+
+    assert seen == {"0": "c0=1", "1": "c1=1"}  # 다른 요청의 cookie 가 함께 실리지 않는다
+
+
+COOKIE_CASES = {
+    "plain": (["sid=1"], [None, "sid=1"]),
+    "path-root": (["sid=1; Path=/"], [None, "sid=1"]),
+    "other-path": (["sid=1; Path=/other"], [None, None]),
+    "expired": (["sid=1; Max-Age=0"], [None, None]),
+    "other-domain": (["sid=1; Domain=other.example.com"], [None, None]),
+    "secure": (["sid=1; Secure"], [None, "sid=1"]),
+    "accumulates": (["a=1; Path=/", "b=2; Path=/"], [None, "a=1", "a=1; b=2"]),
+    "overwrites": (["a=1; Path=/", "a=2; Path=/"], [None, "a=1", "a=2"]),
+}
+
+
+@pytest.mark.parametrize(("set_cookies", "expected"), COOKIE_CASES.values(), ids=COOKIE_CASES)
+def test_redirect_cookies_behave_the_same_on_both_paths(set_cookies, expected):
+    def steps():
+        return [(0, 303, {"location": POLL, "set-cookie": value}, b"") for value in set_cookies] + [OK]
+
+    sync_worker, async_worker = FakeWorker(steps=steps()), FakeWorker(steps=steps())
+
+    service(sync_worker, limiter=BodyValidationLimiter(1, 1)).validate(jpeg())
+
+    async def scenario():
+        await (await opened(service(async_worker))).avalidate(jpeg())
+
+    run(scenario)
+
+    def cookies(worker):
+        return [call.headers.get("cookie") for call in worker.calls]
+
+    assert cookies(sync_worker) == expected
+    assert cookies(async_worker) == expected
+
+
+def test_cookies_stay_isolated_on_a_reused_real_connection(local_worker):  # noqa: F811
+    local_worker.set_cookie = True
+
+    async def scenario():
+        svc = await opened(tcp_service(local_worker))
+        for _ in range(3):
+            await svc.avalidate(jpeg())
+
+    run(scenario)
+
+    assert local_worker.seen_cookies == [None, None, None]
+    assert local_worker.connections == 1
+
+
+# --- 인증 헤더 ---
+
+
+def test_auth_and_deadline_headers_go_on_each_request_and_not_on_the_client():
+    fake = FakeWorker(steps=[redirect(POLL), OK, OK])
+    now = [1_000_000.0]
+
+    async def scenario():
+        svc = await opened(service(fake, deadline=50.0, wall_clock=lambda: now[0]))
+        await svc.avalidate(jpeg())
+        now[0] += 100.0
+        await svc.avalidate(jpeg())
+
+        client_headers = {name.lower() for name in svc._shared_client.headers}
+        assert not client_headers & {"modal-key", "modal-secret", "authorization"}
+
+    run(scenario)
+
+    for call in fake.calls:
+        assert call.headers["modal-key"] == "wk-test"
+        assert call.headers["modal-secret"] == "ws-test"
+        assert call.headers["authorization"] == "Bearer worker-key"
+    first_post, first_get, second_post = fake.calls
+    header = "x-body-image-deadline"
+    assert first_get.headers[header] == first_post.headers[header]
+    assert float(second_post.headers[header]) == pytest.approx(float(first_post.headers[header]) + 100.0, abs=0.1)
+
+
+# --- 실패 뒤 재사용 ---
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (httpx.ConnectError("refused"), UNAVAILABLE),
+        (httpx.RemoteProtocolError("closed"), UNAVAILABLE),
+        (httpx.ReadTimeout("timed out"), TIMED_OUT),
+    ],
+    ids=["refused", "closed", "timeout"],
+)
+def test_shared_client_is_reused_after_a_failure(clients, failure, expected):
+    fake = FakeWorker(steps=[failure, OK])
+
+    async def scenario():
+        svc = await opened(service(fake))
+        client = svc._shared_client
+
+        assert await rejected(svc.avalidate(jpeg())) == expected
+
+        assert (await svc.avalidate(jpeg())).s3_key == KEY
+        assert svc._shared_client is client and not client.is_closed
+        assert len(clients.clients) == 1
+
+    run(scenario)
+
+    assert len(fake.calls) == 2  # 재시도 없음
+
+
+def test_connection_dropped_mid_request_is_503_without_a_retry(local_worker):  # noqa: F811
+    async def scenario():
+        svc = await opened(tcp_service(local_worker))
+        await svc.avalidate(jpeg())
+        local_worker.drop_next = True  # 재사용 중인 연결에서 요청을 받고 끊는다
+
+        assert await rejected(svc.avalidate(jpeg())) == UNAVAILABLE
+
+        assert (await svc.avalidate(jpeg())).s3_key == KEY
+
+    run(scenario)
+
+    assert local_worker.requests == 3  # 끊긴 요청을 다시 보내지 않았다
+    assert local_worker.connections == 2
+
+
+def test_deadline_over_a_reused_connection_is_504_and_the_next_request_works(local_worker):  # noqa: F811
+    async def scenario():
+        svc = await opened(tcp_service(local_worker, timeout=0.1, deadline=0.1))
+        await svc.avalidate(jpeg())
+        local_worker.delays = [0.4]
+
+        assert await rejected(svc.avalidate(jpeg())) == TIMED_OUT
+
+        assert (await svc.avalidate(jpeg())).s3_key == KEY
+
+    run(scenario)
+
+    assert local_worker.requests == 3
+
+
+def test_cancelled_call_over_a_reused_connection_leaves_the_client_usable(local_worker):  # noqa: F811
+    async def scenario():
+        svc = await opened(tcp_service(local_worker))
+        await svc.avalidate(jpeg())
+        local_worker.delays = [0.3]
+        task = asyncio.create_task(svc.avalidate(jpeg()))
+        await wait_until(lambda: local_worker.requests == 2)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert (await svc.avalidate(jpeg())).s3_key == KEY
+        assert state(svc.limiter) == (0, 0)
+
+    run(scenario)
+
+
+# --- lifespan ---
+
+
+@pytest.fixture
+def lifespan_manager(remote, monkeypatch):  # noqa: F811
+    """lifespan 이 쓸 remote manager. 공유 client 가 가짜 worker 를 부르도록 transport 를 미리 넘긴다."""
+
+    def build(fake):
+        manager = BodyImageRuntimeManager(remote_transport=fake.transport)
+        monkeypatch.setattr(main, "runtime_manager", manager)
+        return manager
+
+    return build
+
+
+def use_async_limiter(manager, monkeypatch):
+    """Router 전환 전이라 runtime 은 동기 limiter 를 쓴다. 공유 client 경로를 보려고 이 service 만 바꾼다."""
+    limiter = AsyncBodyValidationLimiter(1, 1)
+    monkeypatch.setattr(manager.runtime.service, "limiter", limiter)
+
+
+def test_lifespan_owns_the_shared_client(lifespan_manager, monkeypatch, clients):
+    fake = FakeWorker()
+    manager = lifespan_manager(fake)
+
+    with TestClient(main.app) as client:
+        service_ = manager.get_service()
+        shared = service_._shared_client
+        assert not shared.is_closed
+        use_async_limiter(manager, monkeypatch)
+        result = client.portal.call(service_.avalidate, jpeg())
+        loop = client.portal.call(asyncio.get_running_loop)
+
+    assert result.s3_key == KEY
+    assert len(fake.calls) == 1  # 주입한 transport 로 나갔다
+    assert shared.is_closed
+    assert manager.runtime is None
+    assert clients.loops == {"created": [loop], "closed": [loop]}
+
+
+def test_restart_uses_a_new_client_on_the_new_event_loop(lifespan_manager, monkeypatch, clients):
+    fake = FakeWorker()
+    manager = lifespan_manager(fake)
+    seen = []
+
+    for _ in range(2):
+        with TestClient(main.app) as client:
+            use_async_limiter(manager, monkeypatch)
+            service_ = manager.get_service()
+            client.portal.call(service_.avalidate, jpeg())
+            seen.append((service_._shared_client, client.portal.call(asyncio.get_running_loop)))
+
+    (first, first_loop), (second, second_loop) = seen
+    assert second is not first
+    assert first_loop is not second_loop
+    assert first.is_closed and second.is_closed
+    assert len(fake.calls) == 2
+
+
+def test_local_mode_creates_no_client(runtime, clients):  # noqa: F811
+    with TestClient(main.app):
+        pass
+
+    assert clients.clients == []
+
+
+def test_failed_remote_runtime_creates_no_client(lifespan_manager, monkeypatch, clients):
+    monkeypatch.setattr(settings, "BODY_IMAGE_REMOTE_API_KEY", "")
+    manager = lifespan_manager(FakeWorker())
+
+    with TestClient(main.app):
+        assert manager.runtime is None
+
+    assert clients.clients == []
+
+
+def test_client_creation_failure_stops_startup_and_releases_resources(remote, monkeypatch):  # noqa: F811
+    def broken_build(self):
+        raise OSError("bad CA bundle")
+
+    cleaned = []
+
+    async def close_async_pool():
+        cleaned.append("async_pool")
+
+    monkeypatch.setattr(RemoteBodyImageValidationService, "_build_client", broken_build)
+    close = remote.close
+    monkeypatch.setattr(remote, "close", lambda: (cleaned.append("runtime"), close()))
+    monkeypatch.setattr(main, "close_connection_pool", lambda: cleaned.append("sync_pool"))
+    monkeypatch.setattr(main, "close_async_pool", close_async_pool)
+
+    with pytest.raises(OSError), TestClient(main.app):
+        pass
+
+    assert cleaned == ["runtime", "sync_pool", "async_pool"]
+    assert remote.runtime is None
+    assert main.app.state.body_image_warmup is None
+
+
+def test_error_after_the_client_opened_still_closes_it(lifespan_manager, monkeypatch, clients):
+    manager = lifespan_manager(FakeWorker())
+
+    def broken():
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(warmup_router, "create_warmup_manager", broken)
+
+    with pytest.raises(RuntimeError), TestClient(main.app):
+        pass
+
+    assert [client.is_closed for client in clients.clients] == [True]
+    assert manager.runtime is None
+
+
+def test_shutdown_order_is_warmup_then_client_then_runtime(lifespan_manager, monkeypatch):
+    manager = lifespan_manager(FakeWorker())
+    order = []
+
+    async def record_warmup():
+        order.append("warmup")
+
+    stub = StubManager()
+    stub.aclose = record_warmup
+    monkeypatch.setattr(warmup_router, "create_warmup_manager", lambda: stub)
+    real_aclose = RemoteBodyImageRuntime.aclose
+
+    async def record_client(self):
+        order.append("client")
+        await real_aclose(self)
+
+    monkeypatch.setattr(RemoteBodyImageRuntime, "aclose", record_client)
+    close = manager.close
+    monkeypatch.setattr(manager, "close", lambda: (order.append("runtime"), close()))
+
+    with TestClient(main.app):
+        pass
+
+    assert order == ["warmup", "client", "runtime"]
+
+
+def test_client_close_failure_does_not_skip_the_rest_of_shutdown(lifespan_manager, monkeypatch, caplog):
+    manager = lifespan_manager(FakeWorker())
+    cleaned = []
+
+    async def broken_close(self):
+        raise RuntimeError("secret ws-test")
+
+    async def close_async_pool():
+        cleaned.append("async_pool")
+
+    monkeypatch.setattr(RemoteBodyImageValidationService, "aclose", broken_close)
+    close = manager.close
+    monkeypatch.setattr(manager, "close", lambda: (cleaned.append("runtime"), close()))
+    monkeypatch.setattr(main, "close_connection_pool", lambda: cleaned.append("sync_pool"))
+    monkeypatch.setattr(main, "close_async_pool", close_async_pool)
+
+    with caplog.at_level(logging.ERROR), TestClient(main.app):
+        pass
+
+    assert cleaned == ["runtime", "sync_pool", "async_pool"]
+    assert manager.runtime is None
+    assert "body image runtime close failed: error=RuntimeError" in caplog.text
+    assert "ws-test" not in caplog.text
+
+
+def test_cancelled_shutdown_while_draining_still_closes_everything(lifespan_manager, monkeypatch, clients):
+    worker = HeldWorker()
+    manager = lifespan_manager(worker)
+    cleaned = []
+
+    async def close_async_pool():
+        cleaned.append("async_pool")
+
+    close = manager.close
+    monkeypatch.setattr(manager, "close", lambda: (cleaned.append("runtime"), close()))
+    monkeypatch.setattr(main, "close_connection_pool", lambda: cleaned.append("sync_pool"))
+    monkeypatch.setattr(main, "close_async_pool", close_async_pool)
+
+    async def scenario():
+        running = []
+
+        async def run_lifespan():
+            async with main.lifespan(main.app):
+                use_async_limiter(manager, monkeypatch)
+                running.append(asyncio.create_task(manager.get_service().avalidate(jpeg())))
+                await wait_until(worker.entered.is_set)
+
+        task = asyncio.create_task(run_lifespan())
+        await wait_until(lambda: running and worker.entered.is_set())
+        await asyncio.sleep(0.01)
+        assert not task.done()  # 진행 중인 호출을 기다리고 있다
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):  # 취소는 삼키지 않는다
+            await task
+
+        assert cleaned == ["runtime", "sync_pool", "async_pool"]
+        assert clients.clients[0].is_closed
+        worker.released.set()
+        await asyncio.gather(*running, return_exceptions=True)
+
+    run(scenario)
+
+
+def test_runtime_manager_close_stays_for_the_modal_worker():
+    closed = []
+
+    class LocalRuntime:
+        def close(self):
+            closed.append(True)
+
+    manager = BodyImageRuntimeManager()
+    manager._runtime = LocalRuntime()
+
+    asyncio.run(manager.aopen())
+    asyncio.run(manager.aclose())
+
+    assert closed == [True]  # local 은 기존 동기 close 그대로
+    assert manager.runtime is None
+
+
+def test_remote_transport_reaches_the_service(monkeypatch):
+    monkeypatch.setattr(config, "VALIDATION_MODE", "remote")
+    monkeypatch.setattr(config, "REMOTE_URL", "https://example.modal.run")
+    monkeypatch.setattr(settings, "BODY_IMAGE_REMOTE_PROXY_KEY", "k")
+    monkeypatch.setattr(settings, "BODY_IMAGE_REMOTE_PROXY_SECRET", "s")
+    monkeypatch.setattr(settings, "BODY_IMAGE_REMOTE_API_KEY", "a")
+    fake = FakeWorker()
+    manager = BodyImageRuntimeManager(remote_transport=fake.transport)
+
+    manager.start()
+
+    assert manager.get_service()._transport is fake.transport
+
+
+# --- 기존 경로 회귀: 공유 client 가 열려 있어도 Router 는 validate() 를 쓴다 ---
+
+
+def test_api_still_goes_through_validate_while_the_shared_client_is_open(real_validation, clients):  # noqa: F811
+    install, worker_calls = real_validation
+
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        install()  # 요청마다 만드는 client 는 생성 뒤에 바꾼 _transport 도 그대로 본다
+        response = validate_jpeg(client)
+        shared = main.runtime_manager.get_service()._shared_client
+        sends = clients.sends[id(shared)]
+
+    assert response.status_code == 200
+    assert worker_calls == [VALIDATE_URL]
+    assert sends == 0
+    assert len(clients.clients) == 2  # 공유 1 + 요청별 1
