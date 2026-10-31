@@ -1,14 +1,18 @@
+import asyncio
+import contextlib
 import importlib
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
+from anyio.from_thread import start_blocking_portal
 
 from app.body_image_validation import deadline as worker_deadline
 from app.body_image_validation import remote, router
-from app.body_image_validation.concurrency import BodyValidationLimiter, SlotWaitTimeout
+from app.body_image_validation.async_concurrency import AsyncBodyValidationLimiter
+from app.body_image_validation.concurrency import SlotWaitTimeout
 from app.body_image_validation.exceptions import BodyImageValidationError, ServerBusyError
 from app.body_image_validation.remote import RemoteBodyImageValidationService
 from tests.test_body_image_remote import POLL, SUCCESS, TIMEOUT, FakeWorker, jpeg, redirect, use
@@ -42,7 +46,41 @@ class TrackingWorker(FakeWorker):
                 self.in_flight -= 1
 
 
-def service(fake, deadline=DEADLINE, queue_wait=QUEUE_WAIT, limiter=None, timeout=100 * S, **kwargs):
+class Server:
+    """요청을 처리하는 event loop 자리. 테스트마다 새 loop 를 쓰고, 여기서 연 공유 client 는 끝날 때 닫는다."""
+
+    def __init__(self, portal):
+        self.portal = portal
+        self.opened = []
+
+    def open(self, svc):
+        self.portal.call(svc.aopen)
+        self.opened.append(svc)
+        return svc
+
+    async def close(self, svc):
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(1.0):
+                await svc.aclose()
+
+
+_server = None
+
+
+@pytest.fixture(autouse=True)
+def server():
+    global _server
+    with start_blocking_portal() as portal:
+        _server = Server(portal)
+        try:
+            yield _server
+        finally:
+            for svc in _server.opened:
+                portal.call(_server.close, svc)
+            _server = None
+
+
+def build(fake, deadline=DEADLINE, queue_wait=QUEUE_WAIT, limiter=None, timeout=100 * S, **kwargs):
     return RemoteBodyImageValidationService(
         "https://example--lookddak-body-image-staging.modal.run",
         proxy_key="wk-test",
@@ -50,10 +88,14 @@ def service(fake, deadline=DEADLINE, queue_wait=QUEUE_WAIT, limiter=None, timeou
         api_key="worker-key",
         timeout=timeout,
         total_deadline=deadline,
-        limiter=limiter or BodyValidationLimiter(1, 1, max_wait_seconds=queue_wait),
+        limiter=limiter or AsyncBodyValidationLimiter(1, 1, max_wait_seconds=queue_wait),
         transport=fake.transport,
         **kwargs,
     )
+
+
+def service(fake, **kwargs):
+    return _server.open(build(fake, **kwargs))
 
 
 def ok(delay_seconds):
@@ -61,7 +103,7 @@ def ok(delay_seconds):
 
 
 class Call:
-    """service.validate 를 다른 thread 에서 실행하고 결과·예외·시간을 남긴다."""
+    """svc.avalidate 를 서버 event loop 에서 실행하고 결과·예외·시간을 남긴다."""
 
     def __init__(self, svc, start_delay=0.0):
         self.svc, self.result, self.error, self.elapsed = svc, None, None, None
@@ -71,7 +113,7 @@ class Call:
         time.sleep(start_delay)
         started = time.monotonic()
         try:
-            self.result = self.svc.validate(jpeg())
+            self.result = _server.portal.call(self.svc.avalidate, jpeg())
         except BaseException as error:  # noqa: BLE001 - 결과로 확인한다
             self.error = error
         self.elapsed = time.monotonic() - started
@@ -200,7 +242,7 @@ def test_queue_wait_plus_execution_over_50s_is_504():
 def test_deadline_ending_in_queue_is_504_without_calling_modal():
     # deadline(5초)이 대기열 제한(10초)보다 짧으면 deadline 이 먼저 끝난다 → 429 가 아니라 504
     fake = FakeWorker(steps=[ok(20)])
-    limiter = BodyValidationLimiter(1, 1, max_wait_seconds=QUEUE_WAIT)
+    limiter = AsyncBodyValidationLimiter(1, 1, max_wait_seconds=QUEUE_WAIT)
     svc_a = service(fake, limiter=limiter)  # A: deadline 50초, 20초 실행
     svc_b = service(fake, deadline=5 * S, limiter=limiter)  # B: deadline 5초(대기열 제한 10초보다 짧음)
 
@@ -235,7 +277,7 @@ def test_deadline_spent_on_the_input_check_is_504_without_calling_modal(monkeypa
     assert idle(svc.limiter)
 
 
-def test_deadline_spent_on_the_input_check_is_504_even_when_the_queue_is_full(monkeypatch):
+def test_deadline_spent_on_the_input_check_is_504_even_when_the_queue_is_full(server, monkeypatch):
     now = [1000.0]
     real_open = remote.open_image
 
@@ -244,10 +286,10 @@ def test_deadline_spent_on_the_input_check_is_504_even_when_the_queue_is_full(mo
         return real_open(body)
 
     monkeypatch.setattr(remote, "open_image", slow_open)
-    limiter = BodyValidationLimiter(1, 0)
+    limiter = AsyncBodyValidationLimiter(1, 0)
     svc = service(FakeWorker(steps=[ok(1)]), limiter=limiter, clock=lambda: now[0])
 
-    with limiter.slot():  # 대기열이 찼어도 429 가 아니라 504 다
+    with server.portal.wrap_async_context_manager(limiter.slot()):  # 대기열이 찼어도 429 가 아니라 504 다
         call = Call(svc).start().join()
 
     assert (call.error.status_code, call.error.code) == (504, "BODY_IMAGE_WORKER_TIMEOUT")
@@ -256,10 +298,10 @@ def test_deadline_spent_on_the_input_check_is_504_even_when_the_queue_is_full(mo
 def test_no_time_left_after_the_queue_is_504_without_calling_modal():
     now = [1000.0]
 
-    class SlowSlot(BodyValidationLimiter):
-        @contextmanager
-        def slot(self, max_wait=None):
-            with super().slot(max_wait):
+    class SlowSlot(AsyncBodyValidationLimiter):
+        @asynccontextmanager
+        async def slot(self, max_wait=None):
+            async with super().slot(max_wait):
                 now[0] += DEADLINE
                 yield
 
@@ -330,11 +372,12 @@ def test_redirect_still_works_inside_the_remaining_deadline():
 
 
 def test_api_responses_keep_the_contract(remote_client, monkeypatch):  # noqa: F811
-    limiter = BodyValidationLimiter(1, 1, max_wait_seconds=QUEUE_WAIT)
+    limiter = AsyncBodyValidationLimiter(1, 1, max_wait_seconds=QUEUE_WAIT)
     fake = FakeWorker(steps=[ok(1)])
-    use(monkeypatch, service(fake, limiter=limiter))
+    use(monkeypatch, build(fake, limiter=limiter))
 
-    with limiter.slot():  # 다른 요청이 실행 중 → 이 요청은 10초 대기 후 429
+    # 다른 요청이 실행 중 → 이 요청은 10초 대기 후 429
+    with remote_client.portal.wrap_async_context_manager(limiter.slot()):
         busy = remote_post(remote_client, jpeg())
     assert busy.status_code == 429
     assert busy.json() == BUSY
@@ -343,7 +386,7 @@ def test_api_responses_keep_the_contract(remote_client, monkeypatch):  # noqa: F
     assert ok_response.status_code == 200
     assert ok_response.json()["code"] == "BODY_IMAGE_UPLOAD_SUCCESS"
 
-    use(monkeypatch, service(FakeWorker(steps=[(80 * S, 200, {}, SUCCESS)]), limiter=limiter))
+    use(monkeypatch, build(FakeWorker(steps=[(80 * S, 200, {}, SUCCESS)]), limiter=limiter))
     late = remote_post(remote_client, jpeg())
     assert late.status_code == 504
     assert late.json() == TIMEOUT

@@ -6,11 +6,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main
+from app.body_image_validation import router as validation_router
 from app.body_image_validation import warmup_router
 from app.body_image_validation.async_concurrency import AsyncBodyValidationLimiter
-from app.body_image_validation.concurrency import BodyValidationLimiter
 from app.body_image_validation.remote import RemoteBodyImageValidationService
-from app.body_image_validation.runtime import BodyImageRuntimeManager, RemoteBodyImageRuntime
+from app.body_image_validation.runtime import (
+    BodyImageRuntimeError,
+    BodyImageRuntimeManager,
+    RemoteBodyImageRuntime,
+)
 from app.config import body_image_validation as config
 from app.config import settings
 from tests.test_body_image_async_concurrency import state, wait_for_queue, wait_until
@@ -21,9 +25,10 @@ from tests.test_body_image_remote import (
     FakeWorker,
     jpeg,
     local_worker,  # noqa: F401 (pytest fixture)
+    post,
     redirect,
 )
-from tests.test_body_image_remote import tcp_service as sync_tcp_service
+from tests.test_body_image_remote import client as remote_client  # noqa: F401 (pytest fixture)
 from tests.test_body_image_remote_async import (
     KEY,
     OK,
@@ -112,15 +117,6 @@ def test_tcp_connection_is_reused_across_requests(local_worker):  # noqa: F811
     assert (local_worker.requests, local_worker.connections) == (6, 1)
 
 
-def test_validate_still_opens_a_connection_per_request(local_worker):  # noqa: F811
-    svc = sync_tcp_service(local_worker, limiter=BodyValidationLimiter(1, 1))
-
-    for _ in range(3):
-        assert svc.validate(jpeg()).s3_key == KEY
-
-    assert (local_worker.requests, local_worker.connections) == (3, 3)
-
-
 def test_server_that_refuses_keep_alive_gets_a_new_connection_each_time(local_worker):  # noqa: F811
     local_worker.keep_alive = False
 
@@ -160,29 +156,6 @@ def test_concurrent_requests_use_separate_connections_and_keep_them(local_worker
     run(scenario)
 
     assert (local_worker.requests, local_worker.connections) == (3, 2)
-
-
-# --- validate() 와의 분리 ---
-
-
-def test_validate_never_touches_the_shared_client(clients):
-    # 1-4 의 운영 상태와 같다. 공유 client 는 열려 있고 요청은 동기 경로로 온다.
-    fake = FakeWorker()
-
-    async def scenario():
-        svc = await opened(service(fake, limiter=BodyValidationLimiter(1, 1)))
-        shared = svc._shared_client
-
-        for _ in range(2):
-            assert (await asyncio.to_thread(svc.validate, jpeg())).s3_key == KEY
-
-        assert clients.sends[id(shared)] == 0
-        assert not shared.is_closed
-        others = [client for client in clients.clients if client is not shared]
-        assert len(others) == 2  # 요청마다 새로 만들었다
-        assert all(client.is_closed for client in others)
-
-    run(scenario)
 
 
 # --- 열림·닫힘 ---
@@ -517,24 +490,17 @@ COOKIE_CASES = {
 
 
 @pytest.mark.parametrize(("set_cookies", "expected"), COOKIE_CASES.values(), ids=COOKIE_CASES)
-def test_redirect_cookies_behave_the_same_on_both_paths(set_cookies, expected):
-    def steps():
-        return [(0, 303, {"location": POLL, "set-cookie": value}, b"") for value in set_cookies] + [OK]
-
-    sync_worker, async_worker = FakeWorker(steps=steps()), FakeWorker(steps=steps())
-
-    service(sync_worker, limiter=BodyValidationLimiter(1, 1)).validate(jpeg())
+def test_redirect_cookies_keep_the_existing_behaviour(set_cookies, expected):
+    # expected 는 A 방식(요청마다 client) 코드에서 확인한 값이다.
+    steps = [(0, 303, {"location": POLL, "set-cookie": value}, b"") for value in set_cookies] + [OK]
+    worker = FakeWorker(steps=steps)
 
     async def scenario():
-        await (await opened(service(async_worker))).avalidate(jpeg())
+        await (await opened(service(worker))).avalidate(jpeg())
 
     run(scenario)
 
-    def cookies(worker):
-        return [call.headers.get("cookie") for call in worker.calls]
-
-    assert cookies(sync_worker) == expected
-    assert cookies(async_worker) == expected
+    assert [call.headers.get("cookie") for call in worker.calls] == expected
 
 
 def test_cookies_stay_isolated_on_a_reused_real_connection(local_worker):  # noqa: F811
@@ -673,12 +639,6 @@ def lifespan_manager(remote, monkeypatch):  # noqa: F811
     return build
 
 
-def use_async_limiter(manager, monkeypatch):
-    """Router 전환 전이라 runtime 은 동기 limiter 를 쓴다. 공유 client 경로를 보려고 이 service 만 바꾼다."""
-    limiter = AsyncBodyValidationLimiter(1, 1)
-    monkeypatch.setattr(manager.runtime.service, "limiter", limiter)
-
-
 def test_lifespan_owns_the_shared_client(lifespan_manager, monkeypatch, clients):
     fake = FakeWorker()
     manager = lifespan_manager(fake)
@@ -687,7 +647,6 @@ def test_lifespan_owns_the_shared_client(lifespan_manager, monkeypatch, clients)
         service_ = manager.get_service()
         shared = service_._shared_client
         assert not shared.is_closed
-        use_async_limiter(manager, monkeypatch)
         result = client.portal.call(service_.avalidate, jpeg())
         loop = client.portal.call(asyncio.get_running_loop)
 
@@ -705,7 +664,6 @@ def test_restart_uses_a_new_client_on_the_new_event_loop(lifespan_manager, monke
 
     for _ in range(2):
         with TestClient(main.app) as client:
-            use_async_limiter(manager, monkeypatch)
             service_ = manager.get_service()
             client.portal.call(service_.avalidate, jpeg())
             seen.append((service_._shared_client, client.portal.call(asyncio.get_running_loop)))
@@ -841,7 +799,6 @@ def test_cancelled_shutdown_while_draining_still_closes_everything(lifespan_mana
 
         async def run_lifespan():
             async with main.lifespan(main.app):
-                use_async_limiter(manager, monkeypatch)
                 running.append(asyncio.create_task(manager.get_service().avalidate(jpeg())))
                 await wait_until(worker.entered.is_set)
 
@@ -893,19 +850,65 @@ def test_remote_transport_reaches_the_service(monkeypatch):
     assert manager.get_service()._transport is fake.transport
 
 
-# --- 기존 경로 회귀: 공유 client 가 열려 있어도 Router 는 validate() 를 쓴다 ---
+# --- API 는 공유 client 를 쓴다 ---
 
 
-def test_api_still_goes_through_validate_while_the_shared_client_is_open(real_validation, clients):  # noqa: F811
-    install, worker_calls = real_validation
+def test_api_requests_share_the_client_opened_by_the_lifespan(real_validation, clients):  # noqa: F811
+    worker_calls = real_validation
 
     with TestClient(main.app, raise_server_exceptions=False) as client:
-        install()  # 요청마다 만드는 client 는 생성 뒤에 바꾼 _transport 도 그대로 본다
-        response = validate_jpeg(client)
+        responses = [validate_jpeg(client) for _ in range(3)]
         shared = main.runtime_manager.get_service()._shared_client
         sends = clients.sends[id(shared)]
 
-    assert response.status_code == 200
-    assert worker_calls == [VALIDATE_URL]
-    assert sends == 0
-    assert len(clients.clients) == 2  # 공유 1 + 요청별 1
+    assert [response.status_code for response in responses] == [200, 200, 200]
+    assert worker_calls == [VALIDATE_URL] * 3
+    assert clients.clients == [shared]  # 요청마다 만들지 않는다
+    assert sends == 3
+    assert shared.is_closed
+
+
+def test_remote_runtime_uses_the_async_limiter_and_each_lifespan_gets_a_new_one(lifespan_manager):
+    manager = lifespan_manager(FakeWorker())
+    limiters = []
+
+    for _ in range(2):
+        with TestClient(main.app):
+            limiters.append(manager.get_service().limiter)
+
+    assert all(isinstance(limiter, AsyncBodyValidationLimiter) for limiter in limiters)
+    assert limiters[0] is not limiters[1]
+
+
+def test_remote_runtime_is_not_built_outside_the_lifespan(remote, monkeypatch, clients):  # noqa: F811
+    monkeypatch.setattr(validation_router, "runtime_manager", remote)
+
+    with pytest.raises(BodyImageRuntimeError):
+        validation_router.get_service()
+
+    assert remote.runtime is None
+    assert clients.clients == []
+
+
+def test_api_without_a_lifespan_is_runtime_unavailable(remote, monkeypatch, remote_client):  # noqa: F811
+    monkeypatch.setattr(validation_router, "runtime_manager", remote)
+
+    response = post(remote_client, jpeg())
+
+    assert response.status_code == 500
+    assert response.json()["code"] == "BODY_IMAGE_RUNTIME_UNAVAILABLE"
+    assert remote.runtime is None
+
+
+def test_runtime_whose_client_was_not_opened_answers_503(
+    remote, monkeypatch, remote_client, caplog  # noqa: F811
+):
+    monkeypatch.setattr(validation_router, "runtime_manager", remote)
+    remote.start()
+
+    with caplog.at_level(logging.ERROR, logger="app.body_image_validation.remote"):
+        response = post(remote_client, jpeg())
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "BODY_IMAGE_WORKER_UNAVAILABLE"
+    assert "client is not open" in caplog.text

@@ -2,7 +2,6 @@ import logging
 import threading
 from typing import TYPE_CHECKING
 
-from app.body_image_validation.concurrency import BodyValidationLimiter
 from app.body_image_validation.inference import BodyImageModels, BodyImageRuntimeError
 from app.body_image_validation.service import BodyImageValidationService
 from app.clients.s3 import ImageStorage, S3ConfigError, S3ImageStorage, get_s3_bucket
@@ -57,10 +56,12 @@ class BodyImageRuntime:
 class RemoteBodyImageRuntime:
     """remote 모드(AI Server). 모델·GPU·S3 client 를 만들지 않고 Modal worker 를 부르는 service 만 둔다.
 
-    service 가 공유 HTTP client 를 소유한다. lifespan 이 aopen()·aclose() 를 같은 event loop 에서 부른다.
+    service 가 공유 HTTP client 를 소유한다. lifespan 이 aopen()·aclose() 를 같은 event loop 에서 부른다. client 와
+    limiter 는 그 event loop 에 묶이므로 lifespan 마다 새 runtime 을 만든다(close() 가 manager 를 비운다).
     """
 
     def __init__(self, transport: "httpx.AsyncBaseTransport | None" = None) -> None:
+        from app.body_image_validation.async_concurrency import AsyncBodyValidationLimiter
         from app.body_image_validation.remote import (
             RemoteBodyImageValidationService,
             RemoteWorkerConfigError,
@@ -75,7 +76,7 @@ class RemoteBodyImageRuntime:
                 api_key=settings.BODY_IMAGE_REMOTE_API_KEY,
                 timeout=config.REMOTE_TIMEOUT_SECONDS,
                 total_deadline=config.REMOTE_TOTAL_DEADLINE_SECONDS,
-                limiter=BodyValidationLimiter(
+                limiter=AsyncBodyValidationLimiter(
                     config.MAX_CONCURRENT_BODY_VALIDATIONS,
                     config.MAX_WAITING_BODY_VALIDATIONS,
                     max_wait_seconds=config.MAX_QUEUE_WAIT_SECONDS,
@@ -136,7 +137,8 @@ class BodyImageRuntimeManager:
         return self._runtime
 
     def get_service(self) -> BodyImageValidationService:
-        if self._runtime is None:
+        # remote runtime 은 lifespan 만 만든다. 여기서 만들면 공유 client 를 열 event loop 가 없다.
+        if self._runtime is None and config.VALIDATION_MODE != "remote":
             self.start()
         if self._runtime is None:
             if isinstance(self._error, S3ConfigError):

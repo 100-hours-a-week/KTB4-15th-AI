@@ -98,16 +98,7 @@ async def rejected(call):
     return failure(exc_info.value)
 
 
-def outcome_of(call):
-    try:
-        return call().s3_key
-    except BodyImageValidationError as error:
-        return error.status_code, error.code, error.message
-    except Exception as error:  # noqa: BLE001 - 예상 밖 오류도 두 경로가 같아야 한다
-        return type(error).__name__
-
-
-# --- validate() 와 같은 정책: 정상·redirect·크기 제한·오류 매핑·재시도 없음 ---
+# --- 정상·redirect·크기 제한·오류 매핑·재시도 없음 ---
 
 MESSAGE = "머리부터 발끝까지 모두 나오도록 전신을 촬영해주세요."
 POLICY_CASES = {
@@ -170,36 +161,25 @@ POLICY_CASES = {
 
 
 @pytest.mark.parametrize(("steps", "expected", "requests"), POLICY_CASES.values(), ids=POLICY_CASES)
-def test_avalidate_applies_the_same_policy_as_validate(steps, expected, requests):
-    image = jpeg()
-    sync_worker, async_worker = FakeWorker(steps=steps()), FakeWorker(steps=steps())
-    sync_service = service(sync_worker, limiter=BodyValidationLimiter(1, 1))
-
-    sync_outcome = outcome_of(lambda: sync_service.validate(image))
-    results = {}
+def test_avalidate_applies_the_remote_policy(steps, expected, requests):
+    worker = FakeWorker(steps=steps())
+    outcome = {}
 
     async def scenario():
-        async_service = await opened(service(async_worker))
+        svc = await opened(service(worker))
         try:
-            results["value"] = (await async_service.avalidate(image)).s3_key
+            outcome["value"] = (await svc.avalidate(jpeg())).s3_key
         except BodyImageValidationError as error:
-            results["value"] = (error.status_code, error.code, error.message)
-        except Exception as error:  # noqa: BLE001
-            results["value"] = type(error).__name__
-        assert state(async_service.limiter) == (0, 0)
+            outcome["value"] = (error.status_code, error.code, error.message)
+        except Exception as error:  # noqa: BLE001 - 예상 밖 오류도 그대로 올라와야 한다
+            outcome["value"] = type(error).__name__
+        assert state(svc.limiter) == (0, 0)
 
     run(scenario)
 
-    def matches(value):
-        return value == expected or (len(expected) == 2 and value[:2] == expected)
-
-    assert matches(sync_outcome)
-    assert results["value"] == sync_outcome
-    # 재시도가 없고, 같은 요청을 같은 순서로 보낸다
-    assert len(async_worker.calls) == len(sync_worker.calls) == requests
-    assert [(c.method, str(c.url)) for c in async_worker.calls] == [
-        (c.method, str(c.url)) for c in sync_worker.calls
-    ]
+    # (status, code) 만 적은 경우는 공통 시스템 오류 문구(message 없음)다.
+    assert outcome["value"] == ((*expected, None) if len(expected) == 2 else expected)
+    assert len(worker.calls) == requests  # 재시도가 없다
 
 
 def test_success_returns_the_result_object():
@@ -771,7 +751,7 @@ def test_cancel_delivered_with_the_deadline_stays_a_cancellation(monkeypatch):
     assert len(fake.calls) == 1
 
 
-# --- 동기 경로와의 구분 ---
+# --- limiter ---
 
 
 def test_avalidate_refuses_the_sync_limiter_before_calling_the_worker():
@@ -785,17 +765,6 @@ def test_avalidate_refuses_the_sync_limiter_before_calling_the_worker():
 
     run(scenario)
 
-    assert fake.calls == []
-
-
-def test_validate_refuses_the_async_limiter_before_calling_the_worker():
-    fake = FakeWorker()
-    svc = service(fake, limiter=AsyncBodyValidationLimiter(1, 1))
-
-    with pytest.raises(TypeError):
-        svc.validate(jpeg())
-
-    assert state(svc.limiter) == (0, 0)
     assert fake.calls == []
 
 

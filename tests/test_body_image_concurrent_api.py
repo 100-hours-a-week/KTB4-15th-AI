@@ -1,21 +1,15 @@
-"""전신 이미지 검증 API 의 HTTP 동시 요청. 실행 구조(asyncio.run·threadpool → 비동기)가 바뀌어도 그대로 통과해야 한다.
-
-운영 경로인 main.app(lifespan·middleware·실제 remote runtime)에 HTTP 로만 요청하고, service.validate·limiter.slot 을
-직접 부르지 않는다. 구조에 닿는 곳은 install(가짜 worker 끼우기)과 limiter.waiting 읽기(요청 순서 맞추기)뿐이다.
-
-TestClient 는 모든 요청을 lifespan 과 같은 event loop 하나에서 처리하고 호출한 thread 만 막는다. 그래서 thread 마다
-요청을 보내면 서버에서는 동시 요청이고, 그 loop 가 막히면 다른 요청의 응답도 오지 않는다. 실제 Modal 은 부르지 않는다.
-"""
-
 import asyncio
 import threading
 import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from app import main
 from app.body_image_validation import router as validation_router
+from app.body_image_validation.models import BodyImageValidationResult
+from app.body_image_validation.runtime import BodyImageRuntimeManager
 from app.config import body_image_validation as config
 from tests.test_body_image_queue_deadline import BUSY, wait_until
 from tests.test_body_image_remote import FakeWorker, jpeg
@@ -31,6 +25,16 @@ from tests.test_body_image_warmup_api import (  # noqa: F401 (pytest fixture)
 QUEUE_WAIT = 0.5
 DEADLINE = 3.0
 ANSWER_WITHIN = 2.0  # DEADLINE 보다 짧다. 이 안에 응답이 오지 않으면 막힌 것으로 본다
+
+
+class WorkerSlot(httpx.AsyncBaseTransport):
+    """공유 client 를 만들 때 넘기는 transport. 테스트가 고른 가짜 worker 로 요청을 보낸다."""
+
+    def __init__(self):
+        self.worker = None
+
+    async def handle_async_request(self, request):
+        return await self.worker.transport.handle_async_request(request)
 
 
 class HeldWorker(FakeWorker):
@@ -83,8 +87,8 @@ class Call(threading.Thread):
 
 
 class Api:
-    def __init__(self, client, manager, monkeypatch):
-        self.client, self.manager, self.monkeypatch = client, manager, monkeypatch
+    def __init__(self, client, manager, slot):
+        self.client, self.manager, self.slot = client, manager, slot
         self.held = []
 
     @property
@@ -92,7 +96,7 @@ class Api:
         return self.manager.runtime.service.limiter
 
     def install(self, worker):
-        self.monkeypatch.setattr(self.manager.runtime.service, "_transport", worker.transport)
+        self.slot.worker = worker
         self.held.append(worker)
         return worker
 
@@ -122,9 +126,12 @@ def api(remote, monkeypatch):  # noqa: F811
     monkeypatch.setattr(config, "MAX_QUEUE_WAIT_SECONDS", QUEUE_WAIT)
     monkeypatch.setattr(config, "REMOTE_TOTAL_DEADLINE_SECONDS", DEADLINE)
     monkeypatch.setattr(config, "REMOTE_TIMEOUT_SECONDS", DEADLINE)
-    monkeypatch.setattr(validation_router, "runtime_manager", remote)
+    slot = WorkerSlot()
+    manager = BodyImageRuntimeManager(remote_transport=slot)
+    monkeypatch.setattr(main, "runtime_manager", manager)
+    monkeypatch.setattr(validation_router, "runtime_manager", manager)
     with TestClient(main.app, raise_server_exceptions=False) as client:
-        test_api = Api(client, remote, monkeypatch)
+        test_api = Api(client, manager, slot)
         try:
             yield test_api
         finally:
@@ -220,3 +227,52 @@ def test_local_validation_returns_the_key_and_stays_off_the_event_loop(api, monk
     response = running.result()
     assert response.status_code == 200
     assert response.json()["data"]["s3_key"].startswith("body-images/")
+
+
+def test_local_service_runs_in_the_threadpool(api, monkeypatch):
+    threads = []
+
+    class LocalStub:
+        def validate(self, body):
+            threads.append(threading.get_ident())
+            return BodyImageValidationResult(s3_key="body-images/local.png")
+
+    monkeypatch.setattr(validation_router, "get_service", LocalStub)
+    loop_thread = api.client.portal.call(threading.get_ident)
+
+    response = api.post(image_bytes())
+
+    assert response.json()["data"] == {"s3_key": "body-images/local.png"}
+    assert threads and threads[0] != loop_thread
+
+
+def test_slow_local_runtime_start_stays_off_the_event_loop(api, monkeypatch):
+    entered, released = threading.Event(), threading.Event()
+    local = local_service()
+
+    def slow_start():
+        entered.set()
+        released.wait(DEADLINE)
+        return local
+
+    monkeypatch.setattr(validation_router, "get_service", slow_start)
+    running = api.start(image_bytes())
+    try:
+        assert entered.wait(ANSWER_WITHIN)
+
+        assert api.health().status_code == 200  # 모델을 올리는 동안에도 서버는 응답한다
+    finally:
+        released.set()
+
+    assert running.result().status_code == 200
+
+
+def test_rejected_upload_is_answered_from_the_shared_router_in_both_modes(api, monkeypatch):
+    local = local_service()
+
+    remote_response = api.post(b"not-an-image")
+    monkeypatch.setattr(validation_router, "get_service", lambda: local)
+    local_response = api.post(b"not-an-image")
+
+    assert remote_response.status_code == local_response.status_code == 400
+    assert remote_response.json() == local_response.json()

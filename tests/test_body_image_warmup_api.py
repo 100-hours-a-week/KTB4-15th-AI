@@ -539,17 +539,16 @@ def jpeg(size=(600, 800)):
 @pytest.fixture
 def real_validation(remote, monkeypatch):
     """검증 API 가 실제 RemoteBodyImageValidationService(limiter·deadline 포함)를 거쳐 가짜 worker 를 부르게 한다."""
-    monkeypatch.setattr(validation_router, "runtime_manager", remote)
     calls = []
 
     def handle(request):
         calls.append(request.url.path)
         return httpx.Response(200, content=WORKER_SUCCESS)
 
-    def install():
-        monkeypatch.setattr(remote.runtime.service, "_transport", httpx.MockTransport(handle))
-
-    return install, calls
+    manager = BodyImageRuntimeManager(remote_transport=httpx.MockTransport(handle))
+    monkeypatch.setattr(main, "runtime_manager", manager)
+    monkeypatch.setattr(validation_router, "runtime_manager", manager)
+    return calls
 
 
 def use_modal(monkeypatch, handle):
@@ -603,12 +602,11 @@ def _status(code):
 def test_validation_is_unaffected_by_each_warmup_failure(
     real_validation, monkeypatch, handle, outcome
 ):
-    install, worker_calls = real_validation
+    worker_calls = real_validation
     monkeypatch.setattr(config, "WARMUP_TIMEOUT_SECONDS", 0.05)  # 전체 시간 초과를 빨리 낸다
     use_modal(monkeypatch, handle)
 
     with TestClient(main.app, raise_server_exceptions=False) as client:
-        install()
         manager = client.app.state.body_image_warmup
         accepted = warm(client)
         wait_until(lambda: manager.last_result is not None)
@@ -627,12 +625,11 @@ def test_validation_is_unaffected_by_each_warmup_failure(
 
 
 def test_validation_works_after_warmup_is_closed_or_cancelled(real_validation, monkeypatch):
-    install, worker_calls = real_validation
+    worker_calls = real_validation
     fake = FakeClient(block=True)
     use_client(monkeypatch, fake)
 
     with TestClient(main.app, raise_server_exceptions=False) as client:
-        install()
         manager = client.app.state.body_image_warmup
         assert warm(client).status_code == 202
         wait_until(lambda: fake.calls == 1)

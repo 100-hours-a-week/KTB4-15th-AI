@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from app.body_image_validation import inference, router, runtime, worker
-from app.body_image_validation.concurrency import BodyValidationLimiter
+from app.body_image_validation.async_concurrency import AsyncBodyValidationLimiter
 from app.body_image_validation.remote import (
     RemoteBodyImageValidationService,
     RemoteWorkerConfigError,
@@ -91,9 +91,19 @@ def remote_service(fake, limiter=None, timeout=30.0, deadline=60.0):
         api_key="worker-key",
         timeout=timeout,
         total_deadline=deadline,
-        limiter=limiter or BodyValidationLimiter(1, 1),
+        limiter=limiter or AsyncBodyValidationLimiter(1, 1),
         transport=fake.transport,
     )
+
+
+_app = SimpleNamespace(portal=None, opened=[])
+
+
+async def _close(service):
+    # 테스트가 실패해 호출이 남아 있어도 기다리지 않는다(시간이 끝나면 바로 닫는다).
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(1.0):
+            await service.aclose()
 
 
 @pytest.fixture
@@ -101,7 +111,12 @@ def client(monkeypatch):
     monkeypatch.setattr(settings, "INTERNAL_API_KEY", KEY)
     monkeypatch.setattr(settings, "AUTH_DISABLED", False)
     with TestClient(worker.create_app(), raise_server_exceptions=False) as test_client:
-        yield test_client
+        _app.portal = test_client.portal
+        try:
+            yield test_client
+        finally:
+            while _app.opened:
+                _app.portal.call(_close, _app.opened.pop())
 
 
 def post(client, body):
@@ -109,6 +124,9 @@ def post(client, body):
 
 
 def use(monkeypatch, service):
+    """worker 앱에 remote service 를 끼운다. 이 앱에는 lifespan 이 없어 공유 client 를 서버 loop 에서 대신 연다."""
+    _app.portal.call(service.aopen)
+    _app.opened.append(service)
     monkeypatch.setattr(router, "get_service", lambda: service)
 
 
@@ -142,7 +160,7 @@ def test_request_carries_both_auth_layers_and_the_original_image(client, monkeyp
 def test_trailing_slash_in_the_base_url_is_ignored():
     service = RemoteBodyImageValidationService(
         WORKER + "/", proxy_key="k", proxy_secret="s", api_key="a", timeout=1, total_deadline=1,
-        limiter=BodyValidationLimiter(1, 1),
+        limiter=AsyncBodyValidationLimiter(1, 1),
     )
     assert service.endpoint == WORKER + URL
 
@@ -409,7 +427,7 @@ def test_cookies_from_one_request_do_not_reach_the_next(client, monkeypatch):
 def test_next_request_succeeds_after_a_failure(client, monkeypatch, failure):
     fake = FakeWorker(steps=[failure, (0, 200, {}, SUCCESS)])
     # 대기열이 없어 슬롯이 돌아오지 않으면 다음 요청은 429 다.
-    use(monkeypatch, remote_service(fake, limiter=BodyValidationLimiter(1, 0)))
+    use(monkeypatch, remote_service(fake, limiter=AsyncBodyValidationLimiter(1, 0)))
 
     assert post(client, jpeg()).status_code != 200
 
@@ -421,7 +439,7 @@ def test_next_request_succeeds_after_a_failure(client, monkeypatch, failure):
 
 def test_next_request_succeeds_after_the_deadline_cancelled_a_call(client, monkeypatch):
     fake = FakeWorker(steps=[(5.0, 200, {}, SUCCESS), (0, 200, {}, SUCCESS)])
-    use(monkeypatch, remote_service(fake, limiter=BodyValidationLimiter(1, 0), timeout=0.05, deadline=0.05))
+    use(monkeypatch, remote_service(fake, limiter=AsyncBodyValidationLimiter(1, 0), timeout=0.05, deadline=0.05))
 
     assert post(client, jpeg()).status_code == 504
 
@@ -511,7 +529,7 @@ def test_consecutive_requests_work_over_real_connections(client, monkeypatch, lo
 
 def test_request_after_a_cancelled_call_works_over_real_connections(client, monkeypatch, local_worker):
     local_worker.delays = [0.5]
-    use(monkeypatch, tcp_service(local_worker, limiter=BodyValidationLimiter(1, 0), timeout=0.1, deadline=0.1))
+    use(monkeypatch, tcp_service(local_worker, limiter=AsyncBodyValidationLimiter(1, 0), timeout=0.1, deadline=0.1))
 
     assert post(client, jpeg()).status_code == 504
 
@@ -545,11 +563,11 @@ def test_invalid_uploads_are_rejected_without_waking_the_worker(client, monkeypa
 
 
 def test_full_limiter_answers_429_without_calling_the_worker(client, monkeypatch):
-    limiter = BodyValidationLimiter(1, 0)
+    limiter = AsyncBodyValidationLimiter(1, 0)
     fake = FakeWorker()
     use(monkeypatch, remote_service(fake, limiter=limiter))
 
-    with limiter.slot():  # 다른 요청이 worker 응답을 기다리는 중
+    with client.portal.wrap_async_context_manager(limiter.slot()):  # 다른 요청이 worker 응답을 기다리는 중
         response = post(client, jpeg())
 
     assert response.status_code == 429
@@ -559,7 +577,7 @@ def test_full_limiter_answers_429_without_calling_the_worker(client, monkeypatch
 
 
 def test_limiter_is_released_after_a_worker_failure(client, monkeypatch):
-    limiter = BodyValidationLimiter(1, 0)
+    limiter = AsyncBodyValidationLimiter(1, 0)
     use(monkeypatch, remote_service(FakeWorker(error=httpx.ReadTimeout("t")), limiter=limiter))
 
     response = post(client, jpeg())
@@ -584,7 +602,7 @@ def test_incomplete_or_unsafe_settings_are_rejected(overrides):
     base_url = options.pop("base_url")
 
     with pytest.raises(RemoteWorkerConfigError):
-        RemoteBodyImageValidationService(base_url, limiter=BodyValidationLimiter(1, 1), **options)
+        RemoteBodyImageValidationService(base_url, limiter=AsyncBodyValidationLimiter(1, 1), **options)
 
 
 @pytest.fixture
@@ -855,7 +873,7 @@ def test_scenario_a_deadline_200_waits_through_the_303_and_returns_the_key(clien
 
 def test_scenario_b_deadline_90_ends_at_90_with_504(client, monkeypatch):
     fake = FakeWorker(steps=modal_slow_steps())
-    limiter = BodyValidationLimiter(1, 0)
+    limiter = AsyncBodyValidationLimiter(1, 0)
     use(monkeypatch, remote_service(fake, limiter=limiter, timeout=90 * SCALE, deadline=90 * SCALE))
 
     started = time.monotonic()

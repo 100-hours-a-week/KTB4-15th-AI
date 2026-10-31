@@ -5,15 +5,13 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator, Callable
-from contextlib import AbstractAsyncContextManager as AsyncContextManager
-from typing import NoReturn
 
 import httpx
 from anyio import to_thread
 
 from app.body_image_validation import deadline as worker_deadline
 from app.body_image_validation.async_concurrency import AsyncBodyValidationLimiter
-from app.body_image_validation.concurrency import BodyValidationLimiter, SlotWaitTimeout
+from app.body_image_validation.concurrency import SlotWaitTimeout
 from app.body_image_validation.exceptions import BodyImageValidationError
 from app.body_image_validation.image_io import open_image
 from app.body_image_validation.models import BodyImageValidationResult
@@ -80,7 +78,7 @@ class RemoteBodyImageValidationService:
         api_key: str,
         timeout: float,
         total_deadline: float,
-        limiter: BodyValidationLimiter | AsyncBodyValidationLimiter,
+        limiter: AsyncBodyValidationLimiter,
         transport: httpx.AsyncBaseTransport | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
@@ -129,37 +127,15 @@ class RemoteBodyImageValidationService:
         self._shared_calls = 0
         self._shared_idle: asyncio.Event
 
-    def validate(self, image_body: bytes) -> BodyImageValidationResult:
-        # 전체 deadline 은 요청마다 여기서 한 번만 만든다(endpoint 가 service 를 부른 시점, monotonic).
-        # 대기열 대기·Modal 연결·스케줄링·실행·303·응답 수신이 모두 이 하나의 deadline 을 나눠 쓴다.
-        received = self._clock()
-        deadline_at = received + self.total_deadline
-        # local 과 같은 입력 검사. 실패하면 worker 를 부르지 않는다.
-        image_format = _image_format(image_body)
-        remaining = deadline_at - self._clock()
-        if remaining <= 0:
-            raise _timeout()
-        with contextlib.ExitStack() as stack:
-            queued = self._clock()
-            try:
-                # 대기열에서는 최대 대기시간과 남은 deadline 중 짧은 쪽까지만 기다린다.
-                stack.enter_context(self.limiter.slot(max_wait=remaining))
-            except SlotWaitTimeout as error:
-                self._give_up_in_queue(error, self._clock() - queued, remaining)
-            queue_wait = self._clock() - queued
-            if deadline_at - self._clock() <= 0:
-                logger.info("body image request has no time left after queue: waited=%.2fs", queue_wait)
-                raise _timeout()
-            # 이 thread(threadpool worker) 전용 event loop. 서버 event loop 를 막거나 쓰지 않는다.
-            status, body = asyncio.run(self._call(image_body, image_format, deadline_at, queue_wait))
-        return self._result(status, body)
-
     async def avalidate(self, image_body: bytes) -> BodyImageValidationResult:
-        """validate() 와 같은 정책의 비동기 경로. limiter 는 AsyncBodyValidationLimiter 여야 한다.
+        """서버 event loop 에서 돈다. 입력 검사만 threadpool 에서 한다.
 
         취소(asyncio.CancelledError)는 바꾸지 않고 그대로 전한다. 슬롯은 어떤 경우에도 반환한다.
+        Backend 가 연결을 끊어도 endpoint 는 취소되지 않아 이 호출은 끝까지 가고 슬롯도 그때 돌아온다. deadline
+        초과는 연결을 끊고 슬롯을 돌려주지만 이미 시작한 Modal 작업은 멈추지 않는다.
         """
-        # deadline 을 만드는 시점도 같다. 입력 검사와 threadpool 대기도 이 시간 안에 들어간다.
+        # 전체 deadline 은 요청마다 여기서 한 번만 만든다(endpoint 가 service 를 부른 시점, monotonic).
+        # 입력 검사·threadpool 대기·대기열 대기·Modal 연결·실행·303·응답 수신이 모두 이 하나의 deadline 을 나눠 쓴다.
         received = self._clock()
         deadline_at = received + self.total_deadline
         try:
@@ -171,23 +147,30 @@ class RemoteBodyImageValidationService:
         remaining = deadline_at - self._clock()
         if remaining <= 0:
             raise _timeout()
+        queue_limit = self.limiter.max_wait_seconds
         async with contextlib.AsyncExitStack() as stack:
             queued = self._clock()
             try:
+                # 대기열에서는 최대 대기시간과 남은 deadline 중 짧은 쪽까지만 기다린다.
                 await stack.enter_async_context(self.limiter.slot(max_wait=remaining))
             except SlotWaitTimeout as error:
-                self._give_up_in_queue(error, self._clock() - queued, remaining)
+                waited = self._clock() - queued
+                if queue_limit is None or remaining <= queue_limit:
+                    # deadline 이 먼저 끝났다. Modal 은 부르지 않는다.
+                    logger.info("body image request timed out in queue: waited=%.2fs deadline=%ss",
+                                waited, self.total_deadline)
+                    raise _timeout() from error
+                logger.info("body image request gave up in queue: waited=%.2fs limit=%ss", waited, queue_limit)
+                raise
             queue_wait = self._clock() - queued
             if deadline_at - self._clock() <= 0:
                 logger.info("body image request has no time left after queue: waited=%.2fs", queue_wait)
                 raise _timeout()
-            status, body = await self._call(
-                image_body, image_format, deadline_at, queue_wait, open_client=self._borrow_shared_client
-            )
+            status, body = await self._call(image_body, image_format, deadline_at, queue_wait)
         return self._result(status, body)
 
     async def aopen(self) -> None:
-        """avalidate() 가 쓸 공유 client 를 이 event loop 에서 만든다. 이미 열려 있으면 아무것도 하지 않는다."""
+        """공유 client 를 이 event loop 에서 만든다. 이미 열려 있으면 아무것도 하지 않는다."""
         self._check_shared_loop()
         if self._shared_client is not None:
             return
@@ -218,24 +201,8 @@ class RemoteBodyImageValidationService:
         if self._shared_loop is not None and self._shared_loop is not asyncio.get_running_loop():
             raise RuntimeError("공유 HTTP client 는 만든 event loop 에서만 쓸 수 있습니다.")
 
-    def _give_up_in_queue(self, error: SlotWaitTimeout, waited: float, remaining: float) -> NoReturn:
-        queue_limit = self.limiter.max_wait_seconds
-        if queue_limit is None or remaining <= queue_limit:
-            # deadline 이 먼저 끝났다. Modal 은 부르지 않는다.
-            logger.info("body image request timed out in queue: waited=%.2fs deadline=%ss",
-                        waited, self.total_deadline)
-            raise _timeout() from error
-        logger.info("body image request gave up in queue: waited=%.2fs limit=%ss", waited, queue_limit)
-        raise error
-
     async def _call(
-        self,
-        image_body: bytes,
-        image_format: str,
-        deadline_at: float,
-        queue_wait: float = 0.0,
-        *,
-        open_client: Callable[[], AsyncContextManager[httpx.AsyncClient]] | None = None,
+        self, image_body: bytes, image_format: str, deadline_at: float, queue_wait: float = 0.0
     ) -> tuple[int, bytes]:
         start = self._clock()
         remaining = deadline_at - start
@@ -248,13 +215,11 @@ class RemoteBodyImageValidationService:
         state = {"redirects": 0, "status": None, "outcome": "error"}
         try:
             async with asyncio.timeout(remaining):
-                status, body = await self._exchange(
-                    image_body, image_format, deadline_at, state, headers, open_client or self._new_client
-                )
+                status, body = await self._exchange(image_body, image_format, deadline_at, state, headers)
             state.update(status=status, outcome="response")
             return status, body
         except asyncio.CancelledError:
-            # 호출자가 취소했다(avalidate 경로). 소켓 작업은 멈췄고 다른 오류로 바꾸지 않는다.
+            # 호출자가 취소했다. 소켓 작업은 멈췄고 다른 오류로 바꾸지 않는다.
             state["outcome"] = "cancelled"
             raise
         except TimeoutError as error:
@@ -280,13 +245,11 @@ class RemoteBodyImageValidationService:
                 remaining, self.total_deadline, http_cancelled, "unknown" if http_cancelled else "n/a",
             )
 
-    async def _exchange(
-        self, image_body, image_format, deadline_at, state, headers, open_client
-    ) -> tuple[int, bytes]:
+    async def _exchange(self, image_body, image_format, deadline_at, state, headers) -> tuple[int, bytes]:
         content_type, extension = _CONTENT_TYPES.get(image_format, ("application/octet-stream", "bin"))
         # 이 호출의 cookie. 303 을 따라갈 때만 쓰고 호출이 끝나면 버린다.
         cookies = httpx.Cookies()
-        async with open_client() as client:
+        async with self._borrow_shared_client() as client:
             request = client.build_request(
                 "POST",
                 self.endpoint,
@@ -317,14 +280,8 @@ class RemoteBodyImageValidationService:
         return httpx.AsyncClient(transport=self._transport, follow_redirects=False, trust_env=False)
 
     @contextlib.asynccontextmanager
-    async def _new_client(self) -> AsyncIterator[httpx.AsyncClient]:
-        """validate() 의 client. 호출마다 만들고 닫는다."""
-        async with self._build_client() as client:
-            yield client
-
-    @contextlib.asynccontextmanager
     async def _borrow_shared_client(self) -> AsyncIterator[httpx.AsyncClient]:
-        """avalidate() 의 client. 공유 client 를 빌려주고 닫지 않는다. aclose() 는 빌려간 호출이 끝나기를 기다린다."""
+        """공유 client 를 빌려주고 닫지 않는다. aclose() 는 빌려간 호출이 끝나기를 기다린다."""
         self._check_shared_loop()
         client = self._shared_client
         if client is None:
