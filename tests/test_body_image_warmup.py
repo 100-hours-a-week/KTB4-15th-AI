@@ -144,6 +144,20 @@ def test_200_with_invalid_json_is_invalid_json(body):
     assert (result.outcome, result.status_code) == (WarmupOutcome.INVALID_JSON, 200)
 
 
+def test_oversized_health_body_is_cut_off_at_the_limit():
+    read = []
+
+    async def chunks():
+        for chunk in [b'{"status":"ok"', *[b" " * 32 * 1024] * 100, b"}"]:
+            read.append(chunk)
+            yield chunk
+
+    result = run(FakeWorker(body=chunks()))
+
+    assert (result.outcome, result.status_code) == (WarmupOutcome.INVALID_JSON, 200)
+    assert len(read) <= 4  # 64KB 를 넘는 조각에서 멈춘다
+
+
 @pytest.mark.parametrize(
     "status, outcome",
     [

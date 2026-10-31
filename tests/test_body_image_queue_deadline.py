@@ -4,14 +4,16 @@
 설정: 실행 1 + 대기 1, 대기열 최대 10초, 전체 deadline 50초.
 """
 
+import importlib
 import threading
 import time
+from contextlib import contextmanager
 
 import httpx
 import pytest
 
 from app.body_image_validation import deadline as worker_deadline
-from app.body_image_validation import router
+from app.body_image_validation import remote, router
 from app.body_image_validation.concurrency import BodyValidationLimiter, SlotWaitTimeout
 from app.body_image_validation.exceptions import BodyImageValidationError, ServerBusyError
 from app.body_image_validation.remote import RemoteBodyImageValidationService
@@ -46,7 +48,7 @@ class TrackingWorker(FakeWorker):
                 self.in_flight -= 1
 
 
-def service(fake, deadline=DEADLINE, queue_wait=QUEUE_WAIT, limiter=None, timeout=100 * S):
+def service(fake, deadline=DEADLINE, queue_wait=QUEUE_WAIT, limiter=None, timeout=100 * S, **kwargs):
     return RemoteBodyImageValidationService(
         "https://example--lookddak-body-image-staging.modal.run",
         proxy_key="wk-test",
@@ -56,6 +58,7 @@ def service(fake, deadline=DEADLINE, queue_wait=QUEUE_WAIT, limiter=None, timeou
         total_deadline=deadline,
         limiter=limiter or BodyValidationLimiter(1, 1, max_wait_seconds=queue_wait),
         transport=fake.transport,
+        **kwargs,
     )
 
 
@@ -217,6 +220,45 @@ def test_deadline_ending_in_queue_is_504_without_calling_modal():
     a.join()
     assert a.result
     assert len(fake.calls) == 1  # B 는 Modal 을 부르지 않았다
+
+
+def test_deadline_spent_on_the_input_check_is_504_without_calling_modal(monkeypatch):
+    now = [1000.0]
+    real_open = remote.open_image
+
+    def slow_open(body):
+        now[0] += DEADLINE
+        return real_open(body)
+
+    monkeypatch.setattr(remote, "open_image", slow_open)
+    fake = FakeWorker(steps=[ok(1)])
+    svc = service(fake, clock=lambda: now[0])
+
+    call = Call(svc).start().join()
+
+    assert (call.error.status_code, call.error.code) == (504, "BODY_IMAGE_WORKER_TIMEOUT")
+    assert fake.calls == []
+    assert idle(svc.limiter)
+
+
+def test_no_time_left_after_the_queue_is_504_without_calling_modal():
+    now = [1000.0]
+
+    class SlowSlot(BodyValidationLimiter):
+        @contextmanager
+        def slot(self, max_wait=None):
+            with super().slot(max_wait):
+                now[0] += DEADLINE
+                yield
+
+    fake = FakeWorker(steps=[ok(1)])
+    svc = service(fake, limiter=SlowSlot(1, 1, max_wait_seconds=QUEUE_WAIT), clock=lambda: now[0])
+
+    call = Call(svc).start().join()
+
+    assert (call.error.status_code, call.error.code) == (504, "BODY_IMAGE_WORKER_TIMEOUT")
+    assert fake.calls == []
+    assert idle(svc.limiter)  # 슬롯을 돌려준다
 
 
 # --- 8~10, 18. 슬롯·대기열 복구 ---
@@ -394,3 +436,30 @@ def test_remote_runtime_limiter_uses_the_configured_wait(monkeypatch):
     assert remote.total_deadline == 50.0
     assert (remote.limiter._max_running, remote.limiter._max_waiting) == (1, 1)
     assert router  # router 는 그대로 쓴다(계약 유지)
+
+
+def test_remote_policy_is_one_running_one_waiting_10s_queue_and_120s_deadline(monkeypatch):
+    from app.body_image_validation import runtime
+    from app.config import body_image_validation as config
+    from app.config import settings
+
+    for name in ("MAX_CONCURRENT_BODY_VALIDATIONS", "MAX_WAITING_BODY_VALIDATIONS",
+                 "BODY_IMAGE_MAX_QUEUE_WAIT_SECONDS"):
+        monkeypatch.delenv(name, raising=False)
+    try:
+        importlib.reload(config)
+        monkeypatch.setattr(config, "VALIDATION_MODE", "remote")
+        monkeypatch.setattr(config, "REMOTE_URL", "https://example.modal.run")
+        monkeypatch.setattr(settings, "BODY_IMAGE_REMOTE_PROXY_KEY", "k")
+        monkeypatch.setattr(settings, "BODY_IMAGE_REMOTE_PROXY_SECRET", "s")
+        monkeypatch.setattr(settings, "BODY_IMAGE_REMOTE_API_KEY", "a")
+
+        built = runtime.RemoteBodyImageRuntime().service
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
+
+    assert built.total_deadline == 120.0
+    assert built.timeout == 120.0
+    assert built.limiter.max_wait_seconds == 10.0
+    assert (built.limiter._max_running, built.limiter._max_waiting) == (1, 1)
