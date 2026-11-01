@@ -652,11 +652,11 @@ def test_deadline_over_a_reused_connection_is_504_and_the_next_request_works(loc
         svc = await opened(tcp_service(local_worker))
         await svc.avalidate(jpeg())
         local_worker.delays = [1.0]
-        svc.total_deadline = svc.timeout = 0.4  # 요청이 서버에 닿은 뒤 끊기도록 넉넉히 둔다
+        svc.total_deadline, svc.timeout = 0.4, httpx.Timeout(0.4)  # 요청이 서버에 닿은 뒤 끊기도록 넉넉히 둔다
 
         assert await rejected(svc.avalidate(jpeg())) == TIMED_OUT
 
-        svc.total_deadline = svc.timeout = 5.0
+        svc.total_deadline, svc.timeout = 5.0, httpx.Timeout(5.0)
         assert (await svc.avalidate(jpeg())).s3_key == KEY
 
     run(scenario)

@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from app import health as health_router
 from app.body_image_validation import router as body_image_validation_router
 from app.body_image_validation import warmup_router as body_image_warmup_router
+from app.body_image_validation.deadline_middleware import BodyImageDeadlineMiddleware
 from app.body_image_validation.runtime import runtime_manager
 from app.chat import router as chat_router
 from app.chat.graph import build_graph
@@ -183,6 +184,9 @@ def _log_fitting_db_target() -> None:
 
 
 app = FastAPI(title="KTB4-15th AI Server", lifespan=lifespan)
+# metrics 보다 먼저 등록해 안쪽에 둔다. 여기서 낸 504 가 metrics 에도 504 로 집계되고, 취소가 BaseHTTPMiddleware 의
+# task group 을 거치지 않는다.
+app.add_middleware(BodyImageDeadlineMiddleware)
 setup_metrics(app)
 
 register_error_handlers(app)

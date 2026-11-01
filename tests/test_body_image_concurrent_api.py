@@ -125,7 +125,7 @@ def api(remote, monkeypatch):  # noqa: F811
     monkeypatch.setattr(config, "MAX_WAITING_BODY_VALIDATIONS", 1)
     monkeypatch.setattr(config, "MAX_QUEUE_WAIT_SECONDS", QUEUE_WAIT)
     monkeypatch.setattr(config, "REMOTE_TOTAL_DEADLINE_SECONDS", DEADLINE)
-    monkeypatch.setattr(config, "REMOTE_TIMEOUT_SECONDS", DEADLINE)
+    monkeypatch.setattr(config, "REMOTE_READ_TIMEOUT_SECONDS", DEADLINE)
     slot = WorkerSlot()
     manager = BodyImageRuntimeManager(remote_transport=slot)
     monkeypatch.setattr(main, "runtime_manager", manager)

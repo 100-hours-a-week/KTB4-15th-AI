@@ -1,18 +1,10 @@
-"""AI Server 의 전체 deadline 을 Modal worker 로 전해, 이미 응답을 포기한 요청을 worker 가 더 처리하지 않게 한다.
-
-AI Server(remote 모드)는 deadline 이 지나면 HTTP 연결을 끊고 504 를 돌려주지만, 그것만으로 Modal 의 작업은
-취소되지 않는다(스케줄링 대기 중이던 요청도 나중에 실행됐다). 그래서 AI Server 가 요청마다 deadline 시각을
-header 로 보내고, worker 는 처리 단계 사이에서 그 시각을 넘겼는지 보고 스스로 멈춘다.
-
-- 시각은 Unix epoch 초(wall clock)다. 서로 다른 machine 이라 monotonic 시계를 쓸 수 없다. NTP 오차는 여유로 덮는다.
-- header 는 worker 앱(Modal)에서만 읽는다. EC2 local 모드에는 이 값이 없어 아무 영향이 없다.
-- 이미 시작한 GPU 추론·S3 업로드를 중간에 끊지는 않는다. 다음 단계로 넘어가기 전에만 멈춘다.
-"""
-
+import asyncio
 import contextvars
 import logging
 import math
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 from app.body_image_validation.exceptions import BodyImageValidationError
 
@@ -25,6 +17,8 @@ UPLOAD_MARGIN_SECONDS = 2.0
 _MAX_DISTANCE_SECONDS = 3600.0
 
 _deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar("body_image_deadline", default=None)
+# AI Server 의 ASGI scope 에서 RequestDeadline 을 찾는 key.
+SCOPE_KEY = "body_image_request_deadline"
 
 
 class RequestDeadlineExceeded(BodyImageValidationError):
@@ -35,6 +29,40 @@ class RequestDeadlineExceeded(BodyImageValidationError):
     def __init__(self, stage: str) -> None:
         super().__init__("BODY_IMAGE_WORKER_TIMEOUT")
         self.stage = stage
+
+
+@dataclass
+class RequestDeadline:
+    """AI Server(remote 모드)에서 요청 하나가 쓰는 전체 제한시간. 시각은 모두 monotonic 이다.
+
+    ASGI middleware 가 요청마다 하나 만들어 scope 에 둔다. hand_over() 전(본문 수신·파싱·인증·service 조회·파일
+    읽기)은 middleware 의 guard 가, 그 뒤(입력 검사·대기열·Modal 호출)는 service 가 같은 deadline_at 으로 지킨다.
+    """
+
+    total: float
+    clock: Callable[[], float] = time.monotonic
+    source: str = "asgi"  # total 을 잰 기준점. 요약 로그의 total_from 이다.
+    stage: str = "request_parse"
+    guard: asyncio.Future[None] | None = None  # service 가 이어받으면 끝난다
+    spent: dict[str, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.started = self._entered = self.clock()
+        self.deadline_at = self.started + self.total
+
+    def enter(self, stage: str) -> None:
+        self.finish_stage()
+        self.stage, self._entered = stage, self.clock()
+
+    def finish_stage(self) -> None:
+        self.spent[self.stage] = self.clock() - self._entered
+
+    def hand_over(self) -> None:
+        """여기부터 service 가 deadline_at 을 지키고 요약 로그를 남긴다."""
+        self.finish_stage()
+        if self.guard is not None:
+            self.guard.set_result(None)
+            self.guard = None
 
 
 def parse_header(value: str | None, now: float | None = None) -> float | None:

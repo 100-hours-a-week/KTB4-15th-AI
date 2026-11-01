@@ -827,7 +827,7 @@ def test_request_after_a_deadline_works_over_real_connections(local_worker):  # 
         svc = await opened(tcp_service(local_worker, timeout=0.4, deadline=0.4))
 
         assert await rejected(svc.avalidate(jpeg())) == TIMED_OUT
-        svc.total_deadline = svc.timeout = 5.0  # 짧은 제한은 첫 요청만을 위한 것이다
+        svc.total_deadline, svc.timeout = 5.0, httpx.Timeout(5.0)  # 짧은 제한은 첫 요청만을 위한 것이다
         assert (await svc.avalidate(jpeg())).s3_key == KEY
 
     run(scenario)

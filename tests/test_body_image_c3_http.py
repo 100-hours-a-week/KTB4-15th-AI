@@ -178,7 +178,7 @@ def live(remote, monkeypatch):  # noqa: F811
     monkeypatch.setattr(config, "MAX_WAITING_BODY_VALIDATIONS", 1)
     monkeypatch.setattr(config, "MAX_QUEUE_WAIT_SECONDS", 10.0)
     monkeypatch.setattr(config, "REMOTE_TOTAL_DEADLINE_SECONDS", 30.0)
-    monkeypatch.setattr(config, "REMOTE_TIMEOUT_SECONDS", 30.0)
+    monkeypatch.setattr(config, "REMOTE_READ_TIMEOUT_SECONDS", 30.0)
     started = []
 
     def start(**kwargs):
@@ -210,9 +210,9 @@ def test_remote_api_runs_avalidate_without_a_new_event_loop_or_client(live, monk
     calls = []
     real_avalidate = RemoteBodyImageValidationService.avalidate
 
-    async def recording_avalidate(self, body):
+    async def recording_avalidate(self, body, limit=None):
         calls.append(asyncio.get_running_loop())
-        return await real_avalidate(self, body)
+        return await real_avalidate(self, body, limit)
 
     def must_not_run(*args, **kwargs):
         raise AssertionError("remote 경로에서 asyncio.run 을 쓰면 안 된다")
@@ -299,7 +299,7 @@ def test_event_loop_answers_while_a_request_waits_for_modal_and_the_queue(live):
 
 def test_stuck_input_check_ends_at_the_deadline_without_calling_modal(live, monkeypatch):
     monkeypatch.setattr(config, "REMOTE_TOTAL_DEADLINE_SECONDS", 0.2)
-    monkeypatch.setattr(config, "REMOTE_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(config, "REMOTE_READ_TIMEOUT_SECONDS", 0.2)
     server = live()
     release = threading.Event()
     real_open = remote_module.open_image
@@ -430,7 +430,7 @@ def test_disconnect_overlapping_the_slot_handover_still_runs_once(live, caplog):
 
 def test_after_a_deadline_the_next_request_can_overlap_the_running_modal_job(live, monkeypatch):
     monkeypatch.setattr(config, "REMOTE_TOTAL_DEADLINE_SECONDS", 0.3)
-    monkeypatch.setattr(config, "REMOTE_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(config, "REMOTE_READ_TIMEOUT_SECONDS", 0.3)
     server = live()
 
     status, body = server.send().read().response()
@@ -439,8 +439,9 @@ def test_after_a_deadline_the_next_request_can_overlap_the_running_modal_job(liv
     assert body["code"] == "BODY_IMAGE_WORKER_TIMEOUT"
     assert server.slots == (0, 0)  # AI Server 의 슬롯은 돌아왔다
     assert (server.modal.active, server.modal.finished) == (1, 0)  # Modal 작업은 계속 돈다
-    server.send()
+    next_request = server.send()
     wait_until(lambda: server.modal.started == 2)
+    next_request.disconnect()
     assert server.modal.max_active == 2  # 슬롯은 1건이어도 Modal 에서는 2건이 겹친다
 
 

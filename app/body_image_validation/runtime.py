@@ -61,6 +61,8 @@ class RemoteBodyImageRuntime:
     """
 
     def __init__(self, transport: "httpx.AsyncBaseTransport | None" = None) -> None:
+        import httpx
+
         from app.body_image_validation.async_concurrency import AsyncBodyValidationLimiter
         from app.body_image_validation.remote import (
             RemoteBodyImageValidationService,
@@ -74,7 +76,12 @@ class RemoteBodyImageRuntime:
                 proxy_key=settings.BODY_IMAGE_REMOTE_PROXY_KEY,
                 proxy_secret=settings.BODY_IMAGE_REMOTE_PROXY_SECRET,
                 api_key=settings.BODY_IMAGE_REMOTE_API_KEY,
-                timeout=config.REMOTE_TIMEOUT_SECONDS,
+                timeout=httpx.Timeout(
+                    connect=config.REMOTE_CONNECT_TIMEOUT_SECONDS,
+                    read=config.REMOTE_READ_TIMEOUT_SECONDS,
+                    write=config.REMOTE_WRITE_TIMEOUT_SECONDS,
+                    pool=config.REMOTE_POOL_TIMEOUT_SECONDS,
+                ),
                 total_deadline=config.REMOTE_TOTAL_DEADLINE_SECONDS,
                 limiter=AsyncBodyValidationLimiter(
                     config.MAX_CONCURRENT_BODY_VALIDATIONS,

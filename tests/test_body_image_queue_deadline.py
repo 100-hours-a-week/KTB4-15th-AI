@@ -515,6 +515,5 @@ def test_remote_policy_is_one_running_one_waiting_10s_queue_and_120s_deadline(mo
         importlib.reload(config)
 
     assert built.total_deadline == 120.0
-    assert built.timeout == 120.0
     assert built.limiter.max_wait_seconds == 10.0
     assert (built.limiter._max_running, built.limiter._max_waiting) == (1, 1)

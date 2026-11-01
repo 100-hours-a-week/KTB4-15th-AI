@@ -552,7 +552,7 @@ def test_request_after_a_cancelled_call_works_over_real_connections(client, monk
 
     assert post(client, jpeg()).status_code == 504
 
-    service.total_deadline = service.timeout = 5.0  # 짧은 제한은 첫 요청만을 위한 것이다
+    service.total_deadline, service.timeout = 5.0, httpx.Timeout(5.0)  # 짧은 제한은 첫 요청만을 위한 것이다
     assert post(client, jpeg()).status_code == 200
     assert local_worker.requests == 2
 
@@ -639,7 +639,7 @@ def remote_mode(monkeypatch):
         monkeypatch.setattr(inference, name, must_not_build)
     monkeypatch.setattr(config, "VALIDATION_MODE", "remote")
     monkeypatch.setattr(config, "REMOTE_URL", WORKER)
-    monkeypatch.setattr(config, "REMOTE_TIMEOUT_SECONDS", 30.0)
+    monkeypatch.setattr(config, "REMOTE_READ_TIMEOUT_SECONDS", 30.0)
     monkeypatch.setattr(config, "REMOTE_TOTAL_DEADLINE_SECONDS", 60.0)
     monkeypatch.setattr(settings, "BODY_IMAGE_REMOTE_PROXY_KEY", "wk-test")
     monkeypatch.setattr(settings, "BODY_IMAGE_REMOTE_PROXY_SECRET", "ws-test")
