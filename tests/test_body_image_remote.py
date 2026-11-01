@@ -814,10 +814,6 @@ def test_303_without_location_is_bad_gateway(client, monkeypatch):
     assert len(fake.calls) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="httpx 가 follow_redirects=False 여도 Location 을 해석하다 RemoteProtocolError 를 내 503 으로 나간다",
-)
 @pytest.mark.parametrize("location", ["https://x:notaport/", "/\x7f"], ids=["bad-port", "control-char"])
 def test_malformed_location_is_bad_gateway(client, monkeypatch, location):
     fake = FakeWorker(steps=[redirect(location), (0, 200, {}, SUCCESS)])

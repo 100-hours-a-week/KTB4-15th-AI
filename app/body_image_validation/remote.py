@@ -5,7 +5,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 
 import httpx
@@ -82,6 +82,25 @@ def _origin(url: httpx.URL) -> tuple[str, str, int | None]:
     return url.scheme, url.host, url.port
 
 
+def _valid_location(current: httpx.URL, location: str) -> bool:
+    try:
+        url = httpx.URL(location)
+        if url.scheme and not url.host:  # "javascript:x", "https:///x". httpx 가 host 를 채우다 원시 예외를 낸다
+            return False
+        _origin(current.join(url))  # host 를 읽어 봐야 idna 오류가 드러난다
+    except (httpx.InvalidURL, UnicodeError):  # idna 오류는 httpx 가 감싸지 않는다
+        return False
+    return True
+
+
+async def _reject_invalid_location(response: httpx.Response) -> None:
+    """httpx 는 follow_redirects=False 여도 응답을 돌려주기 전에 Location 을 해석하고, 실패하면 연결 오류나 원시
+    예외를 낸다. 그 전에 비정상 응답(502)으로 끊는다. 값에 결과 조회 id 가 있을 수 있어 로그에 남기지 않는다."""
+    if response.has_redirect_location and not _valid_location(response.url, response.headers["location"]):
+        logger.error("body image worker sent an invalid Location header: status=%s", response.status_code)
+        raise _unavailable(BAD_GATEWAY)
+
+
 def _error_type(error: httpx.TransportError) -> str:
     return next(_ERROR_TYPES[cls] for cls in type(error).__mro__ if cls in _ERROR_TYPES)
 
@@ -105,6 +124,22 @@ class _RequestLog:
     http: float | None = None
     budget: float | None = None
     timeout_stage: str | None = None
+    connection: str | None = None  # 재사용 연결이면 reused, 새로 연결했으면 new(303 을 따라가다 연결해도 new)
+    failed_at: str | None = None  # HTTP 요청이 처음 실패한 단계(httpcore 단계 이름)
+
+
+def _connection_trace(log: _RequestLog) -> Callable[[str, dict], Awaitable[None]]:
+    """httpcore 의 단계 기록을 요약 로그로 옮긴다. 재사용 연결이 끊긴 것(stale)을 구분하는 근거다. 동작은 바꾸지 않는다."""
+
+    async def trace(event: str, info: dict) -> None:
+        if event == "connection.connect_tcp.started":
+            log.connection = "new"
+        elif event == "http11.send_request_headers.started" and log.connection is None:
+            log.connection = "reused"
+        elif event.endswith(".failed") and log.failed_at is None:
+            log.failed_at = event.split(".")[-2]
+
+    return trace
 
 
 def _new_request_id() -> str:
@@ -115,19 +150,21 @@ def _log_request(log: _RequestLog, limit: RequestDeadline) -> None:
     http_cancelled = log.http is not None and log.outcome in _HTTP_CANCELLED_OUTCOMES
     # http_cancelled: 이 쪽 연결을 끊었다. remote_cancel: Modal 작업 취소 API 는 부르지 않는다(HTTP 로는
     # 없음). remote_stopped: 알 수 없음 — worker 가 deadline header 를 보고 다음 단계 전에 스스로 멈춘다.
-    # total 은 total_from 지점부터 잰다(asgi: 요청 진입, service: avalidate 직접 호출). 뒤의 네 항목은
+    # 연결이 끊긴 경우도 요청이 이미 Modal 에 닿았을 수 있어 remote_stopped 는 unknown 이다.
+    # total 은 total_from 지점부터 잰다(asgi: 요청 진입, service: avalidate 직접 호출). total_from 부터는
     # 기존 항목의 위치를 바꾸지 않게 끝에 붙였다.
     logger.info(
         "body image request: request_id=%s outcome=%s error=%s code=%s status=%s redirects=%s "
         "input_check=%s queue_wait=%s http=%s total=%s budget=%s deadline=%ss http_cancelled=%s "
         "remote_cancel=not_requested remote_stopped=%s total_from=%s request_parse=%s service_lookup=%s "
-        "image_read=%s timeout_stage=%s",
+        "image_read=%s timeout_stage=%s connection=%s failed_at=%s",
         log.request_id, log.outcome, log.error or "-", log.code or "-", log.status or "-", log.redirects,
         _seconds(log.input_check), _seconds(log.queue_wait), _seconds(log.http),
         _seconds(limit.clock() - limit.started), _seconds(log.budget), limit.total, http_cancelled,
-        "unknown" if http_cancelled else "n/a", limit.source, _seconds(limit.spent.get("request_parse")),
-        _seconds(limit.spent.get("service_lookup")), _seconds(limit.spent.get("image_read")),
-        log.timeout_stage or "-",
+        "unknown" if http_cancelled or log.outcome == "connection_failed" else "n/a", limit.source,
+        _seconds(limit.spent.get("request_parse")), _seconds(limit.spent.get("service_lookup")),
+        _seconds(limit.spent.get("image_read")), log.timeout_stage or "-", log.connection or "-",
+        log.failed_at or "-",
     )
 
 
@@ -350,7 +387,9 @@ class RemoteBodyImageValidationService:
                 raise self._deadline_exceeded(log, "http") from None
             log.outcome, log.error, log.timeout_stage = "network_timeout", _error_type(error), "http"
             raise _timeout() from None
-        except httpx.TransportError as error:  # 연결 실패·끊김. keep-alive 재사용 탓인지는 여기서 알 수 없다.
+        # 연결 실패·끊김. 재사용 연결(stale)이었는지와 끊긴 단계는 요약 로그의 connection·failed_at 으로 본다.
+        # 요청이 이미 Modal 에 닿았을 수 있어 다시 보내지 않고, 끊긴 연결은 httpcore 가 pool 에서 뺀다.
+        except httpx.TransportError as error:
             log.outcome, log.error = "connection_failed", _error_type(error)
             raise _unavailable(SERVICE_UNAVAILABLE) from None
         finally:
@@ -360,6 +399,7 @@ class RemoteBodyImageValidationService:
         content_type, extension = _CONTENT_TYPES.get(image_format, ("application/octet-stream", "bin"))
         # 이 호출의 cookie. 303 을 따라갈 때만 쓰고 호출이 끝나면 버린다.
         cookies = httpx.Cookies()
+        extensions = {"trace": _connection_trace(log)}
         async with self._borrow_shared_client() as client:
             request = client.build_request(
                 "POST",
@@ -367,6 +407,7 @@ class RemoteBodyImageValidationService:
                 headers=headers,
                 files={"image": (f"body.{extension}", image_body, content_type)},
                 timeout=self._network_timeout(deadline_at),
+                extensions=extensions,
             )
             visited = {str(request.url)}
             while True:
@@ -383,12 +424,18 @@ class RemoteBodyImageValidationService:
                 target = self._redirect_target(request.url, location, visited, log.redirects)
                 # 303 은 GET 으로 바꾼다. 이미지 본문과 Content-Type·Content-Length 는 보내지 않는다.
                 request = client.build_request(
-                    "GET", target, headers=headers, cookies=cookies, timeout=self._network_timeout(deadline_at)
+                    "GET", target, headers=headers, cookies=cookies,
+                    timeout=self._network_timeout(deadline_at), extensions=extensions,
                 )
 
     def _build_client(self) -> httpx.AsyncClient:
         # trust_env=False: 환경변수 proxy·.netrc 인증을 끼워 넣지 않는다. redirect 는 _exchange 가 직접 판단한다.
-        return httpx.AsyncClient(transport=self._transport, follow_redirects=False, trust_env=False)
+        return httpx.AsyncClient(
+            transport=self._transport,
+            follow_redirects=False,
+            trust_env=False,
+            event_hooks={"response": [_reject_invalid_location]},
+        )
 
     @contextlib.asynccontextmanager
     async def _borrow_shared_client(self) -> AsyncIterator[httpx.AsyncClient]:
@@ -419,8 +466,9 @@ class RemoteBodyImageValidationService:
             logger.error("body image worker sent 303 without a Location header")
             raise _unavailable(BAD_GATEWAY)
         target = current.join(location)
-        if target.scheme != "https" or _origin(target) != self._origin:
+        if target.scheme != "https" or _origin(target) != self._origin or target.userinfo:
             # 인증 헤더·요청을 다른 origin 으로 보내지 않는다. 대상 URL 은 로그에 남기지 않는다.
+            # URL 의 userinfo 는 httpx 가 Basic 인증으로 바꿔 worker 의 Authorization 을 덮어쓴다.
             logger.error("body image worker redirect to a different origin was blocked")
             raise _unavailable(BAD_GATEWAY)
         if count > MAX_REDIRECTS:
