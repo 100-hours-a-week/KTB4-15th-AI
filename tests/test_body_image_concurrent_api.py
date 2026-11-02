@@ -233,7 +233,7 @@ def test_local_service_runs_in_the_threadpool(api, monkeypatch):
     threads = []
 
     class LocalStub:
-        def validate(self, body):
+        def validate(self, body, ai_request_id=None):
             threads.append(threading.get_ident())
             return BodyImageValidationResult(s3_key="body-images/local.png")
 

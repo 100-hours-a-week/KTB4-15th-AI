@@ -1,6 +1,7 @@
 import ctypes
 import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -13,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 MIB = 2**20
 METRICS = ("process_rss_mib", "container_mib", "gpu_device_used_mib")
+REQUEST_ID_HEADER = "X-Request-ID"
+_REQUEST_ID = re.compile(r"[0-9a-f]{16}")
 
 _current: ContextVar["RequestRecord | None"] = ContextVar("body_image_request_record", default=None)
 
@@ -32,6 +35,7 @@ class RequestRecord:
     active_at_start: int = 0
     active_max: int = 0
     spans: dict[str, tuple[float, float]] = field(default_factory=dict)
+    ai_request_id: str | None = None
 
     def add_lock(self, name: str, wait_seconds: float, hold_seconds: float) -> None:
         entry = self.locks.setdefault(name, {"count": 0, "wait_ms": 0.0, "hold_ms": 0.0})
@@ -40,9 +44,10 @@ class RequestRecord:
         entry["hold_ms"] += hold_seconds * 1000
 
     def to_json(self, outcome: str, timings: dict[str, float], resources: dict | None) -> str:
-        """이미지·키·예외 메시지는 담지 않는다. 숫자와 outcome(오류 코드나 예외 클래스 이름)뿐이다."""
+        """이미지·키·예외 메시지는 담지 않는다. 숫자, ID, outcome(오류 코드나 예외 클래스 이름)뿐이다."""
         return json.dumps({
             "request_id": self.request_id,
+            "ai_request_id": self.ai_request_id,
             "seq": self.seq,
             "outcome": outcome,
             "ms": timings,
@@ -91,8 +96,15 @@ def _clock_ms(value: float | None) -> float | None:
     return None if value is None else round(value * 1000, 1)
 
 
-def begin_request(seq: int, process_id: str | None = None) -> tuple[RequestRecord, Token]:
-    record = RequestRecord(seq, process_id)
+def parse_request_id(value: str | None) -> str | None:
+    """형식이 다른 값은 버린다. 로그를 잇는 데만 쓰는 값이라 요청을 거절하지 않는다."""
+    return value if value and _REQUEST_ID.fullmatch(value) else None
+
+
+def begin_request(
+    seq: int, process_id: str | None = None, ai_request_id: str | None = None
+) -> tuple[RequestRecord, Token]:
+    record = RequestRecord(seq, process_id, ai_request_id=ai_request_id)
     return record, _current.set(record)
 
 

@@ -31,6 +31,7 @@ from app.body_image_validation.diagnostics import (
     begin_request,
     end_request,
     install_lock_timers,
+    parse_request_id,
     read_cgroup_mib,
     read_process_memory,
 )
@@ -582,9 +583,45 @@ def test_log_holds_only_numbers_ids_and_codes(real_models, sampler, caplog):
         result = service.validate(body)
 
     [line] = diagnostic_lines(caplog)
-    assert set(line) == {"request_id", "seq", "outcome", "ms", "locks", "execution", "resources"}
+    assert set(line) == {"request_id", "ai_request_id", "seq", "outcome", "ms", "locks", "execution", "resources"}
     assert result.s3_key not in caplog.text  # 결과 객체 키도 남기지 않는다
     assert not any(isinstance(value, str) for value in line["ms"].values())
+
+
+def test_ai_request_id_is_recorded_as_given_and_is_null_without_one(real_models, sampler, caplog):
+    service = service_for(real_models, resources=sampler)
+
+    with caplog.at_level(logging.INFO):
+        service.validate(jpeg(), "85c390e8344842ad")
+        service.validate(jpeg())
+
+    traced, plain = diagnostic_lines(caplog)
+    assert traced["ai_request_id"] == "85c390e8344842ad"
+    assert plain["ai_request_id"] is None
+    assert traced["request_id"] != plain["request_id"]
+    assert "85c390e8344842ad" not in {traced["request_id"], plain["request_id"]}
+
+
+def test_ai_request_id_changes_nothing_when_diagnostics_are_off(real_models, caplog):
+    service = service_for(real_models, diagnostic=False)
+
+    with caplog.at_level(logging.INFO):
+        result = service.validate(jpeg(), "85c390e8344842ad")
+
+    assert result.s3_key.startswith("body-images/")
+    assert "85c390e8344842ad" not in caplog.text
+
+
+@pytest.mark.parametrize("value", ["85c390e8344842ad", "0" * 16])
+def test_parse_request_id_keeps_the_ai_server_format(value):
+    assert parse_request_id(value) == value
+
+
+@pytest.mark.parametrize(
+    "value", [None, "", "0" * 15, "0" * 17, "A" * 16, "g" * 16, "0" * 16 + "\n", " " + "0" * 15, "0" * 8 + "\r\n" + "0" * 6]
+)
+def test_parse_request_id_drops_everything_else(value):
+    assert parse_request_id(value) is None
 
 
 # --- 실제 실행 구간: 슬롯을 쥔 구간만 동시 실행으로 센다 ---

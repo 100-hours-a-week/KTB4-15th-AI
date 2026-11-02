@@ -22,7 +22,8 @@ from app.body_image_validation import deadline, worker
 from app.body_image_validation import router as validation_router
 from app.body_image_validation import service as service_module
 from app.body_image_validation.detectors import DetectionImage
-from app.body_image_validation.diagnostics import current_request
+from app.body_image_validation.diagnostics import REQUEST_ID_HEADER, current_request
+from app.body_image_validation.exceptions import user_error
 from app.body_image_validation.gpu_preprocessing import GpuImagePreprocessor
 from app.body_image_validation.inference import BodyImageModels
 from app.body_image_validation.runtime import BodyImageRuntime, BodyImageRuntimeManager
@@ -80,6 +81,10 @@ def rgb_of(body):
     return np.asarray(Image.open(BytesIO(body)).convert("RGB"))
 
 
+def tag_on_the_wire(request):
+    return tag_of(rgb_of(request.content.split(b"\r\n\r\n", 1)[1]))
+
+
 def tag_of(array):
     """이미지가 어느 요청의 것인지. 빨강 평균이 tag 다(JPEG 손실은 tag 간격보다 훨씬 작다)."""
     return round(float(np.asarray(array)[..., 0].mean()) / 25) * 25
@@ -98,6 +103,7 @@ class Pipeline:
         self.inside = Counter()
         self.most_inside = Counter()
         self.request_ids = {}
+        self.ai_request_ids = defaultdict(set)
         self.uploads = {}
 
     def on(self, stage, hook):
@@ -118,6 +124,7 @@ class Pipeline:
             self.inside[stage] += 1
             self.most_inside[stage] = max(self.most_inside[stage], self.inside[stage])
             self.request_ids[tag] = current_request().request_id
+            self.ai_request_ids[tag].add(current_request().ai_request_id)
         try:
             if stage in self.hooks:
                 self.hooks[stage](tag)
@@ -238,6 +245,7 @@ class Modal(httpx.AsyncBaseTransport):
         self._asgi = httpx.ASGITransport(app=app, raise_app_exceptions=False)
 
     async def handle_async_request(self, request):
+        await request.aread()
         self.requests.append(request)
         if (request.headers.get("modal-key"), request.headers.get("modal-secret")) != ("wk-test", PROXY_SECRET):
             return httpx.Response(401)
@@ -366,10 +374,12 @@ class Stack:
         files = {"image": ("body.png", body, "image/png")}
         return self._send(lambda: self.ai_http.post(VALIDATE_URL, files=files, headers=headers))
 
-    def post_to_worker(self, body, limit=None, bearer=KEY):
+    def post_to_worker(self, body, limit=None, bearer=KEY, trace=None):
         headers = {"Modal-Key": "wk-test", "Modal-Secret": PROXY_SECRET, "Authorization": f"Bearer {bearer}"}
         if limit is not None:
             headers[deadline.HEADER] = f"{limit:.3f}"
+        if trace is not None:
+            headers[REQUEST_ID_HEADER] = trace
         files = {"image": ("body.png", body, "image/png")}
         return self._send(lambda: self.worker_http.post(VALIDATE_URL, files=files, headers=headers))
 
@@ -400,6 +410,10 @@ class Stack:
                 self.ai.limiter._condition.notify_all()
 
         self.portal.call(notify)
+
+    def sent_ids(self):
+        """worker 로 나간 요청에 실제로 실린 이미지와 추적 헤더."""
+        return {tag_on_the_wire(request): request.headers[REQUEST_ID_HEADER] for request in self.modal.requests}
 
     def line(self, tag):
         request_id = self.pipeline.request_ids[tag]
@@ -1313,3 +1327,285 @@ def test_warmup_timeout_ends_the_health_call_while_inputs_are_full_and_the_next_
     assert statuses(a, b) == [200, 200]
     wait_until(lambda: s.modal.inputs.locked() is False and all(task.done() for task in s.modal.tasks))
     assert s.portal.call(client.warm_up).outcome is WarmupOutcome.SUCCESS
+
+
+# --- 요청 ID 전파: 시간이나 완료 순서가 아니라 실제로 전달된 값으로 잇는다 ---
+
+
+TRACE_ID = "85c390e8344842ad"
+
+
+def test_worker_line_names_the_ai_request_and_keeps_its_own_id(stack):
+    s = stack()
+
+    [request] = s.run_all(A)
+
+    response = request.result()
+    assert response.status_code == 200
+    [fields] = s.log.requests()
+    line = s.line(A)
+    assert re.fullmatch(r"[0-9a-f]{16}", fields["request_id"])
+    assert line["ai_request_id"] == fields["request_id"] == s.sent_ids()[A]
+    assert line["request_id"] == s.pipeline.request_ids[A] != fields["request_id"]
+    assert set(response.json()) == {"code", "data", "message"}
+    assert fields["request_id"] not in response.text
+    assert REQUEST_ID_HEADER not in response.headers
+
+
+def test_two_overlapping_requests_keep_their_own_ids_on_both_sides(stack):
+    s = stack()
+    s.pipeline.on("s3_upload", meet())
+
+    assert statuses(*s.run_all(A, B)) == [200, 200]
+
+    sent = s.sent_ids()
+    a, b = s.line(A), s.line(B)
+    assert sent[A] != sent[B] and a["request_id"] != b["request_id"]
+    assert (a["ai_request_id"], b["ai_request_id"]) == (sent[A], sent[B])
+    assert {fields["request_id"] for fields in s.log.requests()} == {sent[A], sent[B]}
+    assert s.pipeline.ai_request_ids == {A: {sent[A]}, B: {sent[B]}}  # threadpool 의 모든 단계에서 자기 ID 다
+    assert (a["execution"]["active_max"], b["execution"]["active_max"]) == (2, 2)
+    assert a["execution"]["process_id"] == b["execution"]["process_id"]
+    assert overlaps(interval(a), interval(b))
+    s.settle()
+
+
+def test_ids_stay_matched_when_the_second_request_finishes_first(stack):
+    s = stack()
+    upload = s.pipeline.gate("s3_upload", A)
+    a = s.post(picture(A))
+    upload.wait_for(1)
+
+    b = s.post(picture(B))
+    assert b.result().status_code == 200
+    assert not a.task.done()
+    upload.open(A)
+    assert a.result().status_code == 200
+
+    sent = s.sent_ids()
+    assert [fields["request_id"] for fields in s.log.requests()] == [sent[B], sent[A]]
+    assert [line["ai_request_id"] for line in s.log.diagnostics] == [sent[B], sent[A]]
+    assert overlaps(interval(s.line(A)), interval(s.line(B)))
+    s.settle()
+
+
+def test_id_survives_the_wait_for_the_worker_slot(stack):
+    s = stack(worker_running=1)
+    upload = s.pipeline.gate("s3_upload", A)
+    a = s.post(picture(A))
+    upload.wait_for(1)
+    b = s.post(picture(B))
+    wait_until(lambda: s.worker.limiter.waiting == 1)
+
+    upload.open(A)
+
+    assert statuses(a, b) == [200, 200]
+    sent = s.sent_ids()
+    assert (s.line(A)["ai_request_id"], s.line(B)["ai_request_id"]) == (sent[A], sent[B])
+    assert s.line(B)["ms"]["slot_wait"] > 0
+    s.settle()
+
+
+@pytest.mark.parametrize(
+    ("install", "status", "code"),
+    [
+        (fail_with("brightness", user_error("FULL_BODY_NOT_VISIBLE")), 422, "FULL_BODY_NOT_VISIBLE"),
+        (fail_with("rembg", RuntimeError("rembg")), 500, "BACKGROUND_REMOVAL_FAILED"),
+        (fail_with("s3_upload", ImageStorageError("s3")), 500, "IMAGE_UPLOAD_FAILED"),
+        (pass_the_deadline, 504, TIMEOUT_CODE),
+    ],
+    ids=["validation", "rembg", "s3", "deadline"],
+)
+def test_failed_request_and_its_worker_line_share_one_id_while_the_other_succeeds(stack, wall, install, status, code):
+    s = stack()
+    install(s, wall)
+    failing = s.pipeline.hooks.get("brightness", lambda tag: None)
+    other = Gate(B)
+    s.pipeline.gates.append(other)
+
+    def brightness(tag):
+        failing(tag)
+        other(tag)
+
+    s.pipeline.on("brightness", brightness)
+    s.pipeline.on("detection_input", meet())
+    a, b = s.run_all(A, B)
+
+    assert a.result().status_code == status
+    assert a.result().json()["code"] == code
+    wall.offset = 0.0
+    other.open()
+    assert b.result().status_code == 200
+    sent = s.sent_ids()
+    fields = next(fields for fields in s.log.requests() if fields["code"] == code)
+    failed, passed = s.line(A), s.line(B)
+    assert fields["request_id"] == sent[A] == failed["ai_request_id"]
+    assert failed["outcome"] == code
+    assert passed["ai_request_id"] == sent[B] != sent[A]
+    assert passed["outcome"] == "success"
+    s.settle()
+
+
+def test_worker_line_of_an_abandoned_request_still_names_it(stack):
+    s = stack(total=0.5)
+    held = s.pipeline.gate("detection_input")
+    a, b = s.run_all(A, B)
+    held.wait_for(2)
+
+    assert statuses(a, b) == [504, 504]
+    assert s.worker_slots == (2, 0)  # worker 는 아직 돌고 있다
+    held.open()
+    s.settle()
+
+    sent = s.sent_ids()
+    assert {fields["request_id"] for fields in s.log.requests()} == {sent[A], sent[B]}
+    assert (s.line(A)["ai_request_id"], s.line(B)["ai_request_id"]) == (sent[A], sent[B])
+    assert {s.line(A)["outcome"], s.line(B)["outcome"]} == {TIMEOUT_CODE}
+
+
+def test_requests_that_never_reach_the_worker_are_logged_only_by_the_ai_server(stack):
+    s = stack(total=8.0)
+    clock = s.use_clock()
+    upload = s.pipeline.gate("s3_upload")
+    a, b = s.run_all(A, B)
+    upload.wait_for(2)
+    c = s.post(picture(C))
+    s.wait_for_queue()
+    d = s.post(picture(D))
+    assert d.result().status_code == 429
+
+    clock.advance(8.1)
+    s.wake_the_queue()
+
+    assert c.result().status_code == 504
+    upload.open()
+    assert statuses(a, b) == [200, 200]
+    s.settle()
+    sent = s.sent_ids()
+    stopped = {s.log.request_fields(outcome)["request_id"] for outcome in ("queue_full", "deadline_exceeded")}
+    assert len(stopped) == 2 and set(sent) == {A, B}
+    assert not stopped & {line["ai_request_id"] for line in s.log.diagnostics}
+    assert not stopped & set(sent.values())
+
+
+@pytest.mark.parametrize(
+    ("header", "value"), [("Authorization", "Bearer wrong"), ("Modal-Key", "wrong")], ids=["worker_bearer", "modal_proxy"]
+)
+def test_rejected_call_carries_the_id_and_leaves_no_worker_line(stack, header, value):
+    s = stack()
+    s.ai._headers[header] = value
+
+    [request] = s.run_all(A)
+
+    assert request.result().status_code == 502
+    [fields] = s.log.requests()
+    assert fields["status"] == "401"
+    assert s.sent_ids()[A] == fields["request_id"]
+    assert s.log.diagnostics == []
+    assert not s.pipeline.order
+
+
+def test_shared_client_keeps_no_request_id_between_requests(stack):
+    s = stack()
+    s.pipeline.on("s3_upload", meet())
+    before = dict(s.ai._shared_client.headers)
+
+    assert statuses(*s.run_all(A, B)) == [200, 200]
+
+    assert dict(s.ai._shared_client.headers) == before
+    assert REQUEST_ID_HEADER not in s.ai._shared_client.headers
+    s.pipeline.on("s3_upload", lambda tag: None)
+    assert statuses(*s.run_all(C)) == [200]
+    assert len(set(s.sent_ids().values())) == 3
+
+
+def test_id_sent_by_a_client_of_the_ai_server_goes_nowhere(stack):
+    s = stack()
+
+    request = s.post(picture(A), headers={**AUTH, REQUEST_ID_HEADER: TRACE_ID})
+
+    assert request.result().status_code == 200
+    [fields] = s.log.requests()
+    assert fields["request_id"] != TRACE_ID
+    assert s.sent_ids()[A] == s.line(A)["ai_request_id"] == fields["request_id"]
+    assert TRACE_ID not in "\n".join(s.log.messages)
+
+
+def test_worker_records_a_valid_id_from_a_direct_call(stack):
+    s = stack()
+
+    request = s.post_to_worker(picture(A), trace=TRACE_ID)
+
+    assert request.result().status_code == 200
+    assert s.line(A)["ai_request_id"] == TRACE_ID
+    assert s.line(A)["request_id"] != TRACE_ID
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        TRACE_ID[:-1],
+        TRACE_ID + "0",
+        "a" * 4096,
+        TRACE_ID.upper(),
+        "85c390e8344842a-",
+        TRACE_ID + "\n",
+        f"{TRACE_ID}\r\nX-Injected: 1",
+        f"{TRACE_ID},{TRACE_ID}",
+        "../../etc/passwd",
+    ],
+    ids=["missing", "empty", "short", "long", "huge", "upper", "symbol", "newline", "crlf", "list", "path"],
+)
+def test_worker_runs_normally_and_records_nothing_for_an_unusable_id(stack, value):
+    s = stack()
+
+    request = s.post_to_worker(picture(A), trace=value)
+
+    assert request.result().status_code == 200
+    line = s.line(A)
+    assert line["ai_request_id"] is None
+    assert re.fullmatch(r"[0-9a-f]{16}", line["request_id"])
+    assert line["outcome"] == "success"
+    if value:
+        assert value not in "\n".join(s.log.messages)
+
+
+@pytest.mark.parametrize("trace", [TRACE_ID, "not valid"], ids=["valid", "invalid"])
+def test_trace_header_never_changes_the_worker_auth_decision(stack, trace):
+    s = stack()
+
+    rejected = s.post_to_worker(picture(A), bearer="wrong", trace=trace)
+    assert rejected.result().status_code == 401
+    assert s.log.diagnostics == [] and not s.pipeline.order
+
+    accepted = s.post_to_worker(picture(B), trace=trace)
+    assert accepted.result().status_code == 200
+
+
+def test_id_of_one_worker_call_does_not_reach_the_next_one(stack):
+    s = stack()
+
+    assert statuses(s.post_to_worker(picture(A), trace=TRACE_ID)) == [200]
+    assert statuses(s.post_to_worker(picture(B))) == [200]
+
+    assert s.line(A)["ai_request_id"] == TRACE_ID
+    assert s.line(B)["ai_request_id"] is None
+
+
+def test_each_request_carries_its_own_id_over_a_real_connection(live, monkeypatch, caplog):  # noqa: F811
+    monkeypatch.setattr(config, "MAX_CONCURRENT_BODY_VALIDATIONS", 2)
+    server = live()
+    first, second = server.send().read(), server.send().read()
+    wait_until(lambda: server.modal.started == 2)
+
+    with caplog.at_level(logging.INFO, logger="app.body_image_validation.remote"):
+        server.modal.release.set()
+        assert [first.response()[0], second.response()[0]] == [200, 200]
+        wait_until(lambda: server.slots == (0, 0))
+
+    assert server.modal.connections == 2
+    sent = {headers[REQUEST_ID_HEADER] for headers in server.modal.headers}
+    logged = set(re.findall(r"request_id=(\w+)", caplog.text))
+    assert len(sent) == 2 and sent == logged

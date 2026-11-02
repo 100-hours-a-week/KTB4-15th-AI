@@ -28,7 +28,7 @@ class StubService:
         self.error = error
         self.calls = []
 
-    def validate(self, body):
+    def validate(self, body, ai_request_id=None):
         self.calls.append(body)
         if self.error:
             raise self.error

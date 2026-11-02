@@ -64,11 +64,11 @@ class BodyImageValidationService:
         self._execution = ExecutionTracker() if diagnostics else None
         self._request_numbers = itertools.count(1)
 
-    def validate(self, image_body: bytes) -> BodyImageValidationResult:
+    def validate(self, image_body: bytes, ai_request_id: str | None = None) -> BodyImageValidationResult:
         if self._diagnostics is None:
             return self._validate(image_body)
         timings = self._diagnostics.timings = {}
-        record, token = begin_request(next(self._request_numbers), self._execution.process_id)
+        record, token = begin_request(next(self._request_numbers), self._execution.process_id, ai_request_id)
         window = self._resources.open() if self._resources is not None else None
         started = time.perf_counter()
         outcome = "error"
