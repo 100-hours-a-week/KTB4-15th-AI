@@ -1,14 +1,9 @@
-"""Modal T4 worker 의 앱 구성과 초기화 순서. Modal·CUDA 없이 CPU 에서 돈다.
-
-실제 MediaPipe·rembg·S3 대신 fake 를 넣고, runtime 을 만드는 순서·한 번만 만드는지·warm-up 이
-S3 를 건드리지 않는지·S3 업로드 성공/실패가 기존 API 응답으로 나가는지를 확인한다.
-"""
-
 import json
 import logging
 import os
 import subprocess
 import sys
+import threading
 from io import BytesIO
 from pathlib import Path
 
@@ -16,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from app.body_image_validation import inference, router, runtime, worker
+from app.body_image_validation import diagnostics, inference, router, runtime, worker
 from app.body_image_validation.models import BoundingBox, PersonDetection
 from app.body_image_validation.runtime import BodyImageRuntimeManager
 from app.body_image_validation.service import BodyImageValidationService
@@ -296,6 +291,92 @@ def test_staging_snapshot_builds_gpu_models_without_s3_runtime_or_limiter(snapsh
     assert set(timings) == {"preprocess", "person_pose", "rembg", "png"}
     assert snapshot_env["manager"].runtime is None  # service·limiter·runtime 은 아직 없다
     assert snapshot_env["s3"].puts == []
+
+
+def test_diagnostics_stay_out_of_the_snapshot_and_start_with_the_first_request(snapshot_env, monkeypatch):
+    opened = []
+
+    def open_nvml(self, library=None):
+        opened.append(1)
+        raise OSError("no NVML here")
+
+    monkeypatch.setattr(config, "DIAGNOSTICS", True)
+    monkeypatch.setattr(diagnostics.NvmlDevice, "__init__", open_nvml)
+    for fake in (FakePersonDetector, FakeRemover):
+        monkeypatch.setattr(fake, "_lock", threading.Lock(), raising=False)
+
+    def sampler_threads():
+        return [thread for thread in threading.enumerate() if thread.name == "body-image-resource-sampler"]
+
+    models, timings = worker.prepare_gpu_snapshot()
+
+    # snap=True 끝: snapshot 에 담기는 시점. 계측 객체·NVML·thread 가 하나도 없다(warm-up 도 끝난 뒤다).
+    plain = type(threading.Lock())
+    assert type(models.person_detector._lock) is plain and type(models.background_remover._lock) is plain
+    assert opened == [] and sampler_threads() == []
+    assert snapshot_env["manager"].runtime is None
+
+    built = worker.start_restored_runtime(models, timings)
+
+    # 복원 뒤: Lock 은 감쌌지만 첫 요청 전이라 장치·thread 는 아직 없다.
+    assert isinstance(models.person_detector._lock, diagnostics.TimedLock)
+    assert opened == [] and sampler_threads() == []
+
+    client = TestClient(worker.create_app(), raise_server_exceptions=False)
+    messages = []  # create_app 의 configure_logging 이 caplog handler 를 지우므로 그 뒤에 붙인다
+    handler = logging.Handler()
+    handler.emit = lambda record: messages.append(record.getMessage())
+    logger = logging.getLogger("app.body_image_validation")
+    logger.addHandler(handler)
+    level = logger.level
+    logger.setLevel(logging.INFO)
+    try:
+        assert post(client, jpeg()).status_code == 200
+        assert post(client, jpeg()).status_code == 200
+    finally:
+        logger.setLevel(level)
+        logger.removeHandler(handler)
+
+    # threadpool 을 지나는 실제 endpoint 경로에서 요청마다 한 줄씩 남는다.
+    prefix = "body image validation diagnostics: "
+    lines = [json.loads(message[len(prefix):]) for message in messages if message.startswith(prefix)]
+    assert [line["seq"] for line in lines] == [1, 2]
+    assert all(line["outcome"] == "success" and line["execution"]["active_max"] == 1 for line in lines)
+    assert lines[0]["execution"]["process_id"] == lines[1]["execution"]["process_id"]
+    assert sum("resource baseline" in message for message in messages) == 1
+    assert opened == [1] and len(sampler_threads()) == 1
+
+    thread = built.resources._thread
+    snapshot_env["manager"].close()
+    assert not thread.is_alive()
+
+
+def test_two_inputs_keep_the_limiter_and_the_tracker_out_of_the_snapshot(snapshot_env, monkeypatch):
+    monkeypatch.setattr(config, "DIAGNOSTICS", True)
+    monkeypatch.setattr(config, "MAX_CONCURRENT_BODY_VALIDATIONS", 2)
+
+    models, timings = worker.prepare_gpu_snapshot()
+
+    assert snapshot_env["manager"].runtime is None  # snapshot 에는 limiter·tracker 가 없다
+
+    built = worker.start_restored_runtime(models, timings)
+
+    assert built.service.limiter._max_running == 2
+    assert (built.service.limiter.running, built.service.limiter.waiting) == (0, 0)
+    assert built.service._execution._running == []
+
+
+def test_diagnostics_off_leaves_the_restored_models_untouched(snapshot_env, monkeypatch):
+    monkeypatch.setattr(config, "DIAGNOSTICS", False)
+    monkeypatch.setattr(diagnostics.NvmlDevice, "__init__", lambda self, library=None: pytest.fail("NVML 을 열었다"))
+    monkeypatch.setattr(FakePersonDetector, "_lock", threading.Lock(), raising=False)
+
+    models, timings = worker.prepare_gpu_snapshot()
+    built = worker.start_restored_runtime(models, timings)
+
+    assert post(TestClient(worker.create_app(), raise_server_exceptions=False), jpeg()).status_code == 200
+    assert built.resources is None
+    assert type(models.person_detector._lock) is type(threading.Lock())
 
 
 def test_staging_restore_registers_the_snapshot_models_without_rebuilding(snapshot_env):

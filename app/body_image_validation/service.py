@@ -1,5 +1,4 @@
-"""전신 이미지 fail-fast 검증, 전처리, S3 저장 orchestration."""
-
+import itertools
 import logging
 import threading
 import time
@@ -14,6 +13,13 @@ from app.body_image_validation.background import encode_png
 from app.body_image_validation.brightness import BrightnessCheckError, validate_brightness
 from app.body_image_validation.concurrency import BodyValidationLimiter
 from app.body_image_validation.detectors import DetectionImage, PersonDetector, PoseDetector
+from app.body_image_validation.diagnostics import (
+    ExecutionTracker,
+    ResourceSampler,
+    begin_request,
+    current_request,
+    end_request,
+)
 from app.body_image_validation.exceptions import BodyImageSystemError
 from app.body_image_validation.gpu_preprocessing import GpuImagePreprocessor
 from app.body_image_validation.image_io import load_image, open_image
@@ -38,6 +44,7 @@ class BodyImageValidationService:
         limiter: BodyValidationLimiter | None = None,
         gpu_preprocessor: GpuImagePreprocessor | None = None,
         diagnostics: bool = False,
+        resources: ResourceSampler | None = None,
     ) -> None:
         self.person_detector = person_detector
         self.pose_detector = pose_detector
@@ -53,11 +60,16 @@ class BodyImageValidationService:
         # 진단(기본 꺼짐). 켜면 요청마다 단계별 처리 시간(ms)을 로그 한 줄로 남긴다. 요청별 기록은
         # thread 마다 따로 둔다(endpoint 는 threadpool 에서 돈다).
         self._diagnostics = threading.local() if diagnostics else None
+        self._resources = resources
+        self._execution = ExecutionTracker() if diagnostics else None
+        self._request_numbers = itertools.count(1)
 
-    def validate(self, image_body: bytes) -> BodyImageValidationResult:
+    def validate(self, image_body: bytes, ai_request_id: str | None = None) -> BodyImageValidationResult:
         if self._diagnostics is None:
             return self._validate(image_body)
         timings = self._diagnostics.timings = {}
+        record, token = begin_request(next(self._request_numbers), self._execution.process_id, ai_request_id)
+        window = self._resources.open() if self._resources is not None else None
         started = time.perf_counter()
         outcome = "error"
         try:
@@ -70,10 +82,11 @@ class BodyImageValidationService:
         finally:
             timings["total"] = (time.perf_counter() - started) * 1000
             self._diagnostics.timings = None
-            logger.info(
-                "body image validation timings: outcome=%s ms=%s",
-                outcome, {name: round(value, 1) for name, value in timings.items()},
-            )
+            end_request(token)
+            rounded = {name: round(value, 1) for name, value in timings.items()}
+            logger.info("body image validation timings: outcome=%s ms=%s", outcome, rounded)
+            resources = self._resources.finish(window) if window is not None else None
+            logger.info("body image validation diagnostics: %s", record.to_json(outcome, rounded, resources))
 
     def _validate(self, image_body: bytes) -> BodyImageValidationResult:
         # 헤더만 읽는 입력 검증은 슬롯 밖에서 한다. 잘못된 이미지가 대기열을 차지하지 않게 하기
@@ -81,7 +94,7 @@ class BodyImageValidationService:
         # PIL 의 `with image:` 는 픽셀 메모리를 놓지 않으므로 close() 를 직접 부른다.
         source = open_image(image_body)
         try:
-            with self.limiter.slot():
+            with self._execution_slot():
                 # Modal worker 에서만 의미가 있다(AI Server 가 deadline 을 보냈을 때). 이미 지났으면 GPU 작업 전에 멈춘다.
                 deadline.check("before_processing")
                 with self._timed("preprocess"):
@@ -95,8 +108,26 @@ class BodyImageValidationService:
             source.close()
 
     @contextmanager
+    def _execution_slot(self):
+        """limiter 슬롯. 진단이 켜져 있으면 슬롯 대기시간과 실행 구간(슬롯 획득부터 반환 직전까지)을 기록한다."""
+        if self._execution is None:
+            with self.limiter.slot():
+                yield
+            return
+        record = current_request()
+        requested = time.perf_counter()
+        with self.limiter.slot():
+            record.slot_acquired = time.perf_counter()
+            self._diagnostics.timings["slot_wait"] = (record.slot_acquired - requested) * 1000
+            self._execution.enter(record)
+            try:
+                yield
+            finally:
+                self._execution.leave(record)
+
+    @contextmanager
     def _timed(self, stage: str):
-        """진단이 켜져 있으면 이 블록의 경과 시간(ms)을 stage 이름으로 기록한다."""
+        """진단이 켜져 있으면 이 블록의 경과 시간(ms)과 구간을 stage 이름으로 기록한다."""
         timings = getattr(self._diagnostics, "timings", None) if self._diagnostics else None
         if timings is None:
             yield
@@ -105,7 +136,9 @@ class BodyImageValidationService:
         try:
             yield
         finally:
-            timings[stage] = (time.perf_counter() - started) * 1000
+            ended = time.perf_counter()
+            timings[stage] = (ended - started) * 1000
+            current_request().spans[stage] = (started, ended)
 
     def _load(self, source: Image.Image, image_body: bytes) -> Image.Image:
         """GPU 로 처리할 수 있는 JPEG 는 GPU 로, 나머지와 GPU 실패는 기존 Pillow load_image 로.

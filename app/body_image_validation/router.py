@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, File, Request, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 
 from app.body_image_validation import deadline
+from app.body_image_validation.diagnostics import REQUEST_ID_HEADER, parse_request_id
 from app.body_image_validation.exceptions import SYSTEM_FAILURE_MESSAGE, BodyImageValidationError
 from app.body_image_validation.remote import RemoteBodyImageValidationService
 from app.body_image_validation.runtime import BodyImageRuntimeError, runtime_manager
@@ -62,7 +63,8 @@ async def validate_body_image(request: Request, image: ImageFile):
         if isinstance(service, RemoteBodyImageValidationService):
             result = await service.avalidate(body, limit)
         else:
-            result = await run_in_threadpool(service.validate, body)
+            ai_request_id = parse_request_id(request.headers.get(REQUEST_ID_HEADER))
+            result = await run_in_threadpool(service.validate, body, ai_request_id)
         return BodyImageValidationResponse(data=BodyImageValidationData(s3_key=result.s3_key))
     except BodyImageValidationError as error:
         if error.status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:

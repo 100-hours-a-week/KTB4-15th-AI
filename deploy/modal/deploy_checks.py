@@ -25,6 +25,7 @@ REQUIRED_SECRET_KEYS = ("INTERNAL_API_KEY", "S3_BUCKET", "AWS_ACCESS_KEY_ID", "A
 STAGING_BUCKET_PREFIX = "lookddak-dev-images"
 DEPLOY_VAR_PREFIX = "BODY_IMAGE_WORKER_"
 MODAL_TARGET_OVERRIDES = ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "MODAL_ENVIRONMENT")
+WORKER_LIMITER_VAR = "MAX_CONCURRENT_BODY_VALIDATIONS"
 _IMAGE_METHODS = ("env", "run_commands", "pip_install", "apt_install", "add_local_file", "add_local_dir")
 
 
@@ -39,16 +40,17 @@ class Check:
 
 
 def deploy_env(stage: str, diagnostics: bool = False, gpu_snapshot: bool = False,
-               max_containers: int | None = None) -> dict[str, str]:
+               max_containers: int | None = None, max_inputs: int = 1) -> dict[str, str]:
     """배포에 쓸 BODY_IMAGE_WORKER_* 전부. 검사(load_worker)·staging 배포·production 수동 명령이 이 값을 같이 쓴다.
 
-    네 값을 모두 명시한다. 셸에 같은 이름이 남아 있어도 이 값이 덮어쓴다(빈 상한은 "상한 없음").
+    값을 모두 명시한다. 셸에 같은 이름이 남아 있어도 이 값이 덮어쓴다(빈 상한은 "상한 없음").
     """
     return {
         "BODY_IMAGE_WORKER_STAGE": stage,
         "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "true" if stage == "staging" or gpu_snapshot else "false",
         "BODY_IMAGE_WORKER_MAX_CONTAINERS": "" if max_containers is None else str(max_containers),
         "BODY_IMAGE_WORKER_DIAGNOSTICS": "true" if diagnostics else "false",
+        "BODY_IMAGE_WORKER_MAX_INPUTS": str(max_inputs),
     }
 
 
@@ -60,16 +62,22 @@ def deploy_process_env(wanted: dict[str, str], profile: str, environ=None) -> di
 
 
 def manual_deploy_command(wanted: dict[str, str]) -> str:
-    """production 수동 배포 명령. 검사한 네 값을 모두 명시한다(셸에 남은 값이 끼어들지 않게)."""
+    """production 수동 배포 명령. 검사한 값을 모두 명시한다(셸에 남은 값이 끼어들지 않게)."""
     assigns = " ".join(f"{name}={shlex.quote(value)}" for name, value in wanted.items())
     return f"MODAL_PROFILE=<{PRODUCTION_WORKSPACE} profile> {assigns} modal deploy deploy/modal/body_image_worker.py"
 
 
-def load_worker(stage: str, diagnostics: bool = False, gpu_snapshot: bool = False, max_containers: int | None = None):
+def load_worker(stage: str, diagnostics: bool = False, gpu_snapshot: bool = False, max_containers: int | None = None,
+                max_inputs: int = 1):
     import modal
 
     calls: list[tuple[str, object]] = []
     originals = {name: getattr(modal.Image, name) for name in _IMAGE_METHODS}
+    original_concurrent = modal.concurrent
+
+    def concurrent_spy(**options):
+        calls.append(("concurrent", options))
+        return original_concurrent(**options)
 
     def make_spy(name, original):
         def spy(self, *args, **kwargs):
@@ -78,8 +86,9 @@ def load_worker(stage: str, diagnostics: bool = False, gpu_snapshot: bool = Fals
         return spy
 
     saved = {name: os.environ.pop(name) for name in list(os.environ) if name.startswith(DEPLOY_VAR_PREFIX)}
-    os.environ.update(deploy_env(stage, diagnostics, gpu_snapshot, max_containers))
+    os.environ.update(deploy_env(stage, diagnostics, gpu_snapshot, max_containers, max_inputs))
     try:
+        modal.concurrent = concurrent_spy
         for name, original in originals.items():
             setattr(modal.Image, name, make_spy(name, original))
         spec = importlib.util.spec_from_file_location("body_image_worker_preflight", WORKER_FILE)
@@ -87,11 +96,41 @@ def load_worker(stage: str, diagnostics: bool = False, gpu_snapshot: bool = Fals
         spec.loader.exec_module(module)
         return module, calls
     finally:
+        modal.concurrent = original_concurrent
         for name, original in originals.items():
             setattr(modal.Image, name, original)
         for name in [name for name in os.environ if name.startswith(DEPLOY_VAR_PREFIX)]:
             del os.environ[name]
         os.environ.update(saved)
+
+
+def check_concurrency(module, calls, max_inputs: int) -> list[Check]:
+    """Modal 입력 동시성과 Worker Limiter 가 같은 값으로 등록되는지. 1 이면 둘 다 건드리지 않는다."""
+    registered = [options for name, options in calls if name == "concurrent"]
+    expected = [{"max_inputs": max_inputs, "target_inputs": max_inputs}] if max_inputs > 1 else []
+    function_env = module.STAGE_ENV.get("env", {})
+    limiter = function_env.get(WORKER_LIMITER_VAR)
+    return [
+        Check("max inputs", module.MAX_INPUTS == max_inputs, f"MAX_INPUTS={module.MAX_INPUTS!r}"),
+        Check("modal concurrency", registered == expected, f"registered={registered!r} expected={expected!r}"),
+        Check("worker limiter env", limiter == (str(max_inputs) if max_inputs > 1 else None),
+              f"{WORKER_LIMITER_VAR}={limiter!r}"),
+    ]
+
+
+def check_registered(function_info: dict, max_inputs: int) -> list[Check]:
+    """Modal 에 등록된 함수가 기대한 동시성·GPU·컨테이너 상한인지. 읽기만 한다."""
+    concurrency = function_info.get("concurrency_info") or {}
+    expected = {"max_inputs": max_inputs, "target_inputs": max_inputs} if max_inputs > 1 else {}
+    registered = {key: concurrency.get(key) for key in expected}
+    gpus = [gpu for gpu, _ in function_info.get("gpus") or []]
+    return [
+        Check("registered gpu", gpus == [EXPECTED_GPU], f"gpus={function_info.get('gpus')!r}"),
+        Check("registered max containers", function_info.get("max_containers") == 1,
+              f"max_containers={function_info.get('max_containers')!r}"),
+        Check("registered concurrency", registered == expected and (max_inputs > 1 or not concurrency),
+              f"concurrency_info={function_info.get('concurrency_info')!r} expected={expected or None!r}"),
+    ]
 
 
 def check_deploy_config(module, calls, stage: str, gpu_snapshot: bool = False,
@@ -112,7 +151,7 @@ def check_deploy_config(module, calls, stage: str, gpu_snapshot: bool = False,
               f"min_containers={module.WORKER_RESOURCES.get('min_containers')!r}"),
         Check("gpu snapshot mode", module.GPU_SNAPSHOT is expect_gpu, f"GPU_SNAPSHOT={module.GPU_SNAPSHOT!r}"),
     ]
-    names = [name for name, _ in calls]
+    names = [name for name, _ in calls if name in _IMAGE_METHODS]
     checks.append(Check("code layer last", bool(names) and names[-1] == "add_local_dir" and names.count("add_local_dir") == 1,
                         f"image build order ends with {names[-3:]}"))
     baked = [env for name, env in calls if name == "env" and env and module.IMAGE_STAGE_VAR in env]
@@ -255,12 +294,12 @@ def modal_cli(*args: str, profile: str | None = None, timeout: float = 120) -> s
 
 
 def preflight(stage: str, workspace: str, diagnostics: bool = False, gpu_snapshot: bool = False,
-              max_containers: int | None = None) -> tuple[str | None, list[Check]]:
+              max_containers: int | None = None, max_inputs: int = 1) -> tuple[str | None, list[Check]]:
     """읽기 전용 배포 전 검사. production 은 Workspace 가 PRODUCTION_WORKSPACE 여야 한다.
 
     배포 대상(Workspace·셸/.env 값)이 확인되지 않으면 Secret 을 조회하지 않는다.
     """
-    wanted = deploy_env(stage, diagnostics, gpu_snapshot, max_containers)
+    wanted = deploy_env(stage, diagnostics, gpu_snapshot, max_containers, max_inputs)
     profiles = json.loads(modal_cli("profile", "list", "--json"))
     profile, workspace_check = resolve_profile(workspace, profiles, os.environ.get("MODAL_PROFILE"))
     checks = [workspace_check, check_modal_target_env(os.environ)]
@@ -270,10 +309,11 @@ def preflight(stage: str, workspace: str, diagnostics: bool = False, gpu_snapsho
     checks.append(check_env_sources(wanted, os.environ, read_dotenv_deploy_vars(DOTENV_FILE)))
     target_ok = all(check.ok for check in checks)
     try:
-        module, calls = load_worker(stage, diagnostics, gpu_snapshot, max_containers)
+        module, calls = load_worker(stage, diagnostics, gpu_snapshot, max_containers, max_inputs)
     except Exception as error:  # noqa: BLE001 - 배포 파일 자체의 설정 오류(staging 이름 충돌 등)도 검사 실패다
         return profile, checks + [Check("load deploy file", False, f"{type(error).__name__}: {error}")]
     checks += check_deploy_config(module, calls, stage, gpu_snapshot, max_containers)
+    checks += check_concurrency(module, calls, max_inputs)
     checks.append(check_lifecycle_decorators())
     checks.append(check_no_private_modal_api())
     if profile and target_ok:
@@ -788,6 +828,11 @@ def main(argv: list[str] | None = None) -> int:
                              help="production 을 GPU snapshot 으로 검사(배포 시 BODY_IMAGE_WORKER_GPU_SNAPSHOT=true)")
         command.add_argument("--max-containers", type=int,
                              help="production max_containers(배포 시 BODY_IMAGE_WORKER_MAX_CONTAINERS). GPU snapshot 에 필수")
+        command.add_argument("--max-inputs", type=int, default=1,
+                             help="컨테이너당 입력·Worker Limiter(배포 시 BODY_IMAGE_WORKER_MAX_INPUTS). 2 는 staging 만")
+    registered_cmd = sub.add_parser("registered")
+    registered_cmd.add_argument("--workspace", required=True)
+    registered_cmd.add_argument("--max-inputs", type=int, default=1)
     smoke_cmd = sub.add_parser("smoke")
     smoke_cmd.add_argument("--workspace", required=True)
     smoke_cmd.add_argument("--image", required=True, type=Path, help="정상 전신사진(JPEG)")
@@ -798,14 +843,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command in ("preflight", "deploy"):
-        wanted = deploy_env(args.stage, args.diagnostics, args.gpu_snapshot, args.max_containers)
+        wanted = deploy_env(args.stage, args.diagnostics, args.gpu_snapshot, args.max_containers, args.max_inputs)
         if args.command == "deploy" and args.stage == "production":
             # 공유 production App 은 이 도구로 배포하지 않는다(자동 배포·중단·롤백 없음). 검사만 한다.
             print("production 은 이 도구로 배포하지 않습니다. preflight 로 검사한 뒤 승인을 받아 직접 실행하세요:\n"
                   f"  {manual_deploy_command(wanted)}")
             return 2
         profile, checks = preflight(args.stage, args.workspace, args.diagnostics, args.gpu_snapshot,
-                                    args.max_containers)
+                                    args.max_containers, args.max_inputs)
         if not print_checks(checks):
             print("preflight FAILED: 배포하지 않습니다.")
             return 1
@@ -827,6 +872,9 @@ def main(argv: list[str] | None = None) -> int:
     ops = ModalOps(profile)
     module, _ = load_worker("staging")
     app_name = module.APP_NAME
+    if args.command == "registered":
+        [function] = ops.app_info(app_name)["functions"].values()
+        return 0 if print_checks(check_registered(ops.function_info(function["id"]), args.max_inputs)) else 1
     report: dict = {"workspace": args.workspace, "profile": profile}
     try:
         report.update(smoke(ops, app_name, load_credentials(args.credentials_file), args.image,

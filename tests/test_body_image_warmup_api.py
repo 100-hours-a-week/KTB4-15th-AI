@@ -92,7 +92,7 @@ class FakeClient:
 
 
 class StubService:
-    def validate(self, body):
+    def validate(self, body, ai_request_id=None):
         return BodyImageValidationResult(s3_key="body-images/stub.png")
 
 

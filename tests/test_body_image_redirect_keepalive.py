@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from app.body_image_validation.async_concurrency import AsyncBodyValidationLimiter
+from app.body_image_validation.diagnostics import REQUEST_ID_HEADER
 from app.body_image_validation.exceptions import BodyImageValidationError
 from tests.test_body_image_http_timeouts import (
     RawServer,
@@ -101,6 +102,23 @@ def test_303_becomes_a_get_without_the_image_and_keeps_the_auth_headers():
     assert "content-type" not in get_call.headers and "content-length" not in get_call.headers
     for name in ("modal-key", "modal-secret", "authorization"):
         assert get_call.headers[name] == post_call.headers[name]
+
+
+def test_303_keeps_the_request_id_of_the_call_and_the_next_call_gets_a_new_one(logs):
+    handler, calls = redirect_once(POLL)
+
+    async def scenario():
+        svc = await opened(service(worker_answering(handler)))
+        await svc.avalidate(jpeg())
+        await svc.avalidate(jpeg())
+
+    run(scenario)
+
+    post_call, get_call, next_call = calls
+    first, second = summaries(logs)
+    assert post_call.headers[REQUEST_ID_HEADER] == get_call.headers[REQUEST_ID_HEADER] == first["request_id"]
+    assert next_call.headers[REQUEST_ID_HEADER] == second["request_id"] != first["request_id"]
+    assert first["redirects"] == "1"
 
 
 def test_get_after_a_303_carries_no_body_on_the_wire():

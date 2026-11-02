@@ -749,7 +749,8 @@ def test_deploy_refusal_prints_the_cap_in_the_manual_command(monkeypatch, capsys
     out = capsys.readouterr().out
     assert code == 2
     assert ("BODY_IMAGE_WORKER_STAGE=production BODY_IMAGE_WORKER_GPU_SNAPSHOT=true "
-            "BODY_IMAGE_WORKER_MAX_CONTAINERS=2 BODY_IMAGE_WORKER_DIAGNOSTICS=false modal deploy") in out
+            "BODY_IMAGE_WORKER_MAX_CONTAINERS=2 BODY_IMAGE_WORKER_DIAGNOSTICS=false "
+            "BODY_IMAGE_WORKER_MAX_INPUTS=1 modal deploy") in out
 
 
 # --- 검사한 설정 = 실제 배포 설정 ---
@@ -784,6 +785,7 @@ def test_deploy_env_states_every_deploy_variable():
     assert dc.deploy_env("production") == {
         "BODY_IMAGE_WORKER_STAGE": "production", "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "false",
         "BODY_IMAGE_WORKER_MAX_CONTAINERS": "", "BODY_IMAGE_WORKER_DIAGNOSTICS": "false",
+        "BODY_IMAGE_WORKER_MAX_INPUTS": "1",
     }
 
 
@@ -892,3 +894,148 @@ def test_cpu_manual_command_overrides_a_leftover_gpu_flag():
     assert "BODY_IMAGE_WORKER_GPU_SNAPSHOT=false" in command and "BODY_IMAGE_WORKER_MAX_CONTAINERS=''" in command
     assert resolved({"BODY_IMAGE_WORKER_STAGE": "production", "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "false",
                      "BODY_IMAGE_WORKER_MAX_CONTAINERS": "", "BODY_IMAGE_WORKER_DIAGNOSTICS": "false"})["gpu_snapshot"] is False
+
+
+# --- 컨테이너당 입력 ---
+
+
+def checks_by_name(checks):
+    return {check.name: check.ok for check in checks}
+
+
+@pytest.mark.parametrize("max_inputs", [1, 2])
+def test_concurrency_checks_pass_on_the_real_file(max_inputs):
+    module, calls = dc.load_worker("staging", max_inputs=max_inputs)
+
+    assert all(check.ok for check in dc.check_concurrency(module, calls, max_inputs))
+    assert all(check.ok for check in dc.check_deploy_config(module, calls, "staging"))
+
+
+def test_loading_the_worker_leaves_modal_as_it_was():
+    import modal
+
+    original = modal.concurrent
+
+    dc.load_worker("staging", max_inputs=2)
+
+    assert modal.concurrent is original
+
+
+def test_one_input_loads_without_the_decorator():
+    _, calls = dc.load_worker("staging")
+
+    assert [options for name, options in calls if name == "concurrent"] == []
+
+
+def test_a_deploy_file_that_skips_the_decorator_fails_the_check():
+    module, calls = dc.load_worker("staging", max_inputs=2)
+    without = [call for call in calls if call[0] != "concurrent"]
+
+    assert checks_by_name(dc.check_concurrency(module, without, 2))["modal concurrency"] is False
+
+
+def test_a_worker_limiter_that_differs_from_the_inputs_fails_the_check(monkeypatch):
+    module, calls = dc.load_worker("staging", max_inputs=2)
+    monkeypatch.setitem(module.STAGE_ENV["env"], "MAX_CONCURRENT_BODY_VALIDATIONS", "1")
+
+    assert checks_by_name(dc.check_concurrency(module, calls, 2))["worker limiter env"] is False
+
+
+def test_preflight_with_two_inputs_checks_the_two_values(monkeypatch):
+    lookddak_profile(monkeypatch)
+
+    _, checks = dc.preflight("staging", "lookddak", max_inputs=2)
+
+    assert all(check.ok for check in checks)
+    assert {"max inputs", "modal concurrency", "worker limiter env"} <= {check.name for check in checks}
+
+
+@pytest.mark.parametrize("max_inputs", [0, -1, 3])
+def test_preflight_refuses_values_outside_one_and_two(monkeypatch, max_inputs):
+    lookddak_profile(monkeypatch)
+
+    _, checks = dc.preflight("staging", "lookddak", max_inputs=max_inputs)
+
+    assert not all(check.ok for check in checks)
+    assert "load deploy file" in {check.name for check in checks if not check.ok}
+
+
+def test_preflight_refuses_two_inputs_on_production(monkeypatch):
+    lookddak_profile(monkeypatch)
+
+    _, checks = dc.preflight("production", "lookddak", max_inputs=2)
+
+    assert "load deploy file" in {check.name for check in checks if not check.ok}
+
+
+def test_deploy_passes_the_checked_inputs_to_modal(monkeypatch):
+    lookddak_profile(monkeypatch)
+    ran = {}
+    monkeypatch.setattr(dc.subprocess, "run",
+                        lambda cmd, env, check: ran.update(env=env) or type("R", (), {"returncode": 0}))
+
+    assert dc.main(["deploy", "--stage", "staging", "--workspace", "lookddak", "--max-inputs", "2"]) == 0
+
+    assert ran["env"]["BODY_IMAGE_WORKER_MAX_INPUTS"] == "2"
+
+
+def test_cli_value_reaches_preflight(monkeypatch):
+    lookddak_profile(monkeypatch)
+    monkeypatch.setattr(dc.subprocess, "run", lambda *a, **k: pytest.fail("배포하면 안 된다"))
+
+    assert dc.main(["deploy", "--stage", "staging", "--workspace", "lookddak", "--max-inputs", "3"]) == 1
+
+
+def test_a_shell_value_that_differs_from_the_checked_inputs_fails_preflight(monkeypatch):
+    lookddak_profile(monkeypatch)
+    monkeypatch.setenv("BODY_IMAGE_WORKER_MAX_INPUTS", "2")
+
+    _, checks = dc.preflight("staging", "lookddak")
+
+    assert [check.name for check in checks if not check.ok] == ["deploy env sources"]
+
+
+def registered_info(**overrides):
+    return {"gpus": [["T4", 1]], "max_containers": 1, "concurrency_info": None, **overrides}
+
+
+@pytest.mark.parametrize(
+    ("info", "max_inputs", "failed"),
+    [
+        (registered_info(), 1, []),
+        (registered_info(concurrency_info={"max_inputs": 2, "target_inputs": 2}), 2, []),
+        (registered_info(), 2, ["registered concurrency"]),
+        (registered_info(concurrency_info={"max_inputs": 2, "target_inputs": 1}), 2, ["registered concurrency"]),
+        (registered_info(concurrency_info={"max_inputs": 2, "target_inputs": 2}), 1, ["registered concurrency"]),
+        (registered_info(max_containers=2), 1, ["registered max containers"]),
+        (registered_info(gpus=[["L4", 1]]), 1, ["registered gpu"]),
+    ],
+    ids=["one", "two", "not-registered", "target-differs", "expected-one", "two-containers", "other-gpu"],
+)
+def test_registered_function_is_compared_with_the_expected_values(info, max_inputs, failed):
+    assert [check.name for check in dc.check_registered(info, max_inputs) if not check.ok] == failed
+
+
+def test_registered_command_only_reads_the_app(monkeypatch):
+    profiles = [{"name": "leejein", "workspace": "leejein", "active": False}]
+    monkeypatch.setattr(dc, "modal_cli", lambda *args, **kwargs: json.dumps(profiles))
+    monkeypatch.setenv("MODAL_PROFILE", "leejein")
+    cli_calls = []
+
+    class Ops:
+        def __init__(self, profile):
+            self.profile = profile
+
+        def app_info(self, name):
+            cli_calls.append("app_info")
+            return {"functions": {"BodyImageWorker.*": {"id": "fu-1"}}}
+
+        def function_info(self, function_id):
+            cli_calls.append("function_info")
+            return registered_info()
+
+    monkeypatch.setattr(dc, "ModalOps", Ops)
+
+    assert dc.main(["registered", "--workspace", "leejein"]) == 0
+    assert dc.main(["registered", "--workspace", "leejein", "--max-inputs", "2"]) == 1
+    assert cli_calls == ["app_info", "function_info"] * 2

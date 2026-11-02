@@ -15,6 +15,7 @@ from app.body_image_validation import deadline as worker_deadline
 from app.body_image_validation.async_concurrency import AsyncBodyValidationLimiter
 from app.body_image_validation.concurrency import SlotWaitTimeout
 from app.body_image_validation.deadline import RequestDeadline
+from app.body_image_validation.diagnostics import REQUEST_ID_HEADER
 from app.body_image_validation.exceptions import BodyImageValidationError, ServerBusyError
 from app.body_image_validation.image_io import open_image
 from app.body_image_validation.models import BodyImageValidationResult
@@ -371,6 +372,7 @@ class RemoteBodyImageValidationService:
         headers = {
             **self._headers,
             worker_deadline.HEADER: f"{self._wall_clock() + remaining:.3f}",
+            REQUEST_ID_HEADER: log.request_id,
         }
         try:
             async with asyncio.timeout(remaining):

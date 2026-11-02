@@ -82,9 +82,11 @@ REMBG_ENABLE_CPU_MEM_ARENA = os.getenv("REMBG_ENABLE_CPU_MEM_ARENA", "false").lo
 REMBG_PROVIDERS = tuple(
     name.strip() for name in os.getenv("BODY_IMAGE_REMBG_PROVIDERS", "").split(",") if name.strip()
 )
-# 진단(staging 검증용, 기본 꺼짐). 켜면 요청마다 단계별 처리 시간(ms)을 INFO 로그 한 줄로 남긴다.
-# API 응답은 바꾸지 않는다.
+# 진단(staging 검증용, 기본 꺼짐). 켜면 요청마다 단계별 처리 시간(ms) 한 줄과, 같은 시간에 request_id·Lock 대기/보유·
+# 메모리(프로세스·컨테이너·GPU 장치 전체 값)를 더한 JSON 한 줄을 INFO 로그로 남긴다. API 응답은 바꾸지 않는다.
 DIAGNOSTICS = os.getenv("BODY_IMAGE_DIAGNOSTICS", "false").lower() == "true"
+# 진단이 켜진 worker 가 요청을 처리하는 동안 메모리를 읽는 간격(초). 유휴 때는 읽지 않는다.
+DIAGNOSTICS_SAMPLE_INTERVAL_SECONDS = 0.05
 # 0 보다 크면 rembg ONNX Runtime session 을 profiling 을 켜고 만들고, 이 횟수만큼 실행한 뒤 profiling 을 끝내
 # 실행별 provider(CUDA/CPU) 노드 수와 추론 시간을 로그로 남긴다. 그 뒤 실행은 profiling 하지 않는다(기본 0).
 REMBG_PROFILE_RUNS = int(os.getenv("BODY_IMAGE_REMBG_PROFILE_RUNS", "0"))
