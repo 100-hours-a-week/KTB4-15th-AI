@@ -2,6 +2,7 @@ import logging
 import threading
 from typing import TYPE_CHECKING
 
+from app.body_image_validation.diagnostics import ResourceSampler, install_lock_timers
 from app.body_image_validation.inference import BodyImageModels, BodyImageRuntimeError
 from app.body_image_validation.service import BodyImageValidationService
 from app.clients.s3 import ImageStorage, S3ConfigError, S3ImageStorage, get_s3_bucket
@@ -22,6 +23,11 @@ class BodyImageRuntime:
         self.person_detector = models.person_detector
         self.pose_detector = models.pose_detector
         self.background_remover = models.background_remover
+        # 진단 계측은 여기서만 설치한다. 이 객체는 snapshot 복원 뒤에 만들어지므로 snapshot 에 담기지 않는다.
+        self.resources = None
+        if config.DIAGNOSTICS:
+            install_lock_timers(models)
+            self.resources = ResourceSampler(config.DIAGNOSTICS_SAMPLE_INTERVAL_SECONDS)
         self.service = BodyImageValidationService(
             models.person_detector,
             models.pose_detector,
@@ -29,6 +35,7 @@ class BodyImageRuntime:
             storage,
             gpu_preprocessor=models.gpu_preprocessor,
             diagnostics=config.DIAGNOSTICS,
+            resources=self.resources,
         )
 
     @classmethod
@@ -50,6 +57,8 @@ class BodyImageRuntime:
         return cls(models, storage)
 
     def close(self) -> None:
+        if self.resources is not None:
+            self.resources.close()
         self.models.close()
 
 
