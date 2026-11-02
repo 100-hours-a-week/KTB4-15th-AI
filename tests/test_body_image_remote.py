@@ -1,15 +1,17 @@
-"""AI Server(remote 모드) → Modal worker HTTP 연동. 실제 Modal 은 부르지 않고 httpx MockTransport 를 쓴다."""
-
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from email import message_from_bytes
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -17,7 +19,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from app.body_image_validation import inference, router, runtime, worker
-from app.body_image_validation.concurrency import BodyValidationLimiter
+from app.body_image_validation.async_concurrency import AsyncBodyValidationLimiter
 from app.body_image_validation.remote import (
     RemoteBodyImageValidationService,
     RemoteWorkerConfigError,
@@ -25,6 +27,7 @@ from app.body_image_validation.remote import (
 from app.body_image_validation.runtime import BodyImageRuntimeError, BodyImageRuntimeManager
 from app.config import body_image_validation as config
 from app.config import settings
+from tests.test_body_image_image_io import png_header_only
 
 URL = "/api/v1/validation/body-image"
 KEY = "ai-server-key"
@@ -36,6 +39,12 @@ ROOT = Path(__file__).resolve().parents[1]
 def jpeg(size=(600, 800)):
     output = BytesIO()
     Image.new("RGB", size, (180, 170, 160)).save(output, format="JPEG")
+    return output.getvalue()
+
+
+def gif(size=(600, 800)):
+    output = BytesIO()
+    Image.new("RGB", size, (180, 170, 160)).save(output, format="GIF")
     return output.getvalue()
 
 
@@ -82,9 +91,19 @@ def remote_service(fake, limiter=None, timeout=30.0, deadline=60.0):
         api_key="worker-key",
         timeout=timeout,
         total_deadline=deadline,
-        limiter=limiter or BodyValidationLimiter(1, 1),
+        limiter=limiter or AsyncBodyValidationLimiter(1, 1),
         transport=fake.transport,
     )
+
+
+_app = SimpleNamespace(portal=None, opened=[])
+
+
+async def _close(service):
+    # 테스트가 실패해 호출이 남아 있어도 기다리지 않는다(시간이 끝나면 바로 닫는다).
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(1.0):
+            await service.aclose()
 
 
 @pytest.fixture
@@ -92,7 +111,12 @@ def client(monkeypatch):
     monkeypatch.setattr(settings, "INTERNAL_API_KEY", KEY)
     monkeypatch.setattr(settings, "AUTH_DISABLED", False)
     with TestClient(worker.create_app(), raise_server_exceptions=False) as test_client:
-        yield test_client
+        _app.portal = test_client.portal
+        try:
+            yield test_client
+        finally:
+            while _app.opened:
+                _app.portal.call(_close, _app.opened.pop())
 
 
 def post(client, body):
@@ -100,6 +124,9 @@ def post(client, body):
 
 
 def use(monkeypatch, service):
+    """worker 앱에 remote service 를 끼운다. 이 앱에는 lifespan 이 없어 공유 client 를 서버 loop 에서 대신 연다."""
+    _app.portal.call(service.aopen)
+    _app.opened.append(service)
     monkeypatch.setattr(router, "get_service", lambda: service)
 
 
@@ -133,7 +160,7 @@ def test_request_carries_both_auth_layers_and_the_original_image(client, monkeyp
 def test_trailing_slash_in_the_base_url_is_ignored():
     service = RemoteBodyImageValidationService(
         WORKER + "/", proxy_key="k", proxy_secret="s", api_key="a", timeout=1, total_deadline=1,
-        limiter=BodyValidationLimiter(1, 1),
+        limiter=AsyncBodyValidationLimiter(1, 1),
     )
     assert service.endpoint == WORKER + URL
 
@@ -189,6 +216,7 @@ TIMEOUT = {"code": "BODY_IMAGE_WORKER_TIMEOUT", "data": None,
         # 시간 초과 → 504
         (FakeWorker(error=httpx.ReadTimeout("timed out")), 504, TIMEOUT),
         (FakeWorker(error=httpx.ConnectTimeout("timed out")), 504, TIMEOUT),
+        (FakeWorker(error=httpx.PoolTimeout("timed out")), 504, TIMEOUT),
         (FakeWorker(status=504, body=b"gateway timeout"), 504, TIMEOUT),
         # worker 에 닿지 못함 → 503
         (FakeWorker(error=httpx.ConnectError("refused")), 503, UNAVAILABLE),
@@ -210,7 +238,7 @@ TIMEOUT = {"code": "BODY_IMAGE_WORKER_TIMEOUT", "data": None,
         (FakeWorker(status=200, body=common("BODY_IMAGE_UPLOAD_SUCCESS", data={})), 502, UNAVAILABLE),
         (FakeWorker(status=200, body=common("OTHER_CODE", data={"s3_key": "k"})), 502, UNAVAILABLE),
     ],
-    ids=["timeout", "connect-timeout", "upstream-504", "refused", "dns", "reset", "upstream-503-json",
+    ids=["timeout", "connect-timeout", "pool-timeout", "upstream-504", "refused", "dns", "reset", "upstream-503-json",
          "upstream-503-html", "upstream-502", "proxy-401", "worker-401", "403", "404", "405",
          "invalid-request", "422-not-json", "200-not-json", "200-not-common-format", "200-without-key",
          "200-other-code"],
@@ -244,6 +272,291 @@ def test_auth_failures_name_the_layer_without_logging_secrets(client, monkeypatc
         assert secret not in caplog.text
 
 
+def test_unexpected_error_is_the_common_500_without_details(client, monkeypatch):
+    use(monkeypatch, remote_service(FakeWorker(error=RuntimeError("internal wk-test"))))
+
+    response = post(client, jpeg())
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "code": "INTERNAL_SERVER_ERROR",
+        "data": None,
+        "message": "서버 내부 오류가 발생했습니다.",
+    }
+
+
+# --- 응답 크기 제한(64KB) ---
+
+LIMIT = 64 * 1024
+SUCCESS_CODE = "BODY_IMAGE_UPLOAD_SUCCESS"
+
+
+def sized(size, code, data=None):
+    """공통 형식 JSON 을 정확히 size 바이트로 만든다."""
+    return common(code, "x" * (size - len(common(code, "", data))), data)
+
+
+class BodyStream:
+    """응답 본문을 조각으로 보낸다. 조각이 예외이면 그 지점에서 낸다(본문을 읽는 도중의 실패). 읽힌 조각 수를 센다."""
+
+    def __init__(self, *chunks):
+        self.chunks = chunks
+        self.read = 0
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            if isinstance(chunk, BaseException):
+                raise chunk
+            self.read += 1
+            yield chunk
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "data", "size", "expected"),
+    [
+        (200, SUCCESS_CODE, {"s3_key": "body-images/abc.png"}, LIMIT, 200),
+        (200, SUCCESS_CODE, {"s3_key": "body-images/abc.png"}, LIMIT + 1, 502),
+        (422, "FULL_BODY_NOT_VISIBLE", None, LIMIT, 422),
+        (422, "FULL_BODY_NOT_VISIBLE", None, LIMIT + 1, 502),
+    ],
+    ids=["200-at-limit", "200-over-limit", "422-at-limit", "422-over-limit"],
+)
+def test_worker_response_is_limited_to_64kb(client, monkeypatch, status, code, data, size, expected):
+    use(monkeypatch, remote_service(FakeWorker(status=status, body=sized(size, code, data))))
+
+    response = post(client, jpeg())
+
+    assert response.status_code == expected
+    if expected == 502:
+        assert response.json() == UNAVAILABLE
+
+
+def test_oversized_response_is_not_read_to_the_end(client, monkeypatch):
+    stream = BodyStream(*[b"x" * 16 * 1024] * 100)  # 1.6MB
+    use(monkeypatch, remote_service(FakeWorker(steps=[(0, 200, {}, stream)])))
+
+    response = post(client, jpeg())
+
+    assert response.status_code == 502
+    assert stream.read <= 5  # 64KB 를 넘는 조각에서 멈춘다
+
+
+# --- 응답 본문을 읽는 도중의 실패 ---
+
+
+@pytest.mark.parametrize(
+    ("error", "status", "expected"),
+    [
+        (httpx.ReadError("reset"), 503, UNAVAILABLE),
+        (httpx.RemoteProtocolError("closed"), 503, UNAVAILABLE),
+        (httpx.ReadTimeout("timed out"), 504, TIMEOUT),
+    ],
+    ids=["reset", "closed", "timeout"],
+)
+def test_failure_while_reading_the_body_maps_like_a_request_failure(client, monkeypatch, error, status, expected):
+    fake = FakeWorker(steps=[(0, 200, {}, BodyStream(b'{"code":', error))])
+    use(monkeypatch, remote_service(fake))
+
+    response = post(client, jpeg())
+
+    assert response.status_code == status
+    assert response.json() == expected
+    assert len(fake.calls) == 1
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="httpx.DecodingError 는 TransportError 가 아니라 _call 에서 잡히지 않아 500 INTERNAL_SERVER_ERROR 로 나간다",
+)
+def test_undecodable_worker_response_is_bad_gateway(client, monkeypatch):
+    fake = FakeWorker(steps=[(0, 200, {"content-encoding": "gzip"}, b"not gzip")])
+    use(monkeypatch, remote_service(fake))
+
+    response = post(client, jpeg())
+
+    assert response.status_code == 502
+    assert response.json() == UNAVAILABLE
+
+
+# --- 요청 사이의 격리와 HTTP client 설정 ---
+
+
+def test_http_client_ignores_the_environment_and_does_not_follow_redirects(client, monkeypatch):
+    created = []
+    real_client = httpx.AsyncClient
+
+    class Spy(real_client):
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", Spy)
+    use(monkeypatch, remote_service(FakeWorker()))
+
+    assert post(client, jpeg()).status_code == 200
+
+    assert created
+    for kwargs in created:
+        assert kwargs["follow_redirects"] is False
+        assert kwargs["trust_env"] is False
+
+
+def test_cookies_from_one_request_do_not_reach_the_next(client, monkeypatch):
+    fake = FakeWorker(steps=[(0, 200, {"set-cookie": "sid=1; Path=/"}, SUCCESS), (0, 200, {}, SUCCESS)])
+    use(monkeypatch, remote_service(fake))
+
+    post(client, jpeg())
+    post(client, jpeg())
+
+    assert len(fake.calls) == 2
+    assert "cookie" not in fake.calls[1].headers
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.ConnectError("refused"),
+        httpx.ReadError("reset"),
+        httpx.ReadTimeout("timed out"),
+        RuntimeError("unexpected"),
+        (0, 502, {}, b"bad gateway"),
+        (0, 200, {}, b"not json"),
+    ],
+    ids=["refused", "reset", "timeout", "unexpected", "502", "invalid-body"],
+)
+def test_next_request_succeeds_after_a_failure(client, monkeypatch, failure):
+    fake = FakeWorker(steps=[failure, (0, 200, {}, SUCCESS)])
+    # 대기열이 없어 슬롯이 돌아오지 않으면 다음 요청은 429 다.
+    use(monkeypatch, remote_service(fake, limiter=AsyncBodyValidationLimiter(1, 0)))
+
+    assert post(client, jpeg()).status_code != 200
+
+    response = post(client, jpeg())
+    assert response.status_code == 200
+    assert response.json()["data"] == {"s3_key": "body-images/abc.png"}
+    assert len(fake.calls) == 2
+
+
+def test_next_request_succeeds_after_the_deadline_cancelled_a_call(client, monkeypatch):
+    fake = FakeWorker(steps=[(5.0, 200, {}, SUCCESS), (0, 200, {}, SUCCESS)])
+    use(monkeypatch, remote_service(fake, limiter=AsyncBodyValidationLimiter(1, 0), timeout=0.05, deadline=0.05))
+
+    assert post(client, jpeg()).status_code == 504
+
+    assert post(client, jpeg()).status_code == 200
+    assert len(fake.calls) == 2
+
+
+# --- 실제 TCP 연결 ---
+# MockTransport 에는 event loop 에 묶인 소켓이 없어 닫힌 loop 의 연결을 다시 쓰는 오류(Event loop is closed)가 나지
+# 않는다. 연결 재사용·취소 뒤 복구는 loopback 의 실제 소켓으로 확인한다. Modal 은 부르지 않는다.
+
+
+class LocalWorkerHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"  # keep-alive
+
+    def setup(self):
+        super().setup()
+        self.server.connections += 1  # 받아들인 TCP 연결
+
+    def do_POST(self):
+        if self.server.reject_upload:  # 본문을 읽지 않고 끊는다
+            self.server.rejected += 1
+            self.close_connection = True
+            return
+        self.rfile.read(int(self.headers["content-length"]))
+        self.server.requests += 1
+        self.server.seen_cookies.append(self.headers.get("cookie"))
+        if self.server.truncate_next:  # 응답을 보내다가 끊는다
+            self.server.truncate_next = False
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(SUCCESS)))
+            self.end_headers()
+            self.wfile.write(SUCCESS[:10])
+            self.close_connection = True
+            return
+        if self.server.delays:
+            time.sleep(self.server.delays.pop(0))
+        if self.server.drop_next:  # 요청을 받고 응답 없이 끊는다
+            self.server.drop_next = False
+            self.close_connection = True
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(SUCCESS)))
+        if self.server.set_cookie:
+            self.send_header("Set-Cookie", f"sid={self.server.requests}; Path=/")
+        if not self.server.keep_alive:
+            self.send_header("Connection", "close")
+        self.end_headers()
+        with contextlib.suppress(ConnectionError):  # 취소된 요청은 이미 끊겼다
+            self.wfile.write(SUCCESS)
+        if self.server.close_silently:  # keep-alive 를 약속한 뒤 유휴 연결을 서버가 닫는다
+            time.sleep(self.server.close_after)  # 이 사이에 도착한 요청은 읽지 않고 버린다
+            self.close_connection = True
+
+    def log_message(self, *args):
+        pass
+
+
+class LocalWorker(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self):
+        super().__init__(("127.0.0.1", 0), LocalWorkerHandler)
+        self.requests = 0
+        self.connections = 0
+        self.seen_cookies = []
+        self.delays = []
+        self.keep_alive = True
+        self.close_silently = False
+        self.close_after = 0.0
+        self.drop_next = False
+        self.truncate_next = False
+        self.set_cookie = False
+        self.reject_upload = False
+        self.rejected = 0
+
+
+@pytest.fixture
+def local_worker():
+    server = LocalWorker()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield server
+    server.shutdown()
+    server.server_close()
+
+
+def tcp_service(server, **kwargs):
+    service = remote_service(SimpleNamespace(transport=None), **kwargs)
+    service.endpoint = f"http://127.0.0.1:{server.server_port}{URL}"  # 생성자는 https 만 받는다
+    return service
+
+
+@pytest.mark.parametrize("keep_alive", [True, False], ids=["keep-alive", "server-closes"])
+def test_consecutive_requests_work_over_real_connections(client, monkeypatch, local_worker, keep_alive):
+    local_worker.keep_alive = keep_alive
+    use(monkeypatch, tcp_service(local_worker))
+
+    responses = [post(client, jpeg()) for _ in range(6)]
+
+    assert [r.status_code for r in responses] == [200] * 6
+    assert responses[-1].json()["data"] == {"s3_key": "body-images/abc.png"}
+    assert local_worker.requests == 6  # 재시도 없음
+
+
+def test_request_after_a_cancelled_call_works_over_real_connections(client, monkeypatch, local_worker):
+    local_worker.delays = [1.0]
+    # 첫 요청이 서버에 닿은 뒤 끊기도록 제한을 넉넉히 둔다(먼저 끊기면 지연을 다음 요청이 받는다).
+    service = tcp_service(local_worker, limiter=AsyncBodyValidationLimiter(1, 0), timeout=0.4, deadline=0.4)
+    use(monkeypatch, service)
+
+    assert post(client, jpeg()).status_code == 504
+
+    service.total_deadline, service.timeout = 5.0, httpx.Timeout(5.0)  # 짧은 제한은 첫 요청만을 위한 것이다
+    assert post(client, jpeg()).status_code == 200
+    assert local_worker.requests == 2
+
+
 # --- 요청 전 검사와 동시 실행 제한 ---
 
 
@@ -252,8 +565,12 @@ def test_auth_failures_name_the_layer_without_logging_secrets(client, monkeypatc
     [
         (b"", 400, "IMAGE_EMPTY"),
         (b"not-an-image", 400, "INVALID_IMAGE"),
+        (gif(), 400, "IMAGE_FORMAT_UNSUPPORTED"),
+        (b"\x00" * (config.MAX_IMAGE_BYTES + 1), 413, "IMAGE_TOO_LARGE"),
         (jpeg((300, 400)), 422, "IMAGE_RESOLUTION_TOO_SMALL"),
+        (png_header_only(15055, 10000), 422, "IMAGE_RESOLUTION_TOO_LARGE"),
     ],
+    ids=["empty", "not-an-image", "unsupported-format", "too-large", "too-small", "too-many-pixels"],
 )
 def test_invalid_uploads_are_rejected_without_waking_the_worker(client, monkeypatch, body, status, code):
     fake = FakeWorker()
@@ -266,11 +583,11 @@ def test_invalid_uploads_are_rejected_without_waking_the_worker(client, monkeypa
 
 
 def test_full_limiter_answers_429_without_calling_the_worker(client, monkeypatch):
-    limiter = BodyValidationLimiter(1, 0)
+    limiter = AsyncBodyValidationLimiter(1, 0)
     fake = FakeWorker()
     use(monkeypatch, remote_service(fake, limiter=limiter))
 
-    with limiter.slot():  # 다른 요청이 worker 응답을 기다리는 중
+    with client.portal.wrap_async_context_manager(limiter.slot()):  # 다른 요청이 worker 응답을 기다리는 중
         response = post(client, jpeg())
 
     assert response.status_code == 429
@@ -280,7 +597,7 @@ def test_full_limiter_answers_429_without_calling_the_worker(client, monkeypatch
 
 
 def test_limiter_is_released_after_a_worker_failure(client, monkeypatch):
-    limiter = BodyValidationLimiter(1, 0)
+    limiter = AsyncBodyValidationLimiter(1, 0)
     use(monkeypatch, remote_service(FakeWorker(error=httpx.ReadTimeout("t")), limiter=limiter))
 
     response = post(client, jpeg())
@@ -305,7 +622,7 @@ def test_incomplete_or_unsafe_settings_are_rejected(overrides):
     base_url = options.pop("base_url")
 
     with pytest.raises(RemoteWorkerConfigError):
-        RemoteBodyImageValidationService(base_url, limiter=BodyValidationLimiter(1, 1), **options)
+        RemoteBodyImageValidationService(base_url, limiter=AsyncBodyValidationLimiter(1, 1), **options)
 
 
 @pytest.fixture
@@ -322,7 +639,7 @@ def remote_mode(monkeypatch):
         monkeypatch.setattr(inference, name, must_not_build)
     monkeypatch.setattr(config, "VALIDATION_MODE", "remote")
     monkeypatch.setattr(config, "REMOTE_URL", WORKER)
-    monkeypatch.setattr(config, "REMOTE_TIMEOUT_SECONDS", 30.0)
+    monkeypatch.setattr(config, "REMOTE_READ_TIMEOUT_SECONDS", 30.0)
     monkeypatch.setattr(config, "REMOTE_TOTAL_DEADLINE_SECONDS", 60.0)
     monkeypatch.setattr(settings, "BODY_IMAGE_REMOTE_PROXY_KEY", "wk-test")
     monkeypatch.setattr(settings, "BODY_IMAGE_REMOTE_PROXY_SECRET", "ws-test")
@@ -497,6 +814,18 @@ def test_303_without_location_is_bad_gateway(client, monkeypatch):
     assert len(fake.calls) == 1
 
 
+@pytest.mark.parametrize("location", ["https://x:notaport/", "/\x7f"], ids=["bad-port", "control-char"])
+def test_malformed_location_is_bad_gateway(client, monkeypatch, location):
+    fake = FakeWorker(steps=[redirect(location), (0, 200, {}, SUCCESS)])
+    use(monkeypatch, remote_service(fake))
+
+    response = post(client, jpeg())
+
+    assert response.status_code == 502
+    assert response.json() == UNAVAILABLE
+    assert len(fake.calls) == 1
+
+
 @pytest.mark.parametrize(
     "steps",
     [
@@ -560,7 +889,7 @@ def test_scenario_a_deadline_200_waits_through_the_303_and_returns_the_key(clien
 
 def test_scenario_b_deadline_90_ends_at_90_with_504(client, monkeypatch):
     fake = FakeWorker(steps=modal_slow_steps())
-    limiter = BodyValidationLimiter(1, 0)
+    limiter = AsyncBodyValidationLimiter(1, 0)
     use(monkeypatch, remote_service(fake, limiter=limiter, timeout=90 * SCALE, deadline=90 * SCALE))
 
     started = time.monotonic()
@@ -611,9 +940,9 @@ def test_call_summary_is_logged_without_secrets_or_urls(client, monkeypatch, cap
     with caplog.at_level(logging.INFO, logger="app.body_image_validation.remote"):
         post(client, jpeg())
 
-    [summary] = [r.getMessage() for r in caplog.records if "body image worker call" in r.getMessage()]
+    [summary] = [r.getMessage() for r in caplog.records if "body image request:" in r.getMessage()]
     assert "outcome=response" in summary and "status=200" in summary and "redirects=1" in summary
-    assert "elapsed=" in summary
+    assert "http=" in summary
     for secret in ("wk-test", "ws-test", "worker-key", KEY, "fc-test123", "__modal_function_call_id", WORKER):
         assert secret not in caplog.text
 
@@ -621,9 +950,9 @@ def test_call_summary_is_logged_without_secrets_or_urls(client, monkeypatch, cap
 @pytest.mark.parametrize(
     ("fake", "outcome"),
     [
-        (FakeWorker(steps=[(1.0, 200, {}, SUCCESS)]), "deadline_exceeded"),
-        (FakeWorker(error=httpx.ReadTimeout("t")), "network_timeout:ReadTimeout"),
-        (FakeWorker(error=httpx.ConnectError("refused")), "connection_failed:ConnectError"),
+        (FakeWorker(steps=[(1.0, 200, {}, SUCCESS)]), "outcome=deadline_exceeded error=deadline_exceeded"),
+        (FakeWorker(error=httpx.ReadTimeout("t")), "outcome=network_timeout error=read_timeout"),
+        (FakeWorker(error=httpx.ConnectError("refused")), "outcome=connection_failed error=connect_error"),
     ],
 )
 def test_timeout_kinds_are_logged(client, monkeypatch, caplog, fake, outcome):
@@ -632,7 +961,7 @@ def test_timeout_kinds_are_logged(client, monkeypatch, caplog, fake, outcome):
     with caplog.at_level(logging.INFO, logger="app.body_image_validation.remote"):
         post(client, jpeg())
 
-    assert f"outcome={outcome}" in caplog.text
+    assert outcome in caplog.text
 
 
 def test_misconfigured_network_timeout_below_modal_redirect_is_warned(caplog):

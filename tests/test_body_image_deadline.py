@@ -1,12 +1,3 @@
-"""AI Server deadline 을 worker 로 전하는 X-Body-Image-Deadline 과, worker 가 deadline 이 지난 요청을 멈추는 지점.
-
-세 상태를 따로 본다.
-- HTTP 연결 취소: AI Server 가 deadline 에 연결을 끊고 504 를 돌려준다(remote.py, asyncio.timeout).
-- Modal 작업 취소 요청: 보내지 않는다(HTTP endpoint 로는 공식 방법이 없다). 로그에 remote_cancel=not_requested.
-- 원격 작업 실제 종료: AI Server 는 알 수 없다(remote_stopped=unknown). worker 가 header 를 보고 다음 단계 전에
-  스스로 멈추는 것만 worker 쪽 테스트로 확인한다.
-"""
-
 import asyncio
 import logging
 import time
@@ -16,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.body_image_validation import deadline, router, worker
-from app.body_image_validation.concurrency import BodyValidationLimiter
+from app.body_image_validation.async_concurrency import AsyncBodyValidationLimiter
 from app.body_image_validation.service import BodyImageValidationService
 from app.config import settings
 from tests.test_body_image_remote import (
@@ -70,7 +61,7 @@ def deadline_service(fake, deadline_seconds, wall_start=1_000_000.0):
         api_key="worker-key",
         timeout=deadline_seconds,
         total_deadline=deadline_seconds,
-        limiter=BodyValidationLimiter(1, 0),
+        limiter=AsyncBodyValidationLimiter(1, 0),
         transport=fake.transport,
         wall_clock=lambda: wall_start,
     )
@@ -117,7 +108,7 @@ def test_over_50s_cancels_the_http_call_and_answers_504_once(remote_client, monk
     assert fake.cancelled is True  # 응답 시간 대신 대기 중인 HTTP coroutine 의 실제 취소를 확인한다
     assert fake.completed is False  # worker 의 정상 응답 완료와 구분한다
     assert len(fake.calls) == 1  # 재시도나 새 GPU 작업 요청이 없다
-    summary = next(r.getMessage() for r in caplog.records if "body image worker call" in r.getMessage())
+    summary = next(r.getMessage() for r in caplog.records if "body image request:" in r.getMessage())
     assert "outcome=deadline_exceeded" in summary
     assert "http_cancelled=True" in summary  # 이 쪽 연결은 끊었다
     assert "remote_cancel=not_requested" in summary  # Modal 취소 API 는 부르지 않았다

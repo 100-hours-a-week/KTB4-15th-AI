@@ -1,9 +1,3 @@
-"""AI Server 진입점.
-
-컨테이너는 `uvicorn app.main:app` 으로 이 파일을 부른다 (Dockerfile CMD).
-로컬에서는 `python -m app.main` 으로도 뜬다.
-"""
-
 import asyncio
 import logging
 from contextlib import asynccontextmanager
@@ -14,6 +8,7 @@ from fastapi import FastAPI
 from app import health as health_router
 from app.body_image_validation import router as body_image_validation_router
 from app.body_image_validation import warmup_router as body_image_warmup_router
+from app.body_image_validation.deadline_middleware import BodyImageDeadlineMiddleware
 from app.body_image_validation.runtime import runtime_manager
 from app.chat import router as chat_router
 from app.chat.graph import build_graph
@@ -78,6 +73,7 @@ async def lifespan(app: FastAPI):
     vf_diag.app_start(flags)
     try:
         # 이 event loop 에서 만들고 쓰고 닫는다.
+        await runtime_manager.aopen()
         body_image_warmup_router.start_warmup(app, runtime_manager.runtime)
         await open_async_pool()
         if settings.VIRTUAL_FITTING_RESULT_PUBLISHER_ENABLED:
@@ -130,11 +126,11 @@ async def lifespan(app: FastAPI):
     finally:
         # warm-up 접수를 먼저 막고 진행 중인 Modal /health 호출을 취소한다(runtime 종료보다 먼저, 예외를 내지 않는다).
         # 이 대기 중에 lifespan 이 취소돼도 아래 기존 자원 정리는 이어서 하고, 취소는 마지막에 다시 낸다.
-        warmup_cancelled = None
+        shutdown_cancelled = None
         try:
             await body_image_warmup_router.close_warmup(app)
         except asyncio.CancelledError as error:
-            warmup_cancelled = error
+            shutdown_cancelled = error
         # Worker 들과 결과 전송 루프가 함께 쓰는 DB pool 을 닫기 전에 모두 멈춘다(동시에 기다린다). 어느 쪽도
         # 공유 자원(DB pool·boto3 client)을 스스로 닫지 않는다. 결과 전송 등록을 먼저 풀어 새 준비 판단에 쓰지 않게 한다.
         register_result_publisher(None)
@@ -162,11 +158,17 @@ async def lifespan(app: FastAPI):
             for result in await asyncio.gather(*stops, return_exceptions=True):
                 if isinstance(result, BaseException):
                     logger.error("worker stop failed", exc_info=result)
-        runtime_manager.close()
+        # warm-up 다음에 닫는다. 실패하거나 취소돼도 DB pool 정리는 이어서 한다.
+        try:
+            await runtime_manager.aclose()
+        except asyncio.CancelledError as error:
+            shutdown_cancelled = error
+        except Exception as error:  # noqa: BLE001 — 종료 정리 실패가 다른 자원 정리를 막지 않게
+            logger.error("body image runtime close failed: error=%s", type(error).__name__)
         close_connection_pool()
         await close_async_pool()
-        if warmup_cancelled is not None:
-            raise warmup_cancelled
+        if shutdown_cancelled is not None:
+            raise shutdown_cancelled
 
 
 def _log_fitting_db_target() -> None:
@@ -182,6 +184,9 @@ def _log_fitting_db_target() -> None:
 
 
 app = FastAPI(title="KTB4-15th AI Server", lifespan=lifespan)
+# metrics 보다 먼저 등록해 안쪽에 둔다. 여기서 낸 504 가 metrics 에도 504 로 집계되고, 취소가 BaseHTTPMiddleware 의
+# task group 을 거치지 않는다.
+app.add_middleware(BodyImageDeadlineMiddleware)
 setup_metrics(app)
 
 register_error_handlers(app)

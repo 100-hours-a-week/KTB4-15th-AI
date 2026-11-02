@@ -32,10 +32,19 @@ VALIDATION_MODE = os.getenv("BODY_IMAGE_VALIDATION_MODE", "local").strip().lower
 # worker 의 base URL(https). 경로 /api/v1/validation/body-image 는 코드가 붙인다.
 REMOTE_URL = os.getenv("BODY_IMAGE_REMOTE_URL", "").strip()
 # worker 호출 시간 제한은 환경변수가 아닌 코드 상수로 둔다(바꾸려면 이 파일을 고쳐 재배포한다).
-# 네트워크 timeout(초): 연결·전송·응답 대기·읽기 각 단계가 멈춰 있을 수 있는 최대 시간. 남은 전체 deadline 보다
-# 길게 쓰이지 않는다.
-REMOTE_TIMEOUT_SECONDS = 120.0
-# 전체 deadline(초): endpoint 가 요청을 받은 시점부터 입력 검사·대기열 대기·Modal 호출·최종 응답 수신까지.
+# 네트워크 timeout(초). 넷 모두 남은 전체 deadline 보다 길게 쓰이지 않고, 끝나면 재시도 없이 504 다.
+# connect: TCP 연결과 TLS handshake 에 각각 적용된다. Cold start 와 무관하다(Modal 앞단이 TLS 를 끝낸다).
+REMOTE_CONNECT_TIMEOUT_SECONDS = 10.0
+# read: 응답 데이터가 끊긴 시간. worker 는 처리 중 아무것도 보내지 않으므로 cold start·추론 시간 전체를 덮어야 한다.
+# 전체 deadline 과 같아 실제로는 deadline 이 먼저 끝난다.
+REMOTE_READ_TIMEOUT_SECONDS = 120.0
+# write: 이미지 전송. httpx 는 bytes 본문을 한 번에 쓰므로 업로드 전체에 걸린다. Modal 은 처리가 밀리면 TCP 로
+# backpressure 를 전하므로 cold start 동안 전송이 막힐 수 있다. 관측한 최악의 cold start(53초)보다 길게 둔다.
+REMOTE_WRITE_TIMEOUT_SECONDS = 60.0
+# pool: 공유 client 의 연결 확보 대기. 동시 호출이 limiter 로 제한돼 정상적으로는 기다리지 않는다.
+REMOTE_POOL_TIMEOUT_SECONDS = 5.0
+# 전체 deadline(초): ASGI 요청 진입부터 본문 수신·Multipart 파싱·인증·service 조회·파일 읽기·입력 검사·대기열
+# 대기·Modal 호출·최종 응답 수신까지.
 # redirect 를 따라가도 다시 시작하지 않고, 넘으면 재시도 없이 504 BODY_IMAGE_WORKER_TIMEOUT.
 # Modal 의 303 redirect(150초)보다 짧으므로 정상적으로는 303 을 받기 전에 끝난다.
 REMOTE_TOTAL_DEADLINE_SECONDS = 120.0
