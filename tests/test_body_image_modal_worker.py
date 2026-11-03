@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -465,7 +466,7 @@ def test_invalid_diagnostics_value_stops_before_deploy():
 
 
 def test_container_config_does_not_require_deploy_only_settings(module):
-    # 컨테이너: stage 가 없으면(CPU snapshot production 은 함수 env 를 등록하지 않는다) production. 상한·진단은 보지 않는다.
+    # 컨테이너: stage 가 없으면(CPU snapshot production 은 stage 를 넘기지 않는다) production. 상한·진단은 보지 않는다.
     assert module.resolve_deploy_config({}, in_container=True).stage == "production"
     config = module.resolve_deploy_config(
         {"BODY_IMAGE_WORKER_STAGE": "production", "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "true",
@@ -780,15 +781,55 @@ def test_two_inputs_keep_one_container_and_the_gpu_snapshot(monkeypatch):
     assert worker.WORKER_RESOURCES["gpu"] == "T4"
 
 
-def test_production_refuses_two_inputs():
-    with pytest.raises(ValueError, match="staging 배포에서만"):
-        load_production(BODY_IMAGE_WORKER_MAX_INPUTS="2")
+@pytest.mark.parametrize("gpu_snapshot", [True, False], ids=["gpu-snapshot", "cpu-snapshot"])
+def test_production_registers_two_inputs_when_set_explicitly(monkeypatch, gpu_snapshot):
+    env = PRODUCTION_GPU if gpu_snapshot else {"BODY_IMAGE_WORKER_STAGE": "production"}
+    worker, options = load_recording_registration(monkeypatch, **env, BODY_IMAGE_WORKER_MAX_INPUTS="2")
+
+    assert worker.MAX_INPUTS == 2 and worker.GPU_SNAPSHOT is gpu_snapshot
+    assert (options["max_concurrent_inputs"], options["target_concurrent_inputs"]) == (2, 2)
+    # snapshot 방식과 상관없이 입력 수와 Limiter 가 같이 컨테이너로 간다.
+    function_env = worker.STAGE_ENV["env"]
+    assert function_env["BODY_IMAGE_WORKER_MAX_INPUTS"] == function_env["MAX_CONCURRENT_BODY_VALIDATIONS"] == "2"
+    # stage 는 GPU snapshot 일 때만 넘긴다(CPU snapshot production 은 기존 그대로 production 기본값).
+    assert ("BODY_IMAGE_WORKER_STAGE" in function_env) is gpu_snapshot
 
 
+@pytest.mark.parametrize(("limiter", "starts"), [(2, True), (1, False)], ids=["same", "different"])
+def test_production_cpu_container_with_two_inputs_compares_the_limiter(
+    fake_worker, monkeypatch, capsys, limiter, starts
+):
+    production = load_production(BODY_IMAGE_WORKER_MAX_INPUTS="2")
+    namespace = load_as_in_container(**production.STAGE_ENV["env"])
+    set_container_stages(monkeypatch, None, None, None, None)
+    monkeypatch.setattr(config, "MAX_CONCURRENT_BODY_VALIDATIONS", limiter)
+    _, pre, post, _ = lifecycle(SimpleNamespace(**namespace))
+
+    assert namespace["MAX_INPUTS"] == 2 and namespace["GPU_SNAPSHOT"] is False
+    if starts:
+        run(pre)
+        run(post)
+        assert [call[0] for call in fake_worker["calls"]] == ["prepare_cpu", "start_gpu"]  # 기존 production 순서
+        assert "max_inputs=2 limiter=2" in capsys.readouterr().out  # 배포 뒤 로그로 확인하는 값
+    else:
+        with pytest.raises(namespace["StageConfigError"], match="다릅니다"):
+            run(pre)
+        assert fake_worker["calls"] == []
+
+
+def test_production_gpu_container_reads_the_two_inputs():
+    production = load(**PRODUCTION_GPU, BODY_IMAGE_WORKER_MAX_INPUTS="2")
+    loaded = load_as_in_container(**production.STAGE_ENV["env"], BODY_IMAGE_WORKER_IMAGE_STAGE="production",
+                                  BODY_IMAGE_WORKER_IMAGE_GPU_SNAPSHOT="true")
+
+    assert loaded["MAX_INPUTS"] == 2 and loaded["GPU_SNAPSHOT"] is True and loaded["STAGE"] == "production"
+
+
+@pytest.mark.parametrize("stage", ["staging", "production"])
 @pytest.mark.parametrize("value", ["0", "-1", "3", "10", "two", "1.5", "02", "true"])
-def test_invalid_max_inputs_stop_before_deploy(value):
+def test_invalid_max_inputs_stop_before_deploy(stage, value):
     with pytest.raises(ValueError, match="1 또는 2"):
-        load(BODY_IMAGE_WORKER_STAGE="staging", BODY_IMAGE_WORKER_MAX_INPUTS=value)
+        load(BODY_IMAGE_WORKER_STAGE=stage, BODY_IMAGE_WORKER_MAX_INPUTS=value)
 
 
 def test_container_reads_the_inputs_passed_by_the_function_env(module):
