@@ -75,8 +75,11 @@ def _unavailable(status_code: int) -> RelayedWorkerError:
     return RelayedWorkerError(status_code, WORKER_UNAVAILABLE, None)
 
 
-def _timeout() -> RelayedWorkerError:
-    return RelayedWorkerError(GATEWAY_TIMEOUT, WORKER_TIMEOUT, None)
+def _timeout(deadline_stop: bool = False) -> RelayedWorkerError:
+    """504. deadline_stop: AI Server 나 worker 의 deadline 보호가 멈췄다(네트워크 timeout·Modal gateway 504 는 아니다)."""
+    error = RelayedWorkerError(GATEWAY_TIMEOUT, WORKER_TIMEOUT, None)
+    error.deadline_stop = deadline_stop
+    return error
 
 
 def _origin(url: httpx.URL) -> tuple[str, str, int | None]:
@@ -323,7 +326,7 @@ class RemoteBodyImageValidationService:
     def _deadline_exceeded(log: _RequestLog, stage: str) -> "RelayedWorkerError":
         log.outcome = log.error = "deadline_exceeded"
         log.timeout_stage = stage
-        return _timeout()
+        return _timeout(deadline_stop=True)
 
     async def aopen(self) -> None:
         """공유 client 를 이 event loop 에서 만든다. 이미 열려 있으면 아무것도 하지 않는다."""
@@ -502,6 +505,9 @@ class RemoteBodyImageValidationService:
             logger.error("body image worker is unavailable: status=503 code=%s", code)
             raise _unavailable(SERVICE_UNAVAILABLE)
         if status == GATEWAY_TIMEOUT:
+            if code == WORKER_TIMEOUT:
+                # worker 가 deadline header 를 보고 스스로 멈췄다. 요약 로그(status=504)와 router 의 WARNING 으로 남는다.
+                raise _timeout(deadline_stop=True)
             logger.error("body image worker gateway timed out: status=504 code=%s", code)
             raise _timeout()
         if status in (401, 403):

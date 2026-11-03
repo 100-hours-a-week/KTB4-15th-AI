@@ -14,6 +14,8 @@ SERVER_BUSY_MESSAGE = "현재 이미지 처리 요청이 많습니다. 잠시 �
 class BodyImageValidationError(Exception):
     status_code: int = status.HTTP_500_INTERNAL_SERVER_ERROR
     code: str
+    # deadline 보호가 의도대로 요청을 멈췄다(응답은 그대로 504). router 가 traceback 없이 WARNING 으로 남긴다.
+    deadline_stop: bool = False
 
     def __init__(self, code: str, message: str | None = None) -> None:
         self.code = code
