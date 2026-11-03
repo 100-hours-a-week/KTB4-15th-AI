@@ -20,13 +20,17 @@ _REQUEST_ID = re.compile(r"[0-9a-f]{16}")
 _current: ContextVar["RequestRecord | None"] = ContextVar("body_image_request_record", default=None)
 
 
+def new_request_id() -> str:
+    return uuid.uuid4().hex[:16]
+
+
 @dataclass(eq=False)
 class RequestRecord:
     """한 요청의 Lock·실행 구간 측정값. 시각은 perf_counter 값이라 같은 process_id 끼리만 비교할 수 있다."""
 
     seq: int
     process_id: str | None = None
-    request_id: str = field(default_factory=lambda: uuid.uuid4().hex[:16])
+    request_id: str = field(default_factory=new_request_id)
     locks: dict[str, dict[str, float]] = field(default_factory=dict)
     received: float = field(default_factory=time.perf_counter)
     slot_acquired: float | None = None
@@ -102,9 +106,9 @@ def parse_request_id(value: str | None) -> str | None:
 
 
 def begin_request(
-    seq: int, process_id: str | None = None, ai_request_id: str | None = None
+    seq: int, process_id: str | None = None, ai_request_id: str | None = None, request_id: str | None = None
 ) -> tuple[RequestRecord, Token]:
-    record = RequestRecord(seq, process_id, ai_request_id=ai_request_id)
+    record = RequestRecord(seq, process_id, request_id=request_id or new_request_id(), ai_request_id=ai_request_id)
     return record, _current.set(record)
 
 

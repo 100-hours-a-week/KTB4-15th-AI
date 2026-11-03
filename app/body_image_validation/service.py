@@ -19,6 +19,7 @@ from app.body_image_validation.diagnostics import (
     begin_request,
     current_request,
     end_request,
+    new_request_id,
 )
 from app.body_image_validation.exceptions import BodyImageSystemError
 from app.body_image_validation.gpu_preprocessing import GpuImagePreprocessor
@@ -28,6 +29,11 @@ from app.clients.s3 import ImageStorage, ImageStorageError
 from app.config import body_image_validation as config
 
 logger = logging.getLogger(__name__)
+
+
+def _outcome(error: Exception) -> str:
+    """오류 코드나 예외 클래스 이름. 예외 메시지는 쓰지 않는다."""
+    return getattr(error, "code", None) or type(error).__name__
 
 
 class BackgroundRemover(Protocol):
@@ -65,10 +71,36 @@ class BodyImageValidationService:
         self._request_numbers = itertools.count(1)
 
     def validate(self, image_body: bytes, ai_request_id: str | None = None) -> BodyImageValidationResult:
-        if self._diagnostics is None:
-            return self._validate(image_body)
+        """요청마다 진단과 관계없이 요약 한 줄(request_id·AI Server 의 request_id·outcome·처리 시간)을 남긴다.
+
+        이미지·S3 key·예외 원문은 남기지 않는다. 진단이 켜져 있으면 같은 request_id 로 상세 기록을 더 남긴다.
+        """
+        request_id = new_request_id()
+        started = time.perf_counter()
+        outcome = "error"
+        try:
+            if self._diagnostics is None:
+                result = self._validate(image_body)
+            else:
+                result = self._validate_with_diagnostics(image_body, request_id, ai_request_id)
+            outcome = "success"
+            return result
+        except Exception as error:
+            outcome = _outcome(error)
+            raise
+        finally:
+            logger.info(
+                "body image validation request: request_id=%s ai_request_id=%s outcome=%s total=%.3fs",
+                request_id, ai_request_id or "-", outcome, time.perf_counter() - started,
+            )
+
+    def _validate_with_diagnostics(
+        self, image_body: bytes, request_id: str, ai_request_id: str | None
+    ) -> BodyImageValidationResult:
         timings = self._diagnostics.timings = {}
-        record, token = begin_request(next(self._request_numbers), self._execution.process_id, ai_request_id)
+        record, token = begin_request(
+            next(self._request_numbers), self._execution.process_id, ai_request_id, request_id=request_id
+        )
         window = self._resources.open() if self._resources is not None else None
         started = time.perf_counter()
         outcome = "error"
@@ -77,7 +109,7 @@ class BodyImageValidationService:
             outcome = "success"
             return result
         except Exception as error:
-            outcome = getattr(error, "code", None) or type(error).__name__
+            outcome = _outcome(error)
             raise
         finally:
             timings["total"] = (time.perf_counter() - started) * 1000
