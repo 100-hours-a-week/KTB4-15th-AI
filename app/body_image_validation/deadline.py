@@ -25,6 +25,7 @@ class RequestDeadlineExceeded(BodyImageValidationError):
     """AI Server 의 deadline 이 지나 처리를 멈췄다. AI Server 가 아직 기다리고 있으면 504 로 전해진다."""
 
     status_code = 504
+    deadline_stop = True
 
     def __init__(self, stage: str) -> None:
         super().__init__("BODY_IMAGE_WORKER_TIMEOUT")

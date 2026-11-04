@@ -960,12 +960,63 @@ def test_preflight_refuses_values_outside_one_and_two(monkeypatch, max_inputs):
     assert "load deploy file" in {check.name for check in checks if not check.ok}
 
 
-def test_preflight_refuses_two_inputs_on_production(monkeypatch):
+@pytest.mark.parametrize(
+    "snapshot", [{"gpu_snapshot": True, "max_containers": 3}, {}], ids=["gpu-snapshot", "cpu-snapshot"]
+)
+def test_production_preflight_accepts_two_inputs_when_set_explicitly(monkeypatch, snapshot):
+    seen = lookddak_profile(monkeypatch)
+
+    _, checks = dc.preflight("production", "lookddak", max_inputs=2, **snapshot)
+
+    assert all(check.ok for check in checks), [c for c in checks if not c.ok]
+    assert {"modal concurrency", "worker limiter env", "worker max inputs env"} <= {c.name for c in checks}
+    assert seen == ["lookddak-body-image-worker"]
+
+
+def test_production_preflight_keeps_one_input_by_default(monkeypatch, capsys):
     lookddak_profile(monkeypatch)
 
-    _, checks = dc.preflight("production", "lookddak", max_inputs=2)
+    assert dc.main(["preflight", "--stage", "production", "--workspace", "lookddak", "--gpu-snapshot",
+                    "--max-containers", "3"]) == 0
 
-    assert "load deploy file" in {check.name for check in checks if not check.ok}
+    out = capsys.readouterr().out
+    assert "[PASS] max inputs: MAX_INPUTS=1" in out
+    assert "BODY_IMAGE_WORKER_MAX_INPUTS=1 modal deploy" in out
+
+
+def test_production_manual_command_carries_the_two_inputs(monkeypatch, capsys):
+    lookddak_profile(monkeypatch)
+    monkeypatch.setattr(dc.subprocess, "run", lambda *a, **k: pytest.fail("production 은 배포하지 않는다"))
+
+    assert dc.main(["preflight", "--stage", "production", "--workspace", "lookddak", "--gpu-snapshot",
+                    "--max-containers", "3", "--max-inputs", "2"]) == 0
+    assert dc.main(["deploy", "--stage", "production", "--workspace", "lookddak", "--gpu-snapshot",
+                    "--max-containers", "3", "--max-inputs", "2"]) == 2  # 이 도구로는 여전히 배포하지 않는다
+
+    command = capsys.readouterr().out.splitlines()[-1]
+    assigns = dict(word.split("=", 1) for word in command.split() if word.startswith("BODY_IMAGE_WORKER_"))
+    checked, _ = dc.load_worker("production", gpu_snapshot=True, max_containers=3, max_inputs=2)
+    assert assigns["BODY_IMAGE_WORKER_MAX_INPUTS"] == "2"
+    assert resolved(assigns) == config_of(checked)
+
+
+@pytest.mark.parametrize("missing", ["MAX_CONCURRENT_BODY_VALIDATIONS", "BODY_IMAGE_WORKER_MAX_INPUTS"])
+def test_two_inputs_without_either_container_value_fail_the_check(monkeypatch, missing):
+    # 컨테이너는 둘을 비교해 다르면 멈춘다. 하나라도 빠지면 그 비교가 되지 않는다.
+    module, calls = dc.load_worker("production", max_inputs=2)
+    monkeypatch.delitem(module.STAGE_ENV["env"], missing)
+
+    failed = [name for name, ok in checks_by_name(dc.check_concurrency(module, calls, 2)).items() if not ok]
+
+    assert len(failed) == 1
+
+
+def test_cpu_production_function_env_may_carry_only_the_concurrency_values(monkeypatch):
+    module, calls = dc.load_worker("production", max_inputs=2)
+    assert all(c.ok for c in dc.check_deploy_config(module, calls, "production"))
+
+    monkeypatch.setitem(module.STAGE_ENV["env"], "BODY_IMAGE_WORKER_STAGE", "production")
+    assert "no stage env" in [c.name for c in dc.check_deploy_config(module, calls, "production") if not c.ok]
 
 
 def test_deploy_passes_the_checked_inputs_to_modal(monkeypatch):
@@ -995,8 +1046,23 @@ def test_a_shell_value_that_differs_from_the_checked_inputs_fails_preflight(monk
     assert [check.name for check in checks if not check.ok] == ["deploy env sources"]
 
 
-def registered_info(**overrides):
-    return {"gpus": [["T4", 1]], "max_containers": 1, "concurrency_info": None, **overrides}
+STAGING_URL = "https://leejein--lookddak-body-image-staging.modal.run"
+PRODUCTION_URL = "https://lookddak--lookddak-body-image.modal.run"
+
+
+def registered_info(url=STAGING_URL, unauthenticated=False, **overrides):
+    """`modal function info --json` 에서 검사에 쓰는 필드(staging 실측 형식)."""
+    return {"gpus": [["T4", 1]], "max_containers": 1, "min_containers": None, "concurrency_info": None,
+            "method_details": {"web": {"web_url": url, "method": None, "unauthenticated": unauthenticated}},
+            **overrides}
+
+
+def production_info(**overrides):
+    return registered_info(url=PRODUCTION_URL, **{"max_containers": 3, **overrides})
+
+
+def staging_check(info, max_inputs):
+    return dc.check_registered(info, max_inputs, max_containers=1, label=dc.LABELS["staging"])
 
 
 @pytest.mark.parametrize(
@@ -1009,11 +1075,91 @@ def registered_info(**overrides):
         (registered_info(concurrency_info={"max_inputs": 2, "target_inputs": 2}), 1, ["registered concurrency"]),
         (registered_info(max_containers=2), 1, ["registered max containers"]),
         (registered_info(gpus=[["L4", 1]]), 1, ["registered gpu"]),
+        (registered_info(min_containers=1), 1, ["registered min containers"]),
+        (registered_info(unauthenticated=True), 1, ["registered proxy auth"]),
+        (registered_info(url=PRODUCTION_URL), 1, ["registered label"]),
+        (registered_info(url="https://leejein-dev--lookddak-body-image-staging.modal.run"), 1, []),
     ],
-    ids=["one", "two", "not-registered", "target-differs", "expected-one", "two-containers", "other-gpu"],
+    ids=["one", "two", "not-registered", "target-differs", "expected-one", "two-containers", "other-gpu",
+         "warm-container", "proxy-off", "production-url", "other-environment"],
 )
 def test_registered_function_is_compared_with_the_expected_values(info, max_inputs, failed):
-    assert [check.name for check in dc.check_registered(info, max_inputs) if not check.ok] == failed
+    assert [check.name for check in staging_check(info, max_inputs) if not check.ok] == failed
+
+
+@pytest.mark.parametrize(
+    ("info", "max_inputs", "max_containers", "failed"),
+    [
+        (production_info(), 1, 3, []),  # 지금 production(입력 1·상한 3)
+        (production_info(concurrency_info={"max_inputs": 2, "target_inputs": 2}), 2, 3, []),
+        (production_info(), 2, 3, ["registered concurrency"]),  # 입력 2 로 배포되지 않았다
+        (production_info(max_containers=1), 1, 3, ["registered max containers"]),  # staging 의 1 을 가정하지 않는다
+        (production_info(max_containers=5), 1, 5, []),
+        (registered_info(max_containers=3), 1, 3, ["registered label"]),  # staging 함수
+    ],
+    ids=["current", "two-inputs", "inputs-not-applied", "cap-differs", "cap-five", "staging-function"],
+)
+def test_production_registration_is_compared_with_explicit_values(info, max_inputs, max_containers, failed):
+    checks = dc.check_registered(info, max_inputs, max_containers=max_containers, label=dc.LABELS["production"])
+
+    assert [check.name for check in checks if not check.ok] == failed
+
+
+class RecordingOps:
+    """registered 가 부르는 읽기 전용 조회만 있다(배포·rollback·stop 은 없다)."""
+
+    def __init__(self, info=None, missing=False):
+        self.info, self.missing, self.calls = info or registered_info(), missing, []
+
+    def app_info(self, name):
+        self.calls.append(("app_info", name))
+        if self.missing:
+            raise RuntimeError("modal app info failed: App not found")
+        return {"functions": {"BodyImageWorker.*": {"id": "fu-1"}}}
+
+    def function_info(self, function_id):
+        self.calls.append(("function_info", function_id))
+        return self.info
+
+
+def test_production_registered_check_reads_the_production_app_with_the_expected_cap():
+    ops = RecordingOps(production_info(concurrency_info={"max_inputs": 2, "target_inputs": 2}))
+
+    checks = dc.registered_checks(ops, "production", "lookddak", max_inputs=2, max_containers=3)
+
+    assert all(check.ok for check in checks), [c for c in checks if not c.ok]
+    assert ops.calls == [("app_info", "lookddak-body-image-worker"), ("function_info", "fu-1")]
+
+
+@pytest.mark.parametrize(
+    ("workspace", "max_inputs", "max_containers", "failed"),
+    [
+        ("lookddak", 2, None, ["expected max containers"]),
+        ("leejein", 2, 3, ["production workspace"]),
+        ("lookddak", 3, 3, ["expected max inputs"]),
+    ],
+    ids=["no-cap", "personal-workspace", "three-inputs"],
+)
+def test_production_registered_check_needs_explicit_values_before_reading(workspace, max_inputs, max_containers, failed):
+    ops = RecordingOps(production_info())
+
+    checks = dc.registered_checks(ops, "production", workspace, max_inputs, max_containers)
+
+    assert [check.name for check in checks if not check.ok] == failed
+    assert ops.calls == []  # 기대값이 정해지지 않으면 조회하지 않는다
+
+
+def test_staging_registered_check_keeps_one_container():
+    assert [c.name for c in dc.registered_checks(RecordingOps(), "staging", "leejein", 1, 2) if not c.ok] == [
+        "expected max containers"]
+    assert all(c.ok for c in dc.registered_checks(RecordingOps(), "staging", "leejein", 1, None))
+
+
+def test_missing_app_is_a_failed_check_not_a_crash():
+    checks = dc.registered_checks(RecordingOps(missing=True), "production", "lookddak", 1, 3)
+
+    [failed] = [c for c in checks if not c.ok]
+    assert failed.name == "registered app" and "App not found" in failed.detail
 
 
 def test_registered_command_only_reads_the_app(monkeypatch):
@@ -1027,15 +1173,29 @@ def test_registered_command_only_reads_the_app(monkeypatch):
             self.profile = profile
 
         def app_info(self, name):
-            cli_calls.append("app_info")
+            cli_calls.append(("app_info", name))
             return {"functions": {"BodyImageWorker.*": {"id": "fu-1"}}}
 
         def function_info(self, function_id):
-            cli_calls.append("function_info")
+            cli_calls.append(("function_info", function_id))
             return registered_info()
 
     monkeypatch.setattr(dc, "ModalOps", Ops)
 
     assert dc.main(["registered", "--workspace", "leejein"]) == 0
     assert dc.main(["registered", "--workspace", "leejein", "--max-inputs", "2"]) == 1
-    assert cli_calls == ["app_info", "function_info"] * 2
+    assert cli_calls == [("app_info", "lookddak-body-image-worker-staging"), ("function_info", "fu-1")] * 2
+
+
+def test_production_registered_command_needs_the_lookddak_profile(monkeypatch):
+    profiles = [{"name": "lookddak", "workspace": "lookddak", "active": True}]
+    monkeypatch.setattr(dc, "modal_cli", lambda *args, **kwargs: json.dumps(profiles))
+    monkeypatch.delenv("MODAL_PROFILE", raising=False)
+    ops = RecordingOps(production_info(concurrency_info={"max_inputs": 2, "target_inputs": 2}))
+    monkeypatch.setattr(dc, "ModalOps", lambda profile: ops)
+
+    assert dc.main(["registered", "--stage", "production", "--workspace", "lookddak",
+                    "--max-inputs", "2", "--max-containers", "3"]) == 0
+    assert dc.main(["registered", "--stage", "production", "--workspace", "leejein",
+                    "--max-inputs", "2", "--max-containers", "3"]) == 1  # profile 의 Workspace 와 다르다
+    assert [name for name, _ in ops.calls] == ["app_info", "function_info"]

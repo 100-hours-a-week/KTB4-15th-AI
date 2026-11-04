@@ -452,14 +452,15 @@ def stack(remote, monkeypatch):  # noqa: F811
         monkeypatch.setattr(settings, "BODY_IMAGE_REMOTE_API_KEY", KEY)
         monkeypatch.setattr(config, "DIAGNOSTICS", True)
         monkeypatch.setattr(config, "MAX_WAITING_BODY_VALIDATIONS", 1)
+        monkeypatch.setattr(config, "REMOTE_MAX_WAITING_BODY_VALIDATIONS", 1)
         monkeypatch.setattr(config, "MAX_QUEUE_WAIT_SECONDS", 10.0)
         monkeypatch.setattr(config, "REMOTE_TOTAL_DEADLINE_SECONDS", total)
         monkeypatch.setattr(DetectionImage, "mediapipe_image", lambda image: pipeline.detection_input(image))
         monkeypatch.setattr(service_module, "validate_brightness", lambda array, box: pipeline.run("brightness", array))
         monkeypatch.setitem(sys.modules, "rembg", SimpleNamespace(remove=pipeline.remove))
         monkeypatch.setattr(config, "MAX_CONCURRENT_BODY_VALIDATIONS", worker_running)
+        monkeypatch.setattr(config, "REMOTE_MAX_CONCURRENT_BODY_VALIDATIONS", ai_running)
         worker_runtime = BodyImageRuntime(pipeline.models(), pipeline)
-        monkeypatch.setattr(config, "MAX_CONCURRENT_BODY_VALIDATIONS", ai_running)
         modal = Modal(worker.create_app(), inputs)
         ai_manager = BodyImageRuntimeManager(remote_transport=modal)
         monkeypatch.setattr(main, "runtime_manager", ai_manager)
@@ -698,7 +699,7 @@ def test_worker_filled_by_orphaned_work_answers_429_through_the_ai_server(stack,
 
 
 def test_two_requests_share_a_real_connection_pool_over_tcp(live, monkeypatch):  # noqa: F811
-    monkeypatch.setattr(config, "MAX_CONCURRENT_BODY_VALIDATIONS", 2)
+    monkeypatch.setattr(config, "REMOTE_MAX_CONCURRENT_BODY_VALIDATIONS", 2)
     server = live()
     first, second = server.send().read(), server.send().read()
     wait_until(lambda: server.modal.started == 2)
@@ -717,7 +718,7 @@ def test_two_requests_share_a_real_connection_pool_over_tcp(live, monkeypatch): 
 
 
 def test_backend_disconnect_over_tcp_leaves_the_other_running_request_alone(live, monkeypatch):  # noqa: F811
-    monkeypatch.setattr(config, "MAX_CONCURRENT_BODY_VALIDATIONS", 2)
+    monkeypatch.setattr(config, "REMOTE_MAX_CONCURRENT_BODY_VALIDATIONS", 2)
     server = live()
     dropped, kept = server.send(), server.send().read()
     wait_until(lambda: server.modal.started == 2)
@@ -1595,7 +1596,7 @@ def test_id_of_one_worker_call_does_not_reach_the_next_one(stack):
 
 
 def test_each_request_carries_its_own_id_over_a_real_connection(live, monkeypatch, caplog):  # noqa: F811
-    monkeypatch.setattr(config, "MAX_CONCURRENT_BODY_VALIDATIONS", 2)
+    monkeypatch.setattr(config, "REMOTE_MAX_CONCURRENT_BODY_VALIDATIONS", 2)
     server = live()
     first, second = server.send().read(), server.send().read()
     wait_until(lambda: server.modal.started == 2)

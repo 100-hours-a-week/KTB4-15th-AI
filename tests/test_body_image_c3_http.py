@@ -174,8 +174,8 @@ class Live:
 
 @pytest.fixture
 def live(remote, monkeypatch):  # noqa: F811
-    monkeypatch.setattr(config, "MAX_CONCURRENT_BODY_VALIDATIONS", 1)
-    monkeypatch.setattr(config, "MAX_WAITING_BODY_VALIDATIONS", 1)
+    monkeypatch.setattr(config, "REMOTE_MAX_CONCURRENT_BODY_VALIDATIONS", 1)
+    monkeypatch.setattr(config, "REMOTE_MAX_WAITING_BODY_VALIDATIONS", 1)
     monkeypatch.setattr(config, "MAX_QUEUE_WAIT_SECONDS", 10.0)
     monkeypatch.setattr(config, "REMOTE_TOTAL_DEADLINE_SECONDS", 30.0)
     monkeypatch.setattr(config, "REMOTE_READ_TIMEOUT_SECONDS", 30.0)
@@ -263,7 +263,7 @@ def test_one_runs_one_waits_and_the_third_is_429(live):
 
 
 def test_waiting_requests_reach_modal_in_arrival_order(live, monkeypatch):
-    monkeypatch.setattr(config, "MAX_WAITING_BODY_VALIDATIONS", 2)
+    monkeypatch.setattr(config, "REMOTE_MAX_WAITING_BODY_VALIDATIONS", 2)
     server = live()
     images = [jpeg((600, 800)), jpeg((640, 900)), jpeg((700, 1000))]
     requests = [server.send(images[0]).read()]

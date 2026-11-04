@@ -67,7 +67,9 @@ async def validate_body_image(request: Request, image: ImageFile):
             result = await run_in_threadpool(service.validate, body, ai_request_id)
         return BodyImageValidationResponse(data=BodyImageValidationData(s3_key=result.s3_key))
     except BodyImageValidationError as error:
-        if error.status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
+        if error.deadline_stop:
+            logger.warning("body image validation failed: %s", error.code)
+        elif error.status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
             logger.exception("body image validation failed: %s", error.code)
         elif error.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
             logger.warning("body image validation rejected: %s", error.code)

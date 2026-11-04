@@ -479,6 +479,8 @@ def test_remote_runtime_limiter_uses_the_configured_wait(monkeypatch):
 
     monkeypatch.setattr(config, "VALIDATION_MODE", "remote")
     monkeypatch.setattr(config, "REMOTE_URL", "https://example.modal.run")
+    monkeypatch.setattr(config, "REMOTE_MAX_CONCURRENT_BODY_VALIDATIONS", 1)
+    monkeypatch.setattr(config, "REMOTE_MAX_WAITING_BODY_VALIDATIONS", 1)
     monkeypatch.setattr(config, "MAX_QUEUE_WAIT_SECONDS", 10.0)
     monkeypatch.setattr(config, "REMOTE_TOTAL_DEADLINE_SECONDS", 50.0)
     monkeypatch.setattr(settings, "BODY_IMAGE_REMOTE_PROXY_KEY", "k")
@@ -493,7 +495,7 @@ def test_remote_runtime_limiter_uses_the_configured_wait(monkeypatch):
     assert router  # router 는 그대로 쓴다(계약 유지)
 
 
-def test_remote_policy_is_one_running_one_waiting_10s_queue_and_120s_deadline(monkeypatch):
+def test_remote_policy_is_two_running_two_waiting_10s_queue_and_120s_deadline(monkeypatch):
     from app.body_image_validation import runtime
     from app.config import body_image_validation as config
     from app.config import settings
@@ -516,4 +518,4 @@ def test_remote_policy_is_one_running_one_waiting_10s_queue_and_120s_deadline(mo
 
     assert built.total_deadline == 120.0
     assert built.limiter.max_wait_seconds == 10.0
-    assert (built.limiter._max_running, built.limiter._max_waiting) == (1, 1)
+    assert (built.limiter._max_running, built.limiter._max_waiting) == (2, 2)
