@@ -21,7 +21,6 @@ from app.virtual_fitting.repositories.async_job_repository import (
 from tests.v2_integration_harness import (
     COMMENT,
     TITLE,
-    USER_IMAGE_KEY,
     WEBHOOK_TOKEN,
     close_env,
     make_env,
@@ -99,9 +98,12 @@ def test_defaults_keep_every_v2_loop_disabled():
         assert getattr(settings, name) is False, name
 
 
-def test_normal_flow_through_the_real_lifespan_loops(env, monkeypatch):
+@pytest.mark.parametrize("input_extension", ["png", "jpg", "webp"])
+def test_normal_flow_through_the_real_lifespan_loops(env, monkeypatch, input_extension):
     enable_all(monkeypatch)
-    env.send_request(JOB)
+    input_key = f"users/10/body.{input_extension}"
+    env.s3.store(input_key)
+    env.send_request(JOB, image_key=input_key)
     with TestClient(app()) as client:
         state = client.app.state
         assert state.request_worker and state.postprocess_worker and state.result_publisher
@@ -110,15 +112,17 @@ def test_normal_flow_through_the_real_lifespan_loops(env, monkeypatch):
         # 요청 Worker: 수신·등록·사전 확인·식별자 선저장·공유 제한·Pruna 비동기 전송
         task = wait_until(lambda: next(iter(env.runware.submissions), None), what="async submit")
         submission = env.runware.submissions[task]
+        assert submission.payload["outputFormat"] == "WEBP"
+        assert submission.payload["outputQuality"] == 90
         accepted = wait_until(
             lambda: (r := row(env)) and r.runware_accepted_at and r, what="accept"
         )
         assert accepted.task_uuid == task and accepted.status is AsyncJobStatus.WAITING_PRUNA
-        assert submission.person_key == USER_IMAGE_KEY  # 사람 이미지 = 사용자 원본(Presigned GET)
+        assert submission.person_key == input_key  # 사람 이미지 = 사용자 원본(Presigned GET)
         assert (
             submission.upload_key
             == accepted.async_image_key
-            == (f"virtual-fitting/results/{JOB}/pruna-async.jpg")
+            == (f"virtual-fitting/results/{JOB}/pruna-async.webp")
         )
         assert submission.webhook_url.endswith(f"token={WEBHOOK_TOKEN}")
         # Watchdog 이 실제로 돌고 있어 접수 대기(AWAIT_WEBHOOK)를 이어 볼 수 있으므로 요청 메시지를 지운다.
@@ -140,18 +144,19 @@ def test_normal_flow_through_the_real_lifespan_loops(env, monkeypatch):
     assert payload == {  # 합의한 평평한 JSON(code/data/message 로 감싸지 않음)
         "fitting_job_id": JOB,
         "status": "COMPLETED",
-        "result_image_key": f"virtual-fitting/results/{JOB}/pruna-async.jpg",
+        "result_image_key": f"virtual-fitting/results/{JOB}/pruna-async.webp",
         "llm_title": TITLE,
         "llm_comment": COMMENT,
     }
     assert final.status is AsyncJobStatus.COMPLETED and final.next_action is None
-    assert final.user_image_key == USER_IMAGE_KEY  # 원본·비동기·최종 Key 구분 유지
+    assert final.user_image_key == input_key  # 원본·비동기·최종 Key 구분 유지
     assert final.result_image_key == final.async_image_key == final.verified_image_key
+    assert env.s3.objects[final.result_image_key][1] == "binary/octet-stream"  # MIME 만으로 보류하지 않음
     # LLM: 코멘트에는 생성된 결과 이미지(Presigned GET)만, 제목에는 그 코멘트만
     comment_request, title_request = env.runware.llm_requests
     image_url = comment_request["messages"][1]["content"][1]["image_url"]["url"]
-    assert f"/virtual-fitting/results/{JOB}/pruna-async.jpg?" in image_url
-    assert USER_IMAGE_KEY not in image_url
+    assert f"/virtual-fitting/results/{JOB}/pruna-async.webp?" in image_url
+    assert input_key not in image_url
     assert title_request["messages"][1]["content"] == f"코디 설명: {COMMENT}"
     # 비용·횟수·자리·실행 권한
     assert costs(env) == [(task, JOB, Decimal("0.023"))]

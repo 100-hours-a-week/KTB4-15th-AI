@@ -37,7 +37,7 @@ from tests.v2_integration_harness import (
 )
 
 JOB = 9101
-ASYNC_KEY = f"virtual-fitting/results/{JOB}/pruna-async.jpg"
+ASYNC_KEY = f"virtual-fitting/results/{JOB}/pruna-async.webp"
 SYNC_KEY = f"virtual-fitting/results/{JOB}/pruna-sync.jpg"
 
 
@@ -678,3 +678,31 @@ def test_bad_result_queue_keeps_the_webhook_503_and_the_postprocess_message(env,
     stack.publish_once()
     assert env.sqs.bodies("be-fitting-response") == []
     assert row(env).result_message_attempt_count == 0  # 설정 오류는 전송 횟수를 쓰지 않음
+
+
+def test_webp_octet_stream_completes_without_extra_permissions_or_rewrite(env):
+    stack = Stack(env).mark_running()
+    task = submitted(env, stack)
+    body = env.runware.complete(task)
+    original_object = env.s3.objects[ASYNC_KEY]
+    original_keys = set(env.s3.objects)
+    assert original_object[1] == "binary/octet-stream"
+    assert post_webhook(client(), body).status_code == 200
+
+    finish(env, stack)
+    final = row(env)
+    assert final.result_payload["status"] == "COMPLETED"
+    assert final.result_image_key == final.async_image_key == final.verified_image_key == ASYNC_KEY
+    assert final.s3_check_attempt_count == 1 and final.llm_generation_attempt_count == 2
+    assert final.fallback_attempt_count == 0
+    assert env.s3.objects[ASYNC_KEY] == original_object  # bytes/MIME/LastModified 모두 유지
+    assert set(env.s3.objects) == original_keys  # 별도 최종 객체 없음
+    assert env.runware.count("async_submit") == 1 and env.runware.count("sync_generate") == 0
+    assert costs(env) == [(task, Decimal("0.023"))]
+    # 완료 Webhook 재수신도 생성·LLM·S3 저장을 반복하지 않는다.
+    assert post_webhook(client(), body).status_code == 200
+    env.sqs.expire_visibility("ai-fitting-response")
+    finish(env, stack)
+    assert row(env).llm_generation_attempt_count == 2
+    assert env.s3.objects[ASYNC_KEY] == original_object and set(env.s3.objects) == original_keys
+    assert env.runware.count("async_submit") == 1 and env.runware.count("sync_generate") == 0

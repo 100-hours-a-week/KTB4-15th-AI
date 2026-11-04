@@ -514,13 +514,14 @@ class FakeProvider:
     def __init__(self, outcome=SubmissionOutcome.ACCEPTED, during=None, **fields):
         self.outcome, self.during, self.fields, self.calls = outcome, during, fields, []
 
-    def submit(self, fitting_input, *, task_uuid, webhook_url, upload_endpoint):
+    def submit(self, fitting_input, *, task_uuid, webhook_url, upload_endpoint, output_format):
         self.calls.append(
             {
                 "input": fitting_input,
                 "task": task_uuid,
                 "webhook": webhook_url,
                 "upload": upload_endpoint,
+                "output_format": output_format,
             }
         )
         if self.during:
@@ -610,8 +611,9 @@ def test_accepted_submission_order_and_records(db):
     (call,) = provider.calls
     # task_uuid·Key·호출 시작 기록은 전송 전에 DB 에 있었다.
     assert seen["task"] == call["task"] and seen["started"] is not None and seen["result"] is None
-    assert seen["key"] == f"virtual-fitting/results/{JOB}/pruna-async.jpg"
+    assert seen["key"] == f"virtual-fitting/results/{JOB}/pruna-async.webp"
     assert seen["in_flight"] == (1, 1)
+    assert call["output_format"] == "WEBP"
     assert call["webhook"] == WEBHOOK and "PUTSIG" in call["upload"]
     assert "GETSIG" in call["input"].person_image_url
     assert call["input"].garment_image_urls == [TOP.image_url, BOTTOM.image_url]

@@ -419,7 +419,7 @@ def test_diagnostics_do_not_change_the_result(real_models, sampler):
     models = BodyImageModels(real_person(), real_pose(), real_remover(), GpuImagePreprocessor(fake_torch_decoder()))
     service_for(models, storage=plain, diagnostic=False).validate(jpeg())
 
-    assert instrumented.uploads[0][0] == plain.uploads[0][0]  # PNG bytes 가 같다
+    assert instrumented.uploads[0][0] == plain.uploads[0][0]  # WebP bytes 가 같다
     assert instrumented.uploads[0][2] == plain.uploads[0][2]
 
 
@@ -782,7 +782,7 @@ def test_timeline_points_follow_the_request_order(real_models, sampler, caplog):
 
     [line] = diagnostic_lines(caplog)
     execution = line["execution"]
-    assert list(execution["spans_ms"]) == ["preprocess", "person", "pose", "brightness", "rembg", "png", "s3_upload"]
+    assert list(execution["spans_ms"]) == ["preprocess", "person", "pose", "brightness", "rembg", "webp", "s3_upload"]
     points = [execution["received_ms"], execution["slot_acquired_ms"], execution["start_ms"]]
     points += [point for stage in execution["spans_ms"].values() for point in stage]
     points += [execution["end_ms"]]

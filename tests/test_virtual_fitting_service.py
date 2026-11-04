@@ -404,3 +404,13 @@ def test_v1_title_failure_through_the_real_provider_falls_back_as_a_pair(title_f
         result_image_key=RESULT_KEY, llm_comment=FALLBACK_COMMENT, llm_title=FALLBACK_TITLE
     )
     assert events.count("vton") == 1 and storage.urls == [(RESULT_URL, "virtual-fitting/results")]
+
+
+@pytest.mark.parametrize("extension", ["jpg", "png", "webp"])
+def test_saved_person_url_is_forwarded_without_reencoding(extension):
+    url = f"https://test.invalid/body.{extension}?signature=mock"
+    provider = FakeFittingProvider()
+    request = SyncFittingRequest(user_image_url=url, products=[{"product_code": "1"}])
+    _service(FakeRepository(TOP), fitting_provider=provider).fit(request)
+    assert provider.inputs[0].person_image_url == url
+    assert provider.inputs[0].garment_image_urls == [TOP.image_url]

@@ -29,7 +29,7 @@ OTHER_UUID = "0b8f8a3e-2c55-4c1e-9d5e-7c0f3b0a9e11"
 PERSON_URL = "https://bucket.s3.amazonaws.com/users/1/body.jpg?X-Amz-Signature=PERSONSIG"
 WEBHOOK_URL = "https://ai.example.com/api/v2/webhooks/runware?token=WEBHOOKTOKEN"
 UPLOAD_URL = (
-    "https://bucket.s3.amazonaws.com/virtual-fitting/results/3/pruna-async.jpg"
+    "https://bucket.s3.amazonaws.com/virtual-fitting/results/3/pruna-async.webp"
     "?X-Amz-Signature=UPLOADSIG&X-Amz-Expires=3600"
 )
 SECRETS = (API_KEY, "PERSONSIG", "WEBHOOKTOKEN", "UPLOADSIG")
@@ -111,7 +111,8 @@ def test_async_payload_matches_design():
             ]
         },
         "outputType": "URL",
-        "outputFormat": "JPG",
+        "outputFormat": "WEBP",
+        "outputQuality": 90,
         "numberResults": 1,
         "includeCost": True,
         "deliveryMethod": "async",
@@ -407,3 +408,26 @@ def test_missing_api_key_raises_config_error(monkeypatch):
     monkeypatch.delenv("RUNWARE_VTON_API_KEY", raising=False)
     with pytest.raises(RunwareConfigError):
         RunwarePrunaAsyncProvider()
+
+
+@pytest.mark.parametrize("result_format", ["JPG", "WEBP"])
+def test_prepared_output_contract_is_preserved(result_format):
+    task, = build_async_payload(_input(), task_uuid=TASK_UUID, webhook_url=WEBHOOK_URL,
+                               upload_endpoint=UPLOAD_URL.replace(".webp", ".jpg") if result_format == "JPG" else UPLOAD_URL,
+                               output_format=result_format)
+    assert task["outputFormat"] == result_format
+    assert (task.get("outputQuality") == 90) if result_format == "WEBP" else "outputQuality" not in task
+
+
+def test_webp_request_cannot_target_a_legacy_jpg_key():
+    opener = FakeOpener(ACK)
+    with pytest.raises(ValueError, match="확장자"):
+        _submit(opener, upload_endpoint=UPLOAD_URL.replace(".webp", ".jpg"))
+    assert opener.calls == []
+
+
+def test_legacy_jpg_submit_keeps_quality_unspecified():
+    opener = FakeOpener(ACK)
+    _submit(opener, upload_endpoint=UPLOAD_URL.replace(".webp", ".jpg"), output_format="JPG")
+    assert _sent_task(opener)["outputFormat"] == "JPG"
+    assert "outputQuality" not in _sent_task(opener)

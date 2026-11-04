@@ -228,7 +228,7 @@ class PrunaSubmitter:
             return False
 
         prepared = self._state.prepare_pruna_submission(
-            job_id, token, job.task_uuid or self._new_task_uuid(), async_result_key(job_id)
+            job_id, token, job.task_uuid or self._new_task_uuid(), job.async_image_key or async_result_key(job_id)
         )
         if not prepared.applied and prepared.reason.value != "already_recorded":
             logger.warning(
@@ -329,6 +329,8 @@ class PrunaSubmitter:
     # --- 전송과 결과 ---
 
     def _send(self, job, token, fitting_input, upload_url, heartbeat) -> bool:
+        from app.virtual_fitting.async_storage import async_output_format
+
         job_id, task_uuid = job.fitting_job_id, job.task_uuid
         invoked = False
         try:
@@ -340,6 +342,7 @@ class PrunaSubmitter:
                         task_uuid=task_uuid,
                         webhook_url=self._webhook_url,
                         upload_endpoint=upload_url,
+                        output_format=async_output_format(job.async_image_key),
                     )
                 except ValueError:
                     # Provider 는 입력 검증 오류를 전송 전에 낸다. 보내지 않은 것이 확실하다.

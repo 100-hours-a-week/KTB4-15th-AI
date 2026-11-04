@@ -4,7 +4,7 @@ POST https://api.runware.ai/v1 (V1 과 같은 endpoint·모델·VTON 키)
   본문: [{"taskType": "imageInference", "taskUUID": <AI 요청 Worker 가 만든 UUID v4>,
           "model": "prunaai:p-image@try-on",
           "inputs": {"referenceImages": [{"image", "role": "person" | "garment"}]},
-          "outputType": "URL", "outputFormat": "JPG", "numberResults": 1, "includeCost": true,
+          "outputType": "URL", "outputFormat": "WEBP", "outputQuality": 90, "numberResults": 1, "includeCost": true,
           "deliveryMethod": "async", "webhookURL": ..., "uploadEndpoint": ...}]
   접수(설계 문서 예시, 실제 형식은 연동 테스트에서 확정):
         {"data": [{"taskType": "imageInference", "taskUUID": "...", "status": "processing"}]}
@@ -41,6 +41,7 @@ from enum import Enum
 from http.client import HTTPException
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
 from app.virtual_fitting.providers.base import FittingInput
@@ -55,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 # 접수 응답만 기다린다(이미지 생성은 기다리지 않는다). 실제 접수 지연을 보고 조정한다.
 DEFAULT_SUBMIT_TIMEOUT = 30.0
-OUTPUT_FORMAT = "JPG"
+OUTPUT_FORMAT = "WEBP"
 # Pruna try-on 모델 제약: person 1장, garment 1~11장.
 MAX_GARMENT_IMAGES = 11
 # Runware 문서상 다시 보내도 될 수 있는 오류 코드. 판단은 상위 Worker 가 한다.
@@ -124,12 +125,19 @@ def _require_https(name: str, value: str) -> None:
 
 
 def build_async_payload(
-    fitting_input: FittingInput, *, task_uuid: str, webhook_url: str, upload_endpoint: str
+    fitting_input: FittingInput, *, task_uuid: str, webhook_url: str, upload_endpoint: str,
+    output_format: str = OUTPUT_FORMAT,
 ) -> list:
     """V2 비동기 요청 본문. person 이 먼저, garment 는 입력 순서를 유지한다."""
+    if output_format not in {"JPG", "WEBP"}:
+        raise ValueError("지원하지 않는 비동기 출력 형식입니다.")
     task_uuid = validate_task_uuid(task_uuid)
     _require_https("webhook_url", webhook_url)
     _require_https("upload_endpoint", upload_endpoint)
+    path = unquote(urlparse(upload_endpoint).path).lower()
+    expected = "WEBP" if path.endswith(".webp") else "JPG" if path.endswith((".jpg", ".jpeg")) else None
+    if expected is not None and output_format != expected:
+        raise ValueError("출력 형식과 업로드 Key 확장자가 일치하지 않습니다.")
     if not fitting_input.person_image_url:
         raise ValueError("person_image_url 이 비어 있습니다.")
     garments = list(fitting_input.garment_image_urls)
@@ -144,13 +152,15 @@ def build_async_payload(
         "model": RUNWARE_MODEL,
         "inputs": {"referenceImages": reference_images},
         "outputType": "URL",
-        "outputFormat": OUTPUT_FORMAT,
+        "outputFormat": output_format,
         "numberResults": 1,
         "includeCost": True,
         "deliveryMethod": "async",
         "webhookURL": webhook_url,
         "uploadEndpoint": upload_endpoint,
     }
+    if output_format == "WEBP":
+        task["outputQuality"] = 90
     # positivePrompt 는 모델에서 선택 항목이다. 비어 있으면 보내지 않는다.
     if fitting_input.prompt:
         task["positivePrompt"] = fitting_input.prompt
@@ -331,6 +341,7 @@ class RunwarePrunaAsyncProvider:
         task_uuid: str,
         webhook_url: str,
         upload_endpoint: str,
+        output_format: str = OUTPUT_FORMAT,
     ) -> AsyncSubmission:
         """접수 요청을 한 번 보낸다. 입력이 잘못되면 ValueError(전송 전), 그 밖에는 예외 없이 결과를 돌려준다."""
         payload = build_async_payload(
@@ -338,6 +349,7 @@ class RunwarePrunaAsyncProvider:
             task_uuid=task_uuid,
             webhook_url=webhook_url,
             upload_endpoint=upload_endpoint,
+            output_format=output_format,
         )
         task_uuid = payload[0]["taskUUID"]
         request = Request(

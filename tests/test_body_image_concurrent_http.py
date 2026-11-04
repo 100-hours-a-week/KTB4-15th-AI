@@ -60,7 +60,7 @@ A, B, C, D = TAGS[:4]
 SIZE = (600, 800)
 RESOLUTION = 0.01  # 구간이 로그 해상도(0.1ms)보다 길게 겹치도록 머문다
 TIMEOUT_CODE = "BODY_IMAGE_WORKER_TIMEOUT"
-S3_KEY = re.compile(r"body-images/[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\.png")
+S3_KEY = re.compile(r"body-images/[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\.webp")
 
 on_worker: contextvars.ContextVar[bool] = contextvars.ContextVar("test_on_worker", default=False)
 
@@ -772,7 +772,7 @@ def test_limiter_2_reports_both_requests_in_one_process_with_their_own_ids(stack
     assert (a["execution"]["active_max"], b["execution"]["active_max"]) == (2, 2)
     assert sorted((a["execution"]["active_at_start"], b["execution"]["active_at_start"])) == [0, 1]
     assert overlaps(interval(a), interval(b))
-    assert {"preprocess", "person", "pose", "brightness", "rembg", "png", "s3_upload"} <= set(a["execution"]["spans_ms"])
+    assert {"preprocess", "person", "pose", "brightness", "rembg", "webp", "s3_upload"} <= set(a["execution"]["spans_ms"])
     assert set(a["execution"]["spans_ms"]) == set(b["execution"]["spans_ms"])
 
 
@@ -947,7 +947,7 @@ def test_model_error_inside_the_lock_hands_it_to_the_waiting_request(stack, stag
 
 
 @pytest.mark.parametrize("image_format", ["PNG", "JPEG"])
-def test_each_response_points_at_the_png_of_its_own_image_while_the_paths_overlap(stack, image_format):
+def test_each_response_points_at_the_webp_of_its_own_image_while_the_paths_overlap(stack, image_format):
     s = stack()
     s.pipeline.on("detection_input", meet())
     s.pipeline.on("brightness", meet())
@@ -964,11 +964,18 @@ def test_each_response_points_at_the_png_of_its_own_image_while_the_paths_overla
             keys.append(key)
             assert S3_KEY.fullmatch(key)
             png, content_type = s.pipeline.uploads[key]
-            assert content_type == "image/png"
+            assert content_type == "image/webp"
             stored = Image.open(BytesIO(png))
             assert stored.mode == "RGBA"
             result = np.asarray(stored)
-            assert np.array_equal(result[..., :3], rgb_of(bodies[tag]))  # 다시 decode 해 픽셀 전체를 비교한다
+            # 손실 WebP 의 RGB 값 자체를 원래 픽셀과 동일하다고 가정하지 않는다.
+            # 각 요청의 독립적인 기대 WebP 를 decode 해 전체 픽셀을 비교해 섞임을 검출한다.
+            expected_rgba = Image.fromarray(rgb_of(bodies[tag])).convert("RGBA")
+            expected_rgba.putalpha(tag)
+            from app.body_image_validation.background import encode_webp
+
+            expected = np.asarray(Image.open(BytesIO(encode_webp(expected_rgba))))
+            assert np.array_equal(result, expected)
             assert (result[..., 3] == tag).all()  # rembg 도 이 요청의 이미지를 받았다
 
     assert len(set(keys)) == len(keys)
@@ -991,7 +998,7 @@ def test_each_stage_sees_its_own_arrays(stack):
 # --- E. 저장소 동시성(FakeStorage. 실제 boto3·S3 는 3-1C-4 에서 본다) ---
 
 
-def test_two_uploads_overlap_and_keep_their_own_png_and_key(stack):
+def test_two_uploads_overlap_and_keep_their_own_webp_and_key(stack):
     s = stack()
     s.pipeline.on("s3_upload", meet())
     a, b = s.run_all(A, B)

@@ -174,7 +174,7 @@ def test_start_gpu_builds_the_runtime_once_with_the_snapshot_detectors(worker_en
     assert service.person_detector is person and service.pose_detector is pose
     # 위에서 만든 것뿐이다. runtime 이 detector 를 새로 만들지 않는다.
     assert (FakePersonDetector.instances, FakePoseDetector.instances, FakeRemover.instances) == (1, 1, 1)
-    assert set(timings) == {"preprocess", "person_pose", "rembg", "png"}
+    assert set(timings) == {"preprocess", "person_pose", "rembg", "webp"}
 
 
 def test_prepare_gpu_for_snapshot_builds_models_without_s3_or_runtime(worker_env, monkeypatch):
@@ -189,7 +189,7 @@ def test_prepare_gpu_for_snapshot_builds_models_without_s3_or_runtime(worker_env
     assert models.person_detector is person and models.pose_detector is pose
     assert FakeRemover.instances == 1
     assert (person.calls, pose.calls, models.background_remover.calls) == (1, 1, 1)  # warm-up
-    assert set(timings) == {"preprocess", "person_pose", "rembg", "png"}
+    assert set(timings) == {"preprocess", "person_pose", "rembg", "webp"}
     assert worker_env["manager"].runtime is None  # runtime 등록은 start_runtime 이 한다
     assert worker_env["s3"].puts == []
 
@@ -288,7 +288,7 @@ def test_staging_snapshot_builds_gpu_models_without_s3_runtime_or_limiter(snapsh
 
     assert models.person_detector is snapshot_env["built"]["person"]
     assert FakeRemover.instances == 1 and models.background_remover.calls == 1  # GPU 모델 + warm-up
-    assert set(timings) == {"preprocess", "person_pose", "rembg", "png"}
+    assert set(timings) == {"preprocess", "person_pose", "rembg", "webp"}
     assert snapshot_env["manager"].runtime is None  # service·limiter·runtime 은 아직 없다
     assert snapshot_env["s3"].puts == []
 
@@ -589,7 +589,7 @@ def test_missing_internal_key_rejects_every_request(worker_env, monkeypatch, cap
 # --- S3 업로드 (mock client) ---
 
 
-def test_pass_uploads_the_png_to_s3_before_answering(worker_env):
+def test_pass_uploads_the_webp_to_s3_before_answering(worker_env):
     worker.start_gpu(FakePersonDetector(), FakePoseDetector())
     client = TestClient(worker.create_app(), raise_server_exceptions=False)
 
@@ -601,9 +601,9 @@ def test_pass_uploads_the_png_to_s3_before_answering(worker_env):
     [put] = worker_env["s3"].puts
     assert put["Bucket"] == "test-bucket"
     assert put["Key"] == body["data"]["s3_key"]
-    assert put["Key"].startswith("body-images/") and put["Key"].endswith(".png")
-    assert put["ContentType"] == "image/png"
-    assert Image.open(BytesIO(put["Body"])).mode == "RGBA"
+    assert put["Key"].startswith("body-images/") and put["Key"].endswith(".webp")
+    assert put["ContentType"] == "image/webp"
+    assert Image.open(BytesIO(put["Body"])).convert("RGBA").mode == "RGBA"
 
 
 def test_s3_failure_is_a_500_not_a_success(worker_env):

@@ -266,7 +266,15 @@ class FakeS3Backend:
 
     def store(self, key: str, body: bytes | None = None, content_type: str = "image/jpeg") -> None:
         with self._lock:
-            self.objects[key] = (body or jpeg_bytes(), content_type, datetime.now(UTC))
+            if body is None:
+                body = jpeg_bytes()
+                if key.endswith(".webp"):
+                    from PIL import Image
+
+                    output = io.BytesIO()
+                    Image.new("RGB", (4, 4), (20, 40, 80)).save(output, format="WEBP", quality=90)
+                    body = output.getvalue()
+            self.objects[key] = (body, content_type, datetime.now(UTC))
 
     def client(self) -> "FakeS3Client":
         return FakeS3Client(self)
@@ -303,6 +311,13 @@ class FakeS3Client:
             "ContentType": content_type,
             "LastModified": modified,
         }
+
+    def __getattr__(self, name):
+        # 기존 Get/Put/HEAD 외의 메타데이터 보정 권한은 제공하지 않는다.
+        if name in {"copy_object", "get_object_tagging", "get_object_acl",
+                    "get_object_retention", "get_object_legal_hold"}:
+            raise AssertionError(f"unexpected metadata permission dependency: {name}")
+        raise AttributeError(name)
 
     def generate_presigned_url(self, ClientMethod, Params, ExpiresIn):
         self._b.presigned.append((ClientMethod, Params["Key"]))
@@ -504,7 +519,7 @@ class FakeRunware:
         """결과를 uploadEndpoint 로 PUT 하고(put=True) 성공 Webhook 본문을 돌려준다."""
         submission = self.submissions[task_uuid]
         if put:
-            self.s3.store(submission.upload_key)
+            self.s3.store(submission.upload_key, content_type="binary/octet-stream")
         body = {
             "taskType": "imageInference",
             "taskUUID": task_uuid,

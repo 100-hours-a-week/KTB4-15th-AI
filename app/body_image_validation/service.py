@@ -9,7 +9,7 @@ from typing import Protocol
 from PIL import Image
 
 from app.body_image_validation import deadline, validation_rules
-from app.body_image_validation.background import encode_png
+from app.body_image_validation.background import encode_webp
 from app.body_image_validation.brightness import BrightnessCheckError, validate_brightness
 from app.body_image_validation.concurrency import BodyValidationLimiter
 from app.body_image_validation.detectors import DetectionImage, PersonDetector, PoseDetector
@@ -168,20 +168,19 @@ class BodyImageValidationService:
                 result = self.background_remover.remove(image)
         except Exception as error:
             raise BodyImageSystemError("BACKGROUND_REMOVAL_FAILED") from error
-        # RGBA 결과는 PNG 로 인코딩한 직후 닫는다. 업로드 동안에는 PNG bytes 만 남긴다.
         try:
-            with self._timed("png"):
-                png = encode_png(result)
+            with self._timed("webp"):
+                webp = encode_webp(result)
         except (OSError, ValueError) as error:
             raise BodyImageSystemError("IMAGE_ENCODING_FAILED") from error
         finally:
             result.close()
         # AI Server 가 결과를 받을 시간이 남지 않았으면 올리지 않는다(아무도 받지 않을 객체를 만들지 않는다).
         deadline.check("before_upload", margin=deadline.UPLOAD_MARGIN_SECONDS)
-        key = f"body-images/{uuid.uuid4()}.png"
+        key = f"body-images/{uuid.uuid4()}.webp"
         try:
             with self._timed("s3_upload"):
-                self.image_storage.upload_bytes(png, key, "image/png")
+                self.image_storage.upload_bytes(webp, key, "image/webp")
         except ImageStorageError as error:
             raise BodyImageSystemError("IMAGE_UPLOAD_FAILED") from error
         return BodyImageValidationResult(s3_key=key)
