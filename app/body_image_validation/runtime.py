@@ -93,8 +93,8 @@ class RemoteBodyImageRuntime:
                 ),
                 total_deadline=config.REMOTE_TOTAL_DEADLINE_SECONDS,
                 limiter=AsyncBodyValidationLimiter(
-                    config.MAX_CONCURRENT_BODY_VALIDATIONS,
-                    config.MAX_WAITING_BODY_VALIDATIONS,
+                    config.REMOTE_MAX_CONCURRENT_BODY_VALIDATIONS,
+                    config.REMOTE_MAX_WAITING_BODY_VALIDATIONS,
                     max_wait_seconds=config.MAX_QUEUE_WAIT_SECONDS,
                 ),
                 transport=transport,

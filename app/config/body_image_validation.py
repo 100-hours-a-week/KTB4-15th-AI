@@ -66,8 +66,12 @@ WARMUP_TIMEOUT_RETRY_INTERVAL_SECONDS = 30.0
 WARMUP_MAX_STARTS_PER_WINDOW = 4
 WARMUP_START_WINDOW_SECONDS = 60.0
 # 무거운 검증(모델 추론·rembg)의 프로세스 내 동시 실행 수와 대기 수. 넘치면 즉시 429.
+# local 모드(EC2·Modal worker) 값이다. Modal worker 는 입력 2 로 배포하면 배포가 실행 수 2 를 넘긴다.
 MAX_CONCURRENT_BODY_VALIDATIONS = int(os.getenv("MAX_CONCURRENT_BODY_VALIDATIONS", "1"))
 MAX_WAITING_BODY_VALIDATIONS = int(os.getenv("MAX_WAITING_BODY_VALIDATIONS", "1"))
+# remote 모드(AI Server) 값. 같은 환경변수를 읽어 값이 있으면 그 값을 쓰고, 없을 때의 기본값만 local 과 다르다.
+REMOTE_MAX_CONCURRENT_BODY_VALIDATIONS = int(os.getenv("MAX_CONCURRENT_BODY_VALIDATIONS", "2"))
+REMOTE_MAX_WAITING_BODY_VALIDATIONS = int(os.getenv("MAX_WAITING_BODY_VALIDATIONS", "2"))
 # remote 모드에서 대기열에 들어간 요청이 실행 슬롯을 기다리는 최대 시간(초). 넘으면 429 SERVER_BUSY. 이 대기도
 # 전체 deadline(REMOTE_TOTAL_DEADLINE_SECONDS) 안에 들어가고, deadline 이 먼저 끝나면 504.
 # local 모드에는 적용하지 않는다(기존처럼 대기 시간 제한 없음).
