@@ -1,9 +1,3 @@
-"""13단계 보완: (1) 8단계 제출 거절 → RUN_FALLBACK 내부 큐 발행·재수신 복구, (2) 상태 변경 트랜잭션의 잠금 대기 제한.
-
-실제 RequestProcessor·PrunaSubmitter·FollowUpProcessor·RunFallbackHandler·AsyncJobStateRepository·PrunaLimiter
-(격리 PostgreSQL)를 쓴다. SQS·Runware HTTP·S3·LLM 은 가짜다. 잠금은 별도 DB 연결로 실제 행 잠금을 잡아 확인한다.
-"""
-
 import threading
 import time
 from contextlib import contextmanager
@@ -79,12 +73,12 @@ def build(db, provider, queue, *, follow_up_queue=True, check=None):  # noqa: F8
 
 
 def retryable_reject():
-    # 8단계 기존 정책: REJECTED + retryable(재시도 가능 코드) → V1 fallback 전환.
+    # 이 task 의 생성 종료 실패 근거(timeoutProvider)가 제출 응답에 온 경우 → V1 fallback 전환(Webhook 과 같은 기준).
+    # 2-1 보완 전에는 retryable 거절 전체를 fallback 으로 넘겼다. 이제 retryable(확실한 미접수)은 fallback 이 아니다.
     return FakeProvider(
         SubmissionOutcome.REJECTED,
-        reason="error_response",
+        reason="generation_fallback",
         http_status=200,
-        retryable=True,
         error_codes=("timeoutProvider",),
     )
 
@@ -182,8 +176,19 @@ def test_redelivery_after_the_fallback_result_is_saved_does_not_republish(db):  
             NextAction.SUBMIT_PRUNA,
         ),
         (
+            # 2-1 보완: 의미가 불명확한 4xx 는 FITTING_MODEL_FAILED 가 아니라 보류(운영 확인)다.
             FakeProvider(SubmissionOutcome.REJECTED, reason="client_error", http_status=400),
-            NextAction.PUBLISH_RESULT,
+            NextAction.SUBMIT_PRUNA,
+        ),
+        (
+            FakeProvider(
+                SubmissionOutcome.REJECTED,
+                reason="not_accepted",
+                http_status=503,
+                retryable=True,
+                error_codes=("serviceOverloaded",),
+            ),
+            NextAction.SUBMIT_PRUNA,
         ),
         (
             FakeProvider(SubmissionOutcome.UNKNOWN, reason="timeout"),

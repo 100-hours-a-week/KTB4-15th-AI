@@ -27,6 +27,7 @@ from app.virtual_fitting.repositories.async_job_repository import (
     ResultMessageStatus,
 )
 from app.virtual_fitting.repositories.async_job_state import AsyncJobStateRepository
+from tests.runware_codes import GENERATION_FAILED_TEST_CODE, register_generation_failed_code
 from tests.v2_integration_harness import (
     COMMENT,
     TITLE,
@@ -34,6 +35,7 @@ from tests.v2_integration_harness import (
     close_env,
     make_env,
     post_webhook,
+    prepared_by_previous_version,
 )
 
 JOB = 9101
@@ -52,6 +54,7 @@ def env(monkeypatch):
         pytest.skip(f"테스트 DB 에 연결할 수 없다: {error}")
     schema = f"vf_v2scn_{uuid.uuid4().hex[:12]}"
     admin.execute(f"CREATE SCHEMA {schema}")
+    register_generation_failed_code(monkeypatch)  # 최종 실패(FITTING_MODEL_FAILED) 시나리오용 코드
     e = make_env(monkeypatch, url, schema)
     try:
         yield e
@@ -166,9 +169,14 @@ def finish(env, stack):
 # --- B. fallback 진입점 ---
 
 
-def test_fallback_from_a_retryable_submit_rejection(env):
+def test_fallback_from_a_task_linked_generation_timeout_in_the_submit_response(env):
+    # 2-1 보완: 예전에는 providerRateLimitExceeded(연결 task 없음)를 retryable 거절로 보고 fallback 했다. 이제 fallback 은
+    # 이 task 에 연결된 생성 종료 실패 근거(timeoutProvider)일 때만이다(Webhook·getResponse 와 같은 기준).
     env.runware.async_modes.append(
-        ("errors", [{"code": "providerRateLimitExceeded", "message": "x"}])
+        lambda submission: (
+            "errors",
+            [{"code": "timeoutProvider", "message": "x", "taskUUID": submission.task_uuid}],
+        )
     )
     stack = Stack(env).mark_running()
     env.send_request(JOB)
@@ -184,6 +192,8 @@ def test_fallback_from_a_retryable_submit_rejection(env):
 
 
 def test_fallback_after_both_s3_check_bundles_find_nothing(env):
+    # 이전 계약 검증: 전환 전 코드가 준비한 기존 직접 업로드 작업(ai_stores_result=False)
+    prepared_by_previous_version(env.monkeypatch, JOB)
     clock = Clock()
     stack = Stack(env, clocked_handlers(clock)).mark_running()
     task = submitted(env, stack)
@@ -201,6 +211,8 @@ def test_fallback_after_both_s3_check_bundles_find_nothing(env):
 
 
 def test_object_appearing_after_the_webhook_succeeds_inside_the_check_window(env):
+    # 이전 계약 검증: 전환 전 코드가 준비한 기존 직접 업로드 작업(ai_stores_result=False)
+    prepared_by_previous_version(env.monkeypatch, JOB)
     clock = Clock()
     stack = Stack(env, clocked_handlers(clock)).mark_running()
     task = submitted(env, stack)
@@ -217,7 +229,7 @@ def test_object_appearing_after_the_webhook_succeeds_inside_the_check_window(env
 # --- D. 접수 응답보다 Webhook 이 먼저 ---
 
 
-@pytest.mark.parametrize("code", [None, "timeoutProvider", "someNewCode"])
+@pytest.mark.parametrize("code", [None, "timeoutProvider", GENERATION_FAILED_TEST_CODE])
 def test_webhook_before_the_accept_response(env, code):
     stack = Stack(env).mark_running()
     seen = {}
@@ -240,11 +252,11 @@ def test_webhook_before_the_accept_response(env, code):
     expected = {
         None: (AsyncJobStatus.POSTPROCESSING, NextAction.POSTPROCESS),
         "timeoutProvider": (AsyncJobStatus.FALLBACK_RUNNING, NextAction.RUN_FALLBACK),
-        "someNewCode": (AsyncJobStatus.RECEIVED, NextAction.PUBLISH_RESULT),
+        GENERATION_FAILED_TEST_CODE: (AsyncJobStatus.RECEIVED, NextAction.PUBLISH_RESULT),
     }[code]
     assert (current.status, current.next_action) == expected  # 늦은 접수 응답이 되돌리지 않음
     assert current.runware_accepted_at is not None
-    if code == "someNewCode":
+    if code == GENERATION_FAILED_TEST_CODE:
         assert current.result_payload["error_code"] == "FITTING_MODEL_FAILED"
     finish(env, stack)
     assert row(env).result_message_status is ResultMessageStatus.PUBLISHED
@@ -348,7 +360,7 @@ def test_submit_auth_rejection_is_held_across_redelivery_and_restart(env, status
 
 def saved_failure(env, stack):
     task = submitted(env, stack)
-    post_webhook(client(), env.runware.failure(task, "someNewCode"))
+    post_webhook(client(), env.runware.failure(task, GENERATION_FAILED_TEST_CODE))
     expire_lease(env)
     return task
 
@@ -671,7 +683,7 @@ def test_bad_result_queue_keeps_the_webhook_503_and_the_postprocess_message(env,
         "BE_FITTING_RESPONSE_QUEUE_URL",
         "https://sqs.us-east-1.amazonaws.com/1/be-fitting-response",
     )
-    response = post_webhook(client(), env.runware.failure(task, "someNewCode"))
+    response = post_webhook(client(), env.runware.failure(task, GENERATION_FAILED_TEST_CODE))
     assert response.status_code == 503
     assert response.json()["data"]["pending"][0]["next_step"] == "publish_result"
     assert row(env).result_payload["status"] == "FAILED"
@@ -681,6 +693,8 @@ def test_bad_result_queue_keeps_the_webhook_503_and_the_postprocess_message(env,
 
 
 def test_webp_octet_stream_completes_without_extra_permissions_or_rewrite(env):
+    # 이전 계약 검증: 전환 전 코드가 준비한 기존 직접 업로드 작업(ai_stores_result=False)
+    prepared_by_previous_version(env.monkeypatch, JOB)
     stack = Stack(env).mark_running()
     task = submitted(env, stack)
     body = env.runware.complete(task)

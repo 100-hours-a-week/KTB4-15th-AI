@@ -1,8 +1,3 @@
-"""가상피팅 V2 단계별 진단 로그(vf_diag). 실제 formatter 로 렌더링한 출력으로 확인한다.
-
-외부 경계는 tests/v2_integration_harness 의 가짜(SQS·S3·Runware), DB 는 격리 PostgreSQL schema 다. 네트워크는 막는다.
-"""
-
 import asyncio
 import io
 import logging
@@ -374,7 +369,8 @@ def test_logging_does_not_change_counts_or_deletion(env, rendered):
     stack = Stack(env).mark_running()
     env.send_request(JOB, codes=("999999",))
     (outcome,) = stack.request_once()
-    assert (outcome.action, outcome.delete) == ("failure_saved_PRODUCT_NOT_FOUND", False)
+    # 실패 결과·발행 대기를 저장했고 결과 전송 루프가 돌고 있어 다른 단계와 같은 인계 판단으로 지운다(로깅과 무관).
+    assert (outcome.action, outcome.delete) == ("failure_saved_PRODUCT_NOT_FOUND", True)
     stack.publish_once()
     current = env.job(JOB)
     assert (

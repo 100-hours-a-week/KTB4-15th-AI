@@ -3,7 +3,8 @@
 --
 -- 한 줄 = BE 의 fitting_job_id 하나. AI 는 이 번호를 새로 만들지 않고, BE DB 와 따로라서 외래키도 없다.
 -- 같은 fitting_job_id 가 다시 오면 새 줄을 만들거나 덮어쓰지 않는다(PRIMARY KEY + ON CONFLICT DO NOTHING).
--- Presigned URL·인증 토큰·이미지 파일은 저장하지 않는다. S3 Key 만 둔다.
+-- Presigned URL·인증 토큰·이미지 파일은 저장하지 않는다. S3 Key 만 둔다(예외: Runware 결과 참조 URL —
+-- virtual_fitting_runware_image_ref.sql, 허용된 Runware 이미지 서버 URL 만).
 -- 시각은 모두 timestamptz(UTC 기준으로 다룬다). requested_at 은 BE 요청 시각, created_at 은 AI 가 저장한 시각.
 -- 상태 전환·실행 권한·횟수 한도 판단은 이 파일이 아니라 코드(5단계 이후)가 한다. 여기서는 값의 범위만 막는다.
 CREATE TABLE IF NOT EXISTS virtual_fitting_async_jobs (

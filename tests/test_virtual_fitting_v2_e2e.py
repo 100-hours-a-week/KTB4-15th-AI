@@ -1,9 +1,3 @@
-"""16단계: 실제 FastAPI lifespan 이 돌리는 루프(요청 Worker·후처리 Worker·결과 전송 루프·Watchdog)로 전체 흐름 검증.
-
-외부 경계만 가짜다(tests/v2_integration_harness.py): SQS·S3 boto3 client, Runware HTTP(urlopen), 네트워크 차단.
-DB 는 격리 PostgreSQL schema. 실제 AWS·Runware·OpenAI·BE 는 부르지 않는다(BE 결과 큐 도착까지만 확인).
-"""
-
 import os
 import threading
 import uuid
@@ -25,6 +19,7 @@ from tests.v2_integration_harness import (
     close_env,
     make_env,
     post_webhook,
+    prepared_by_previous_version,
     wait_until,
 )
 
@@ -100,6 +95,8 @@ def test_defaults_keep_every_v2_loop_disabled():
 
 @pytest.mark.parametrize("input_extension", ["png", "jpg", "webp"])
 def test_normal_flow_through_the_real_lifespan_loops(env, monkeypatch, input_extension):
+    # 이전 계약 검증: 전환 전 코드가 준비한 기존 직접 업로드 작업(ai_stores_result=False)
+    prepared_by_previous_version(monkeypatch, JOB)
     enable_all(monkeypatch)
     input_key = f"users/10/body.{input_extension}"
     env.s3.store(input_key)
@@ -168,6 +165,8 @@ def test_normal_flow_through_the_real_lifespan_loops(env, monkeypatch, input_ext
 
 
 def test_restart_between_accept_and_webhook_continues_from_db(env, monkeypatch):
+    # 이전 계약 검증: 전환 전 코드가 준비한 기존 직접 업로드 작업(ai_stores_result=False)
+    prepared_by_previous_version(monkeypatch, JOB)
     enable_all(monkeypatch)
     env.send_request(JOB)
     with TestClient(app()):

@@ -1,5 +1,3 @@
-"""기존 GetObject/PutObject 범위: generic MIME 후처리·실제 Key·중복 방지 회귀. 외부 호출 없음."""
-
 import copy
 from datetime import UTC, datetime
 from io import BytesIO
@@ -67,7 +65,8 @@ def test_original_async_key_reaches_llm_and_result_without_metadata_changes(exte
     key = KEY.replace(".webp", "." + extension)
     job = SimpleNamespace(fitting_job_id=123, result_payload=None, verified_image_key=None,
         async_image_key=key, status=AsyncJobStatus.POSTPROCESSING, next_action=NextAction.POSTPROCESS,
-        s3_check_attempt_count=0, llm_generation_attempt_count=0, products=["123"])
+        s3_check_attempt_count=0, llm_generation_attempt_count=0, products=["123"],
+        ai_stores_result=False)  # 기존 Runware 직접 업로드 작업
     state = MemoryState(job)
     storage = ExistingStorage(content_type)
     original = copy.deepcopy(storage.object_properties)
@@ -123,7 +122,8 @@ def test_submitter_uses_persisted_output_contract_and_actual_person_url(extensio
     submitter._webhook_url = "https://local.invalid/webhook"
     submitter._decide = lambda _: True
     person_url = "https://local.invalid/actual-user-key.webp?signature=mock"
-    job = SimpleNamespace(fitting_job_id=123, task_uuid=task, async_image_key=KEY.replace(".webp", "." + extension))
+    job = SimpleNamespace(fitting_job_id=123, task_uuid=task, async_image_key=KEY.replace(".webp", "." + extension),
+        ai_stores_result=False)  # 이미 준비된 기존 Runware 직접 업로드 작업(이전 계약)
     assert submitter._send(job, "lease", FittingInput(person_url, ["https://local.invalid/shirt.jpg"], ""),
                             "https://local.invalid/" + job.async_image_key, SimpleNamespace(beat=lambda: True))
     assert len(sent) == 1 and sent[0]["outputFormat"] == fmt

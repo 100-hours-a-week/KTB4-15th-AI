@@ -25,6 +25,7 @@ from app.virtual_fitting.concurrency import create_fitting_limiters
 from app.virtual_fitting.postprocess_worker import (
     connected_postprocess_handlers,
     create_postprocess_worker,
+    register_postprocess_worker,
 )
 from app.virtual_fitting.providers.runware import (
     get_runware_llm_api_key,
@@ -115,6 +116,7 @@ async def lifespan(app: FastAPI):
                     create_postprocess_worker, handlers
                 )
                 app.state.postprocess_worker.start()
+                register_postprocess_worker(app.state.postprocess_worker)
                 app.state.postprocess_worker_status = "running"
         if any(flags.values()):
             # 켜진 루프가 쓰는 DB pool 의 실제 연결로 한 번만 확인한다(모두 꺼져 있으면 새 연결을 만들지 않는다).
@@ -135,6 +137,7 @@ async def lifespan(app: FastAPI):
         # 공유 자원(DB pool·boto3 client)을 스스로 닫지 않는다. 결과 전송 등록을 먼저 풀어 새 준비 판단에 쓰지 않게 한다.
         register_result_publisher(None)
         register_watchdog(None)
+        register_postprocess_worker(None)
         stops = [
             worker.stop(timeout)
             for worker, timeout in (

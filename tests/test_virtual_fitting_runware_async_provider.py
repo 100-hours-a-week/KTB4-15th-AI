@@ -251,7 +251,11 @@ def test_202_ack_is_accepted():
 # --- 4. 오류 응답 ---
 
 
-def test_errors_in_2xx_body_are_rejected():
+# 2-1 보완: 예전에는 2xx 의 오류 본문을 모두 REJECTED(error_response)로, 429·5xx·retryAfter·
+# providerRateLimitExceeded 를 retryable 로 봤다. 이제 이 task 에 연결된 근거 코드만 분류에 쓴다.
+
+
+def test_unclear_task_error_in_2xx_body_is_unknown_not_a_failure():
     body = {
         "errors": [
             {"code": "invalidReferenceImages", "message": "bad image", "taskUUID": TASK_UUID}
@@ -260,21 +264,22 @@ def test_errors_in_2xx_body_are_rejected():
     }
     result = _submit(FakeOpener(body))
 
-    assert result.outcome is SubmissionOutcome.REJECTED
-    assert result.reason == "error_response"
+    assert result.outcome is SubmissionOutcome.UNKNOWN
+    assert result.reason == "error_response_unclear"
     assert result.error_codes == ("invalidReferenceImages",)
     assert not result.retryable
 
 
-def test_retryable_error_code_and_retry_after_are_reported_not_retried():
+def test_provider_rate_limit_and_retry_after_alone_are_not_retryable():
     body = {
         "errors": [{"code": "providerRateLimitExceeded", "message": "slow down", "retryAfter": 5}]
     }
     opener = FakeOpener(body)
     result = _submit(opener)
 
-    assert result.outcome is SubmissionOutcome.REJECTED
-    assert result.retryable and result.retry_after == 5
+    assert result.outcome is SubmissionOutcome.UNKNOWN
+    assert result.reason == "error_response_unmatched"  # 이 task 에 연결되지 않은 오류
+    assert not result.retryable and result.retry_after == 5  # 대기 안내는 공유 대기용으로만 남긴다
     assert len(opener.calls) == 1  # 자동 재시도 없음
 
 
@@ -283,7 +288,7 @@ def test_definitive_4xx_is_rejected(code):
     result = _submit(FakeOpener(error=_http_error(code)))
 
     assert result.outcome is SubmissionOutcome.REJECTED
-    assert result.reason == "client_error"
+    assert result.reason == ("auth_error" if code in (401, 403) else "client_error")
     assert result.http_status == code
     assert result.error_codes == ("boom",)
 
@@ -303,11 +308,11 @@ def test_402_is_rejected_as_balance_exhausted():
 @pytest.mark.parametrize(
     "code, reason, retryable",
     [
-        (429, "rate_limited", True),
-        (500, "server_error", True),
-        (502, "server_error", True),
-        (503, "server_error", True),
-        (504, "server_error", True),
+        (429, "rate_limited", False),
+        (500, "server_error", False),
+        (502, "server_error", False),
+        (503, "server_error", False),
+        (504, "server_error", False),
         (408, "unexpected_status", False),
         (409, "unexpected_status", False),
         (302, "unexpected_status", False),
