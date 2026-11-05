@@ -1,13 +1,3 @@
-"""가상피팅 V2 작업 상태 관리(조건부 변경·lease·시도 횟수·진행 기록)를 실제 PostgreSQL 에서 검증한다.
-
-TEST_DATABASE_URL 이 없거나 연결할 수 없으면 PostgreSQL 테스트는 건너뛴다(pytest 는 .env 를 읽지 않는다).
-테스트마다 고유한 schema 에 마이그레이션을 적용하고 끝나면 지운다.
-
-동시성 테스트는 순차 호출이 아니다. 별도 connection 이 행 잠금(또는 커밋하지 않은 INSERT)을 쥔 상태에서
-N 개 thread 가 각자 pool 의 다른 connection 으로 같은 UPDATE/INSERT 를 보내고, pg_stat_activity 로 N 개 backend 가
-모두 그 잠금을 기다리는 것을 확인한 뒤에 잠금을 푼다. 그래서 실제로 겹친 트랜잭션들의 경쟁을 본다.
-"""
-
 import os
 import threading
 import time
@@ -43,6 +33,9 @@ MIGRATION = (
 # 13단계 변경 SQL(fallback 진행 기록 컬럼). 신규 생성 SQL 뒤에 적용한다(배포 순서와 같음).
 FALLBACK_MIGRATION = MIGRATION.with_name("virtual_fitting_fallback.sql")
 AUTH_HOLD_MIGRATION = MIGRATION.with_name("virtual_fitting_auth_hold.sql")
+IMAGE_REF_MIGRATION = MIGRATION.with_name("virtual_fitting_runware_image_ref.sql")
+AI_RESULT_MIGRATION = MIGRATION.with_name("virtual_fitting_ai_result_storage.sql")
+PRUNA_RETRY_MIGRATION = MIGRATION.with_name("virtual_fitting_pruna_retry.sql")
 KST = timezone(timedelta(hours=9))
 JOB = 3
 TASK = "a770f077-f413-47de-9dac-be0b26a35da6"
@@ -94,6 +87,9 @@ def pg():
         connection.execute(MIGRATION.read_text(encoding="utf-8"))
         connection.execute(FALLBACK_MIGRATION.read_text(encoding="utf-8"))
         connection.execute(AUTH_HOLD_MIGRATION.read_text(encoding="utf-8"))
+        connection.execute(IMAGE_REF_MIGRATION.read_text(encoding="utf-8"))
+        connection.execute(AI_RESULT_MIGRATION.read_text(encoding="utf-8"))
+        connection.execute(PRUNA_RETRY_MIGRATION.read_text(encoding="utf-8"))
     pool = ConnectionPool(url, min_size=1, max_size=20, kwargs={"options": options}, open=True)
 
     def sql(statement, params=None):

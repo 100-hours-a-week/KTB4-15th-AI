@@ -15,8 +15,9 @@ from app.clients.sqs import FittingQueue, SqsConfigError, get_queue_url
 from app.virtual_fitting import diagnostics as diag
 from app.virtual_fitting.exceptions import FittingDatabaseError, VirtualFittingError
 from app.virtual_fitting.follow_up_queue import publish_follow_up
+from app.virtual_fitting.providers.runware_errors import TaskErrorKind, classify_task_error
 from app.virtual_fitting.providers.runware_status import TaskStatusKind
-from app.virtual_fitting.pruna_submitter import NextStep, auth_hold_active
+from app.virtual_fitting.pruna_submitter import NextStep, auth_hold_active, not_accepted_pending
 from app.virtual_fitting.repositories.async_job_repository import (
     AsyncFittingJob,
     AsyncJobStatus,
@@ -25,7 +26,6 @@ from app.virtual_fitting.repositories.async_job_repository import (
 )
 from app.virtual_fitting.repositories.async_job_state import S3_CHECK_LIMIT, ChangeReason
 from app.virtual_fitting.runware_webhook import (
-    FALLBACK_ERROR_CODES,
     EventKind,
     WebhookEvent,
     WebhookFollowUpError,
@@ -124,11 +124,28 @@ class WatchdogRepository:
                       (j.status = 'WAITING_PRUNA' AND j.next_action IS NULL
                         AND j.runware_accepted_at <= statement_timestamp() - make_interval(secs => %(query)s))
                       OR (j.status = 'RECEIVED' AND j.next_action = 'SUBMIT_PRUNA'
-                        AND j.runware_accepted_at IS NULL AND j.pruna_submit_started_at
+                        AND j.runware_accepted_at IS NULL AND j.pruna_not_accepted_at IS NULL
+                        AND j.pruna_submit_started_at
                             <= statement_timestamp() - make_interval(secs => %(query)s))
+                      -- 확실한 미접수로 기록된 시도: 예약 시각이 지난 재요청(실행 권한이 비어 있을 때), 또는 보류(운영 확인 알림)
+                      OR (j.status = 'RECEIVED' AND j.next_action = 'SUBMIT_PRUNA'
+                        AND j.result_payload IS NULL AND j.pruna_not_accepted_at IS NOT NULL
+                        AND (j.pruna_retry_at IS NULL OR (j.pruna_retry_at <= statement_timestamp()
+                          AND (j.worker_lease_token IS NULL OR j.worker_lease_until <= statement_timestamp()))))
                       OR (j.next_action IN ('POSTPROCESS', 'RUN_FALLBACK')
                         AND (j.worker_lease_token IS NULL OR j.worker_lease_until <= statement_timestamp())
                         AND j.updated_at <= statement_timestamp() - make_interval(secs => %(stale)s))
+                      -- AI 저장 작업인데 결과 URL 이 없다(UUID 만 받은 성공 등): 접수 대기와 같이 접수 3분 뒤부터 같은 task
+                      -- 조회. updated_at 은 Worker 의 실행 권한 선점·반납마다 바뀌어(URL 이 없어 보류해도) 기준으로 쓰지 않는다.
+                      OR (j.ai_stores_result AND j.status = 'POSTPROCESSING' AND j.next_action = 'POSTPROCESS'
+                        AND j.result_payload IS NULL AND j.verified_image_key IS NULL
+                        AND j.runware_image_url IS NULL
+                        AND (j.worker_lease_token IS NULL OR j.worker_lease_until <= statement_timestamp())
+                        AND j.runware_accepted_at <= statement_timestamp() - make_interval(secs => %(query)s))
+                      -- AI 저장 작업의 후처리 장기 미진행: 단계 시작(성공 전환·저장 확인) 기준. lease·재수신으로 밀리지 않는다.
+                      OR (j.ai_stores_result AND j.next_action = 'POSTPROCESS' AND j.result_payload IS NULL
+                        AND (j.worker_lease_token IS NULL OR j.worker_lease_until <= statement_timestamp())
+                        AND COALESCE(j.image_verified_at, j.runware_accepted_at) <= statement_timestamp() - make_interval(secs => %(stale)s))
                       OR (j.next_action = 'PUBLISH_RESULT' AND j.result_payload IS NOT NULL AND (
                         j.result_message_status = 'RETRY_EXHAUSTED'
                         OR j.updated_at <= statement_timestamp() - make_interval(secs => %(stale)s)))
@@ -192,6 +209,31 @@ class WatchdogRepository:
 
         return self._run(work)
 
+    def claim_republish_once(self, job_id: int) -> bool:
+        """AI 저장 작업의 지금 후처리 단계에서 아직 재발행하지 않았을 때만 선점한다(단계당 최대 한 번, DB 기록이라 재시작에도 유지).
+
+        단계 시작 = COALESCE(j.image_verified_at, j.runware_accepted_at): 결과 저장 전에는 성공 전환(접수 시각 이후), 저장 확인 뒤에는 그 확인 시각.
+        둘 다 실제 진척 기록이며 lease 선점·연장·반납·재수신(updated_at 만 바뀜)으로 바뀌지 않는다. 그래서 재발행한 메시지를
+        Worker 가 받아 계속 실패해도(DLQ 로 가는 중) 제한이 다시 열리지 않는다. 발행이 실패·UNKNOWN 이면 forget_republish 로
+        되돌린다(소비 실패가 아니라 발행 실패라서).
+        """
+
+        def work(cursor):
+            cursor.execute(
+                f"""
+                UPDATE {CHECKS} c SET follow_up_published_at = statement_timestamp()
+                FROM virtual_fitting_async_jobs j
+                WHERE c.fitting_job_id = %(job)s AND j.fitting_job_id = c.fitting_job_id
+                  AND (c.follow_up_published_at IS NULL
+                       OR c.follow_up_published_at < COALESCE(j.image_verified_at, j.runware_accepted_at))
+                RETURNING c.fitting_job_id
+                """,
+                {"job": job_id},
+            )
+            return cursor.fetchone() is not None
+
+        return self._run(work)
+
     def defer_check(self, job_id: int, seconds: float) -> None:
         """이 작업의 다음 점검을 늦춘다(비용 누락처럼 급하지 않은 점검)."""
         self._run(
@@ -221,7 +263,7 @@ class WatchdogRepository:
         )
 
     def timing(self, job_id: int) -> dict[str, float | None]:
-        """DB 시각 기준 경과 초(접수 확인·호출 시작·마지막 변경·진행 중 자리)."""
+        """DB 시각 기준 경과 초(접수 확인·호출 시작·마지막 변경·진행 중 자리·AI 후처리 단계 시작)."""
 
         def age(column: str) -> str:
             return f"EXTRACT(EPOCH FROM statement_timestamp() - {column})"
@@ -231,7 +273,9 @@ class WatchdogRepository:
                 f"""
                 SELECT {age("j.runware_accepted_at")}, {age("j.pruna_submit_started_at")},
                        {age("j.updated_at")}, {age("f.acquired_at")}, f.task_uuid::text,
-                       EXISTS (SELECT 1 FROM virtual_fitting_task_costs t WHERE t.task_uuid = j.task_uuid)
+                       EXISTS (SELECT 1 FROM virtual_fitting_task_costs t WHERE t.task_uuid = j.task_uuid),
+                       {age("COALESCE(j.image_verified_at, j.runware_accepted_at)")},
+                       {age("j.pruna_retry_at")}
                 FROM virtual_fitting_async_jobs j
                 LEFT JOIN virtual_fitting_pruna_in_flight f USING (fitting_job_id)
                 WHERE j.fitting_job_id = %s
@@ -241,7 +285,16 @@ class WatchdogRepository:
             row = cursor.fetchone()
             if row is None:
                 return {}
-            keys = ("accepted", "started", "updated", "slot", "slot_task", "has_cost")
+            keys = (
+                "accepted",
+                "started",
+                "updated",
+                "slot",
+                "slot_task",
+                "has_cost",
+                "stage",
+                "retry",  # 재요청 예약 시각부터 지난 초(음수면 아직 전)
+            )
             return {
                 k: (float(v) if v is not None and k not in ("slot_task", "has_cost") else v)
                 for k, v in zip(keys, row, strict=True)
@@ -367,7 +420,11 @@ class Watchdog:
         publisher_ready: Callable[[], bool] = lambda: False,
         config: WatchdogSettings | None = None,
         should_stop: Callable[[], bool] = lambda: False,
+        resubmit: Callable[[int], str] | None = None,
     ) -> None:
+        # resubmit: 확실한 미접수 뒤 예약 시각이 지난 작업을 같은 Submitter 로 재요청한다(pruna_resubmit.PrunaResubmitter).
+        # 없으면 재요청하지 않고 알린다(요청 메시지 삭제 판단도 준비되지 않음으로 본다).
+        self._resubmit = resubmit
         self._jobs, self._state, self._repo = jobs, state, repo
         self._status, self._events, self._sqs, self._storage = status, events, sqs, storage
         self._alerts = alerts or LogAlertSink()
@@ -446,6 +503,9 @@ class Watchdog:
             report.actions.append("auth_hold")
             self._alert(f"pruna_auth_hold_{job.auth_hold_reason}", "pruna", job_id)
             return report
+        if not_accepted_pending(job):
+            self._resubmit_due(job, timing, report)
+            return report
         if self._submit_unknown(job):
             age = timing.get("started") or 0.0
             if age >= self._config.query_after_seconds and queried is None:
@@ -462,6 +522,12 @@ class Watchdog:
                 job_id, self._awaiting_webhook
             ):
                 self._alert("pruna_delayed", "pruna", job_id)
+        elif (
+            self._missing_result_url(job)
+            and not self._leased(job)
+            and (timing.get("accepted") or 0.0) >= self._config.query_after_seconds
+        ):
+            self._recover_result_url(job, report)
         elif job.next_action is NextAction.POSTPROCESS and self._stale(job, timing):
             self._postprocess(job, report)
         elif job.next_action is NextAction.RUN_FALLBACK and self._stale(job, timing):
@@ -470,6 +536,27 @@ class Watchdog:
             self._publish(job, timing)
         return report
 
+    def _resubmit_due(self, job: AsyncFittingJob, timing: dict, report: CheckReport) -> None:
+        """확실한 미접수로 기록된 작업. 예약 시각(DB) 전에는 아무것도 하지 않고, 지났으면 같은 Submitter 로 재요청한다.
+
+        재요청 조건(예약 시각·남은 횟수·실행 권한·공통 제한)은 Submitter 의 자리 확보 트랜잭션이 다시 확인한다. 예약이 없으면
+        (표현할 수 없는 대기·모순 근거) 자동으로 보내지 않고 알린다.
+        """
+        job_id = job.fitting_job_id
+        if job.pruna_retry_at is None:
+            report.actions.append("resubmit_held")
+            self._alert("pruna_resubmit_held", "pruna", job_id)
+            return
+        elapsed = timing.get("retry")
+        if elapsed is None or elapsed < 0 or self._leased(job):
+            report.actions.append("resubmit_waiting")
+            return
+        if self._resubmit is None:
+            report.actions.append("resubmit_not_connected")
+            self._alert("pruna_resubmit_not_connected", "pruna", job_id)
+            return
+        report.actions.append(f"resubmit_{self._resubmit(job_id)}")
+
     @staticmethod
     def _submit_unknown(job: AsyncFittingJob) -> bool:
         return (
@@ -477,6 +564,7 @@ class Watchdog:
             and job.next_action is NextAction.SUBMIT_PRUNA
             and job.pruna_submit_started_at is not None
             and job.runware_accepted_at is None
+            and job.pruna_not_accepted_at is None
         )
 
     @staticmethod
@@ -488,9 +576,14 @@ class Watchdog:
         return latest is not None and predicate(latest)
 
     def _stale(self, job: AsyncFittingJob, timing: dict) -> bool:
-        return (timing.get("updated") or 0.0) >= self._config.stale_seconds and not self._leased(
-            job
+        # AI 저장 작업의 후처리는 단계 시작(성공 전환·저장 확인) 기준: updated_at 은 lease 선점·연장·반납과 메시지 재수신마다
+        # 바뀌어 진척이 없어도 판단이 계속 밀린다. 그 밖(기존 직접 업로드·fallback)은 기존대로 updated_at 기준이다.
+        basis = (
+            "stage"
+            if job.ai_stores_result and job.next_action is NextAction.POSTPROCESS
+            else "updated"
         )
+        return (timing.get(basis) or 0.0) >= self._config.stale_seconds and not self._leased(job)
 
     @staticmethod
     def _leased(job: AsyncFittingJob) -> bool:
@@ -530,8 +623,11 @@ class Watchdog:
             self._alert("cost_missing", "cost", job.fitting_job_id)
             self._repo.settle_cleanup(job.fitting_job_id)
             report.actions.append("cleanup_settled_without_cost")
-        elif status.kind is TaskStatusKind.FAILED and status.error_code in FALLBACK_ERROR_CODES:
-            self._repo.settle_cleanup(job.fitting_job_id)  # 확정 실패, 보고된 비용 없음
+        elif status.kind is TaskStatusKind.FAILED and classify_task_error(status.error_code) in (
+            TaskErrorKind.GENERATION_FALLBACK,
+            TaskErrorKind.GENERATION_FAILED,
+        ):
+            self._repo.settle_cleanup(job.fitting_job_id)  # 확정 생성 실패, 보고된 비용 없음
             report.actions.append("cleanup_settled_without_cost")
         else:
             self._repo.defer_check(job.fitting_job_id, self._config.cleanup_interval_seconds)
@@ -569,20 +665,42 @@ class Watchdog:
             elapsed_ms=diag.elapsed_ms(started),
         )
         report.actions.append(f"query_{why}_{status.kind.value}")
-        if status.kind is TaskStatusKind.SUCCEEDED:
-            self._apply(
-                job, WebhookEvent(job.task_uuid, EventKind.SUCCEEDED, cost=status.cost), report
+        if status.kind is TaskStatusKind.PROCESSING:
+            # 조회 중 미접수 기록이 생겼을 수 있다. Webhook 과 같은 모순 보호로 다음 생성 재전송을 막는다.
+            self._state.record_attempt_contradiction(
+                job.task_uuid, "processing_after_not_accepted"
             )
-        elif status.kind is TaskStatusKind.FAILED and status.error_code in FALLBACK_ERROR_CODES:
+        elif status.kind is TaskStatusKind.SUCCEEDED:
+            # 결과 참조(imageURL·imageUUID)도 Webhook 과 같은 의미로 넘긴다(저장 조건은 9단계 처리가 정한다).
             event = WebhookEvent(
-                job.task_uuid, EventKind.FAILED, status.error_code, cost=status.cost
+                job.task_uuid,
+                EventKind.SUCCEEDED,
+                cost=status.cost,
+                image_url=status.image_url,
+                image_uuid=status.image_uuid,
+                image_ref_invalid=status.image_ref_invalid,
+                from_status_query=True,  # 우리 인증으로 이 task 를 직접 조회한 결과(외부 본문이 아님)
             )
             self._apply(job, event, report)
-        elif status.kind is TaskStatusKind.FAILED and alert:
-            # 조회 오류인지 생성 실패인지 근거가 부족한 코드. 상태·자리를 바꾸지 않는다.
-            self._alert(
-                f"pruna_error_{status.error_code or 'unknown'}", "pruna", job.fitting_job_id
+        elif status.kind is TaskStatusKind.FAILED and status.error_code is not None:
+            # 이 task 에 연결된 생성 task 의 오류 결과: Webhook 과 같은 처리(같은 분류·fallback 목록·보호 조건)로 넘긴다.
+            event = WebhookEvent(
+                job.task_uuid,
+                EventKind.FAILED,
+                status.error_code,
+                cost=status.cost,
+                from_status_query=True,  # 우리 인증으로 이 task 를 직접 조회한 결과(미접수 기록의 확인 경로)
+                # 그 task 오류 항목의 안내만 넘긴다(조회 HTTP 자체의 Retry-After 는 status.retry_after 로 따로 있다).
+                retry_after=status.task_retry_after,
+                retry_after_unrepresentable=status.task_retry_after_unrepresentable,
             )
+            self._apply(job, event, report)
+            if event.unresolved and alert:
+                # 확실한 미접수(자동 재요청 미연결)·근거 부족 코드: 상태를 바꾸지 않았다. 운영 확인으로 알린다.
+                self._alert(f"pruna_error_{status.error_code}", "pruna", job.fitting_job_id)
+        elif status.kind is TaskStatusKind.FAILED and alert:
+            # 코드를 읽을 수 없거나 같은 task 의 실패 코드가 서로 다르다. 분류하지 않고 알린다(상태·자리 그대로).
+            self._alert("pruna_error_unknown", "pruna", job.fitting_job_id)
         elif status.kind is TaskStatusKind.AUTH_ERROR:
             self._alert("status_query_auth", "pruna", job.fitting_job_id)
         return status
@@ -603,8 +721,20 @@ class Watchdog:
             self._alert("follow_up_queue_config", "queue", job.fitting_job_id)
 
     # 후속 메시지 재발행(작업당 republish 간격에 한 번, 실패하면 다음 점검에서 다시)
-    def _republish(self, job: AsyncFittingJob, action: NextAction, report: CheckReport) -> None:
-        if not self._repo.claim_republish(
+    def _republish(
+        self,
+        job: AsyncFittingJob,
+        action: NextAction,
+        report: CheckReport,
+        *,
+        once_per_progress: bool = False,
+    ) -> None:
+        if once_per_progress:
+            if not self._repo.claim_republish_once(job.fitting_job_id):
+                report.actions.append(f"republish_{action.value.lower()}_held")
+                self._alert(f"{action.value.lower()}_stalled", "postprocess", job.fitting_job_id)
+                return
+        elif not self._repo.claim_republish(
             job.fitting_job_id, self._config.republish_interval_seconds
         ):
             report.actions.append(f"republish_{action.value.lower()}_throttled")
@@ -639,7 +769,43 @@ class Watchdog:
             return False
         return modified >= since - timedelta(seconds=CLOCK_SKEW_SECONDS)
 
+    @staticmethod
+    def _missing_result_url(job: AsyncFittingJob) -> bool:
+        """AI 저장 작업이 후처리 대기 중인데 결과를 내려받을 URL 이 없다(저장·최종 결과·fallback 진행 기록 없음)."""
+        return (
+            job.ai_stores_result
+            and job.status is AsyncJobStatus.POSTPROCESSING
+            and job.next_action is NextAction.POSTPROCESS
+            and job.result_payload is None
+            and job.verified_image_key is None
+            and job.runware_image_url is None
+            and job.task_uuid is not None
+            and job.pruna_submit_started_at is not None
+        )
+
+    def _recover_result_url(self, job: AsyncFittingJob, report: CheckReport) -> None:
+        """같은 task 를 조회해 확인된 참조를 저장(9단계 처리 — 조건부 보완)한 뒤 POSTPROCESS 로 인계한다.
+
+        조회 실패·미발견·참조 없음은 생성 실패가 아니다(상태를 바꾸지 않음). 운영 확인으로 알리고 정리 간격 뒤 다시 본다.
+        """
+        self._query(job, report, "result_ref")
+        latest = self._jobs.find_by_fitting_job_id(job.fitting_job_id)
+        if latest is not None and latest.runware_image_url is not None:
+            # 참조 저장과 POSTPROCESS 발행은 9단계 처리가 같은 흐름에서 했다(DB 저장 뒤 발행). 발행이 실패했으면
+            # 장기 미진행 점검(_postprocess)이 DB 기록으로 다시 발행한다.
+            report.actions.append("result_ref_recovered")
+            return
+        report.actions.append("result_ref_unrecovered")
+        self._alert("result_ref_missing", "postprocess", job.fitting_job_id)
+        self._repo.defer_check(job.fitting_job_id, self._config.cleanup_interval_seconds)
+
     def _postprocess(self, job: AsyncFittingJob, report: CheckReport) -> None:
+        if job.ai_stores_result:
+            # AI 저장 작업은 S3 확인 횟수를 쓰지 않는다(객체 미존재·저장 실패를 fallback 근거로 쓰지 않음). 멈춘 메시지는
+            # 후처리 단계(결과 저장 전 / 저장 확인 뒤 LLM·결과 저장)마다 한 번만 다시 발행하고, 그 뒤에도 진척이 없으면 운영
+            # 확인으로 알린다(DLQ 우회 방지). 재발행 기록은 DB 에 남아 재시작에도 유지된다.
+            self._republish(job, NextAction.POSTPROCESS, report, once_per_progress=True)
+            return
         if job.verified_image_key is not None or job.s3_check_attempt_count < S3_CHECK_LIMIT:
             self._republish(
                 job, NextAction.POSTPROCESS, report
@@ -731,6 +897,8 @@ class WatchdogWorker:
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
         self.status = WatchdogStatus()
+        # 확실한 미접수 재요청 경로가 조립됐는지(create_watchdog 이 정한다). False 면 RESUBMIT_PRUNA 를 준비됨으로 보지 않는다.
+        self.resubmits = False
 
     @property
     def stopping(self) -> bool:
@@ -825,6 +993,10 @@ class WatchdogPaths:
 
     - AWAIT_WEBHOOK(접수됨, 완료 알림 대기): Webhook 이 오지 않아도 3분부터 getResponse 로 확인한다.
     - RECOVER_UNKNOWN(호출 시작 기록만 있고 접수 불명확): 3분부터 getResponse 로 확인한다(재전송 없음).
+    - RECOVER_RESULT_REF(AI 저장 작업이 성공했지만 결과 URL 없음): 접수 3분 뒤부터 같은 task 를 조회해 참조를 저장하고
+      POSTPROCESS 를 발행한다.
+    - RESUBMIT_PRUNA(확실한 미접수 뒤 재요청 예약): 예약 시각(pruna_retry_at)이 지나면 같은 Submitter 로 새 task 를 보낸다.
+      재요청 경로가 조립된 Watchdog(resubmits)일 때만이다.
     그 밖(OPERATOR_REVIEW·인증 오류 보류 등)은 준비되지 않음. 내부 큐 URL 이 로컬 검증을 통과해야 한다(확인 결과를 POSTPROCESS·
     RUN_FALLBACK 으로 이어 가므로). 로그를 남길 수 있다는 것만으로는 준비됐다고 보지 않는다.
     """
@@ -833,11 +1005,19 @@ class WatchdogPaths:
         self._worker = worker
 
     def ready_for(self, job: AsyncFittingJob | None, step: NextStep) -> bool:
-        if job is None or step not in (NextStep.AWAIT_WEBHOOK, NextStep.RECOVER_UNKNOWN):
+        if job is None or step not in (
+            NextStep.AWAIT_WEBHOOK,
+            NextStep.RECOVER_UNKNOWN,
+            NextStep.RECOVER_RESULT_REF,
+            NextStep.RESUBMIT_PRUNA,
+        ):
             return False
         worker = self._worker()
         if worker is None or not worker.alive or job.task_uuid is None:
             return False
+        if step is NextStep.RESUBMIT_PRUNA:
+            # 예약된 재요청: Watchdog 이 DB 기록(pruna_retry_at)을 읽어 같은 Submitter 로 보낸다(큐를 쓰지 않음).
+            return bool(getattr(worker, "resubmits", False)) and job.pruna_retry_at is not None
         try:
             get_queue_url(FittingQueue.AI_FITTING_RESPONSE)
         except SqsConfigError:
@@ -855,11 +1035,58 @@ class AnyFollowUpPaths:
         return any(path.ready_for(job, step) for path in self._paths)
 
 
+class PostprocessPaths:
+    """POSTPROCESS(후처리 준비·진행): 결과 참조·후속 작업이 DB 에 있고(next_action=POSTPROCESS, 결과 전), 그 일을 이어 갈
+    두 주체가 실제로 돌 때만 준비됐다고 답한다.
+
+    - 후처리 Worker: ai-fitting-response 의 POSTPROCESS 메시지를 소비한다.
+    - Watchdog: 후처리 메시지가 유실·발행 실패했거나 진행이 멈추면 DB 기록으로 다시 발행한다(요청 메시지를 지운 뒤에는
+      이것이 DB 기록을 다시 큐로 잇는 경로다). Watchdog 판단은 WatchdogPaths 와 같은 기준(실행 중·내부 큐 설정)이다.
+    결과 URL 이 없는 AI 저장 작업은 이 단계가 아니다(next_step_for 가 RECOVER_RESULT_REF 로 나눈다).
+    """
+
+    def __init__(
+        self,
+        worker_running: Callable[[], bool] | None = None,
+        watchdog: Callable[[], WatchdogWorker | None] = lambda: _registered,
+    ):
+        self._worker_running = worker_running
+        self._watchdog = watchdog
+
+    def ready_for(self, job: AsyncFittingJob | None, step: NextStep) -> bool:
+        if job is None or step is not NextStep.POSTPROCESS:
+            return False
+        if (
+            job.next_action is not NextAction.POSTPROCESS
+            or job.result_payload is not None
+            or job.task_uuid is None
+        ):
+            return False
+        if self._worker_running is None:
+            from app.virtual_fitting.postprocess_worker import postprocess_worker_running
+
+            running = postprocess_worker_running()
+        else:
+            running = self._worker_running()
+        if not running:
+            return False
+        watchdog = self._watchdog()
+        if watchdog is None or not watchdog.alive:
+            return False
+        try:
+            get_queue_url(FittingQueue.AI_FITTING_RESPONSE)
+        except SqsConfigError:
+            return False
+        return True
+
+
 def follow_up_paths() -> AnyFollowUpPaths:
-    """요청·후처리 Worker·Webhook 이 쓰는 준비 판단: 결과 전송 루프(PUBLISH_RESULT) + Watchdog(AWAIT_WEBHOOK·RECOVER_UNKNOWN)."""
+    """요청·후처리 Worker·Webhook 이 쓰는 준비 판단(단계마다 필요한 주체만 본다):
+    결과 전송 루프(PUBLISH_RESULT) + Watchdog(AWAIT_WEBHOOK·RECOVER_UNKNOWN·RECOVER_RESULT_REF)
+    + 후처리 Worker 와 Watchdog(POSTPROCESS)."""
     from app.virtual_fitting.result_publisher import result_publish_paths
 
-    return AnyFollowUpPaths(result_publish_paths(), WatchdogPaths())
+    return AnyFollowUpPaths(result_publish_paths(), WatchdogPaths(), PostprocessPaths())
 
 
 # --- 조립 ---
@@ -921,6 +1148,15 @@ def create_watchdog(components: Callable[[], dict[str, Any]] = dict) -> Watchdog
         current = result_publisher._registered
         return current is not None and current.alive and result_publisher._result_queue_configured()
 
+    resubmitter = None
+    try:
+        from app.virtual_fitting.request_worker import create_pruna_resubmitter
+
+        resubmitter = create_pruna_resubmitter(lambda: worker.stopping)
+    except Exception as error:  # noqa: BLE001 — 조립 실패를 Watchdog 전체 중단으로 키우지 않는다
+        # 재요청 경로를 만들 수 없다(설정 오류 등). Watchdog 의 다른 점검은 그대로 돌고, 예약된 재요청은 보내지 않고 알린다
+        # (RESUBMIT_PRUNA 를 준비됨으로 보지 않아 요청 메시지도 지우지 않는다).
+        logger.error("watchdog resubmit path not connected error_type=%s", type(error).__name__)
     watchdog = Watchdog(
         jobs=jobs,
         state=state,
@@ -936,6 +1172,8 @@ def create_watchdog(components: Callable[[], dict[str, Any]] = dict) -> Watchdog
         publisher_ready=publisher_ready,
         config=config,
         should_stop=lambda: worker.stopping,
+        resubmit=resubmitter,
     )
     worker = WatchdogWorker(watchdog.run_once, interval_seconds=config.check_interval_seconds)
+    worker.resubmits = resubmitter is not None
     return worker

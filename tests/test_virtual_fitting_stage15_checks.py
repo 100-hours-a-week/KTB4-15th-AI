@@ -29,6 +29,7 @@ from app.virtual_fitting.watchdog import (
     follow_up_paths,
     register_watchdog,
 )
+from tests.runware_codes import GENERATION_FAILED_TEST_CODE, register_generation_failed_code
 from tests.test_virtual_fitting_async_job_state import pg  # noqa: F401 (pytest fixture)
 from tests.test_virtual_fitting_pruna_submit import JOB, db, job, limiter  # noqa: F401
 from tests.test_virtual_fitting_result_publisher import (
@@ -75,6 +76,9 @@ class Alive:
 
 @pytest.fixture(autouse=True)
 def queues(monkeypatch):
+    register_generation_failed_code(
+        monkeypatch
+    )  # Webhook 영구 실패(FITTING_MODEL_FAILED)를 만드는 코드
     monkeypatch.setattr(settings, "AWS_REGION", "ap-northeast-2")
     monkeypatch.setattr(settings, "BE_FITTING_RESPONSE_QUEUE_URL", QUEUE_URL)
     monkeypatch.setattr(settings, "AI_FITTING_RESPONSE_QUEUE_URL", AI_QUEUE)
@@ -151,7 +155,7 @@ def test_watchdog_alone_keeps_the_saved_postprocess_message(wdb):
 def test_watchdog_alone_keeps_the_webhook_permanent_failure_503(api):  # noqa: F811
     run(watchdog_=True)
     task = submitted(api["db"])
-    response = post(api, error_body(task, code="someNewCode"))
+    response = post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE))
     assert response.status_code == 503
     assert response.json()["data"]["pending"][0]["next_step"] == "publish_result"
     assert job(api["db"]).result_payload == FAILED_PAYLOAD  # 결과는 저장, 발행 경로만 없음
@@ -208,9 +212,9 @@ def test_both_running_with_a_bad_result_queue_keep_the_webhook_503(api, monkeypa
     run(publisher_=True, watchdog_=True)
     monkeypatch.setattr(settings, "BE_FITTING_RESPONSE_QUEUE_URL", BAD_BE_QUEUE)
     task = submitted(api["db"])
-    assert post(api, error_body(task, code="someNewCode")).status_code == 503
+    assert post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE)).status_code == 503
     monkeypatch.setattr(settings, "BE_FITTING_RESPONSE_QUEUE_URL", QUEUE_URL)
-    assert post(api, error_body(task, code="someNewCode")).status_code == 200
+    assert post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE)).status_code == 200
 
 
 def test_operator_review_is_never_ready_even_with_both_running(wdb):
@@ -242,13 +246,13 @@ def test_invalid_api_key_hold_stays_503_with_both_running(api):  # noqa: F811
 def test_published_duplicate_webhook_is_still_200_without_any_loop(api):  # noqa: F811
     run(publisher_=True)
     task = submitted(api["db"])
-    post(api, error_body(task, code="someNewCode"))
+    post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE))
     clear_lease(api["db"])  # 요청 Worker 의 lease 반납(submitted 도우미는 쥔 채 끝난다)
     assert publisher(api["db"], FakeSqs()).publish(JOB).value == "published"
     assert job(api["db"]).result_message_status is ResultMessageStatus.PUBLISHED
     final = job(api["db"])
     run()  # 루프가 모두 꺼져도 발행 완료 작업의 중복 알림은 안전하게 200
-    response = post(api, error_body(task, code="someNewCode"))
+    response = post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE))
     assert response.status_code == 200 and job(api["db"]) == final
 
 

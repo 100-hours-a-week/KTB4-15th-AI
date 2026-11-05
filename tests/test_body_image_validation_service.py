@@ -116,17 +116,17 @@ def service(person=None, pose=None, remover=None, storage=None):
     )
 
 
-def test_success_removes_background_and_uploads_rgba_png():
+def test_success_removes_background_and_uploads_rgba_webp():
     storage = FakeStorage()
 
     result = service(storage=storage).validate(image_bytes())
 
     assert result.s3_key.startswith("body-images/")
-    assert result.s3_key.endswith(".png")
+    assert result.s3_key.endswith(".webp")
     [(body, key, content_type)] = storage.uploads
     assert key == result.s3_key
-    assert content_type == "image/png"
-    assert Image.open(BytesIO(body)).mode == "RGBA"
+    assert content_type == "image/webp"
+    assert Image.open(BytesIO(body)).convert("RGBA").mode == "RGBA"
 
 
 def test_brightness_check_failure_is_system_failure(monkeypatch):
@@ -408,7 +408,7 @@ def test_images_are_closed_and_the_slot_is_released_in_every_outcome(
     storage = FakeStorage(ImageStorageError("s3") if case == "upload-failure" else None)
     person = NoPersonDetector() if case == "validation-failure" else FakePersonDetector()
     if case == "encode-failure":
-        monkeypatch.setattr(service_module, "encode_png", _fail_encoding)
+        monkeypatch.setattr(service_module, "encode_webp", _fail_encoding)
     target = BodyImageValidationService(person, FakePoseDetector(), remover, storage)
 
     if expected_error is None:
@@ -434,13 +434,13 @@ def test_processing_image_stays_open_until_encoding_and_is_closed_by_validate(
     # rembg 직후 조기 close 는 측정상 효과가 없어 넣지 않았다. validate() 의 finally 가 닫는다.
     assert not hasattr(config, "BODY_IMAGE_EARLY_CLOSE_RGB")
     closed_at_encode = []
-    real_encode = service_module.encode_png
+    real_encode = service_module.encode_webp
 
-    def encode_png(result):
+    def encode_webp(result):
         closed_at_encode.append(is_closed(opened_images["decoded"][0]))
         return real_encode(result)
 
-    monkeypatch.setattr(service_module, "encode_png", encode_png)
+    monkeypatch.setattr(service_module, "encode_webp", encode_webp)
     remover = RecordingRemover()
     storage = FakeStorage()
     target = BodyImageValidationService(
@@ -451,9 +451,9 @@ def test_processing_image_stays_open_until_encoding_and_is_closed_by_validate(
 
     assert closed_at_encode == [False]
     assert result.s3_key == storage.uploads[0][1]
-    [png] = [body for body, *_ in storage.uploads]
-    with Image.open(BytesIO(png)) as uploaded:  # 결과 품질은 그대로다
-        assert (uploaded.mode, uploaded.size) == ("RGBA", (600, 800))
+    [webp] = [body for body, *_ in storage.uploads]
+    with Image.open(BytesIO(webp)) as uploaded:  # 해상도·알파 모드 유지
+        assert (uploaded.convert("RGBA").mode, uploaded.size) == ("RGBA", (600, 800))
     assert is_closed(opened_images["decoded"][0])
     assert all(is_closed(image) for image in remover.results)
     assert (target.limiter.running, target.limiter.waiting) == (0, 0)
@@ -490,7 +490,7 @@ def test_diagnostics_log_each_stage_without_changing_the_result(caplog):
     assert result.s3_key.startswith("body-images/")
     [line] = [r.getMessage() for r in caplog.records if "body image validation timings" in r.getMessage()]
     assert "outcome=success" in line
-    for stage in ("preprocess", "person", "pose", "brightness", "rembg", "png", "s3_upload", "total"):
+    for stage in ("preprocess", "person", "pose", "brightness", "rembg", "webp", "s3_upload", "total"):
         assert f"'{stage}'" in line
 
 

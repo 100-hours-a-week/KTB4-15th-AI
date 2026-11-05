@@ -843,7 +843,14 @@ def smoke(ops, app_name: str, credentials: dict, image_path: Path, limits: Smoke
     if not key:
         raise SmokeFailure("validation", "응답에 s3_key 가 없습니다")
     report["s3"] = {"key": key, **(s3_checker(secret_name, key) if secret_name else {"skipped": True})}
-    if "refused" in report["s3"] or report["s3"].get("format") not in (None, "PNG"):
+    # 새 WebP 출력과 기존 PNG 출력의 Key·실제 형식·MIME 이 일치해야 한다.
+    # secret_name 이 없으면 기존처럼 S3 검사를 생략한다.
+    expected = {".webp": ("WEBP", "image/webp"), ".png": ("PNG", "image/png")}
+    actual = (report["s3"].get("format"), report["s3"].get("content_type"))
+    if "refused" in report["s3"] or (
+        secret_name and (Path(key).suffix.lower() not in expected
+                         or actual != expected[Path(key).suffix.lower()])
+    ):
         raise SmokeFailure("s3", json.dumps(report["s3"]))
     report["result"] = "PASS"
     return report

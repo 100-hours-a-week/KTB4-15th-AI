@@ -1,11 +1,3 @@
-"""9단계 보완: (1) 영구 실패 저장 뒤 후속 경로 준비 여부, (2) Runware 인증 오류와 사용자용 모델 실패의 분리.
-
-처음에는 "지금 이렇게 동작한다"는 관찰값(영구 실패에도 200, invalidApiKey 도 FITTING_MODEL_FAILED)을 담았던 파일이다.
-지금은 보완한 요구사항을 검증한다. 실제 app.main.app → webhook_router → RunwareWebhookService → Repository(격리
-PostgreSQL)를 쓰고, 외부 SQS 만 가짜 boto3 client 로 바꾼다. 준비된 후속 경로는 테스트에서만 주입한다
-(실제 조립에는 결과 발행 14단계·Watchdog 15단계가 없다).
-"""
-
 import inspect
 import logging
 from decimal import Decimal
@@ -19,6 +11,7 @@ from app.virtual_fitting.pruna_submitter import NextStep, next_step_for
 from app.virtual_fitting.repositories.async_job_repository import AsyncJobStatus, NextAction
 from app.virtual_fitting.repositories.pruna_limiter import TaskCostRepository
 from app.virtual_fitting.runware_webhook import AUTH_ERROR_CODES, FALLBACK_ERROR_CODES
+from tests.runware_codes import GENERATION_FAILED_TEST_CODE, register_generation_failed_code
 from tests.test_virtual_fitting_async_job_state import pg  # noqa: F401 (pytest fixture)
 from tests.test_virtual_fitting_pruna_submit import JOB, db, job  # noqa: F401 (pytest fixture)
 from tests.test_virtual_fitting_webhook import (  # noqa: F401 (pytest fixture)
@@ -38,6 +31,12 @@ MODEL_FAILED = {
     "error_message": "가상 피팅 이미지 생성에 실패했습니다.",
 }
 FAILED_RESULT = {"fitting_job_id": JOB, "status": "FAILED", **MODEL_FAILED}
+
+
+@pytest.fixture(autouse=True)
+def _generation_failed_code(monkeypatch):
+    # 영구 실패(FITTING_MODEL_FAILED) 저장 경로는 확정 생성 실패 코드로 만든다(운영 목록은 비어 있음, tests/runware_codes.py).
+    register_generation_failed_code(monkeypatch)
 
 
 def snapshot(api, job_id=JOB):  # noqa: F811
@@ -94,7 +93,7 @@ def mark_published(api):  # noqa: F811
 
 def test_permanent_failure_without_a_publish_path_is_503_and_keeps_the_record(api):  # noqa: F811
     task = submitted(api["db"])
-    response = post(api, error_body(task, code="someNewCode", cost=0.015))
+    response = post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE, cost=0.015))
 
     assert response.status_code == 503
     assert response.json() == not_ready_body(task, "publish_result", "applied")
@@ -110,10 +109,10 @@ def test_permanent_failure_without_a_publish_path_is_503_and_keeps_the_record(ap
 
 def test_redelivery_while_not_ready_keeps_everything_and_stays_503(api):  # noqa: F811
     task = submitted(api["db"])
-    post(api, error_body(task, code="someNewCode", cost=0.015))
+    post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE, cost=0.015))
     first = snapshot(api)
     for _ in range(2):
-        again = post(api, error_body(task, code="someNewCode", cost=0.5))
+        again = post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE, cost=0.5))
         assert again.status_code == 503
         assert again.json() == not_ready_body(task, "publish_result", "duplicate")
     assert snapshot(api) == first  # 결과·상태·다음 작업·생성 기록 보존, fallback 없음
@@ -133,19 +132,23 @@ def test_redelivery_completes_a_missed_cleanup_step_before_answering(api, monkey
         return real(self, *args, **kwargs)
 
     monkeypatch.setattr(TaskCostRepository, "record", flaky)
-    assert post(api, error_body(task, code="someNewCode", cost=0.015)).status_code == 500
+    assert (
+        post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE, cost=0.015)).status_code == 500
+    )
     assert task_costs(api["db"]) == [] and snapshot(api)["result_payload"] == FAILED_RESULT
-    again = post(api, error_body(task, code="someNewCode", cost=0.015))
+    again = post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE, cost=0.015))
     assert again.status_code == 503  # 빠진 비용·자리 정리는 마쳤고, 경로는 여전히 없다
     assert len(task_costs(api["db"])) == 1 and in_flight(api["db"]) == []
 
 
 def test_injected_ready_publish_path_allows_200_with_the_same_result(api, monkeypatch):  # noqa: F811
     task = submitted(api["db"])
-    assert post(api, error_body(task, code="someNewCode", cost=0.015)).status_code == 503
+    assert (
+        post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE, cost=0.015)).status_code == 503
+    )
     paths = ReadyPaths(NextStep.PUBLISH_RESULT)
     connect(monkeypatch, paths)  # 이후 14·15단계가 연결된 상황
-    response = post(api, error_body(task, code="someNewCode", cost=0.015))
+    response = post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE, cost=0.015))
     assert response.status_code == 200 and response.json()["code"] == "WEBHOOK_PROCESSED"
     assert response.json()["data"]["results"][0]["outcome"] == "duplicate"
     assert paths.asked == [NextStep.PUBLISH_RESULT]
@@ -167,16 +170,20 @@ def test_default_assembly_never_reports_a_publish_or_recovery_path(api, monkeypa
         "https://sqs.ap-northeast-2.amazonaws.com/123456789012/be-fitting-response",
     )
     task = submitted(api["db"])
-    assert post(api, error_body(task, code="someNewCode")).status_code == 503
+    assert post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE)).status_code == 503
     assert settings.VIRTUAL_FITTING_REQUEST_WORKER_ENABLED is False
 
 
 def test_duplicate_after_the_result_was_published_is_200(api):  # noqa: F811
     task = submitted(api["db"])
-    post(api, error_body(task, code="someNewCode"))
+    post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE))
     mark_published(api)
     published = snapshot(api)
-    for body in (error_body(task, code="someNewCode"), success_body(task), error_body(task)):
+    for body in (
+        error_body(task, code=GENERATION_FAILED_TEST_CODE),
+        success_body(task),
+        error_body(task),
+    ):
         response = post(api, body)
         assert response.status_code == 200
         assert response.json()["data"]["results"][0]["outcome"] == "ignored"
@@ -185,7 +192,7 @@ def test_duplicate_after_the_result_was_published_is_200(api):  # noqa: F811
 
 def test_late_success_on_a_job_waiting_to_publish_is_not_answered_as_done(api):  # noqa: F811
     task = submitted(api["db"])
-    post(api, error_body(task, code="someNewCode"))
+    post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE))
     response = post(api, success_body(task))  # 상충하는 늦은 성공 알림
     assert response.status_code == 503
     assert response.json()["data"]["results"][0]["outcome"] == "ignored"
@@ -239,7 +246,7 @@ def test_runware_auth_error_does_not_touch_another_jobs_slot(api):  # noqa: F811
 
 def test_runware_auth_error_keeps_an_existing_result(api):  # noqa: F811
     task = submitted(api["db"])
-    post(api, error_body(task, code="someNewCode"))
+    post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE))
     saved = snapshot(api)
     response = post(api, error_body(task, code="invalidApiKey"))
     # 늦은 인증 오류는 무시하고 기존 결과를 보존한다. 결과 발행 경로가 없으므로 여전히 503.
@@ -250,7 +257,7 @@ def test_runware_auth_error_keeps_an_existing_result(api):  # noqa: F811
 
 def test_runware_auth_error_after_publish_is_200_and_preserved(api):  # noqa: F811
     task = submitted(api["db"])
-    post(api, error_body(task, code="someNewCode"))
+    post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE))
     mark_published(api)
     published = snapshot(api)
     response = post(api, error_body(task, code="invalidApiKey"))
@@ -301,7 +308,9 @@ def test_webhook_token_failure_with_an_auth_error_body_is_still_401(api):  # noq
 # --- 3. 코드별 매핑 (실제 Router, 기본 조립 = 경로 미준비) ---
 
 # 근거: "doc" = Runware 공식 오류 문서에 이름이 나오는 코드, "assumed" = 문서·실제 계정에서 확인하지 못한 가정
-# 코드(잔액·입력 오류의 Webhook 코드명은 문서에 없다. 가정 코드에 근거 없는 매핑을 추가하지 않는다), "unknown".
+# 코드(잔액·입력 오류의 Webhook 코드명은 문서에 없다. 가정 코드에 근거 없는 매핑을 추가하지 않는다), "unknown",
+# "test" = 확정 생성 실패로 등록한 테스트 전용 코드(근거가 확인된 코드가 생긴 경우의 경로).
+# 2-1 보완: 생성 실패 근거가 없는 코드(확실한 미접수·근거 부족)는 더 이상 FITTING_MODEL_FAILED 로 저장하지 않는다.
 CODES = [
     ("timeoutProvider", "doc"),
     ("providerRateLimitExceeded", "doc"),
@@ -310,6 +319,7 @@ CODES = [
     ("insufficientCredits", "assumed"),
     ("invalidReferenceImage", "assumed"),
     ("someNewCode", "unknown"),
+    (GENERATION_FAILED_TEST_CODE, "test"),
 ]
 
 
@@ -332,9 +342,17 @@ def test_failure_code_mapping_through_the_router(api, code, basis):  # noqa: F81
     elif code in AUTH_ERROR_CODES:
         expected = (503, AsyncJobStatus.WAITING_PRUNA, None, None)
         assert observed == (*expected, [])
-    else:
+    elif code == GENERATION_FAILED_TEST_CODE:
         expected = (503, AsyncJobStatus.WAITING_PRUNA, NextAction.PUBLISH_RESULT, FAILED_RESULT)
         assert observed == (*expected, [])
+    else:
+        # 확실한 미접수(serviceOverloaded)·근거 부족(providerRateLimitExceeded·가정·알 수 없는 코드): 상태·결과·자리를
+        # 그대로 두고 Watchdog 조회·운영 확인에 맡긴다(자동 재요청은 아직 연결 안 됨).
+        assert observed == (200, AsyncJobStatus.WAITING_PRUNA, None, None, [])
+        # 2-2 보완: 이 작업은 접수가 기록돼 있어 미접수 코드는 모순(ignored, 재요청 없음)이다.
+        outcome = "ignored" if code == "serviceOverloaded" else "unresolved"
+        assert response.json()["data"]["results"][0]["outcome"] == outcome
+        assert in_flight(api["db"]) == [(JOB, task)]
     assert state["fallback_attempt_count"] == 0  # 실제 fallback 호출은 없음
 
 
@@ -350,7 +368,7 @@ def test_classification_reads_only_the_code_field(api):  # noqa: F811
     task = submitted(api["db"])
     body = error_body(
         task,
-        code="someNewCode",
+        code=GENERATION_FAILED_TEST_CODE,
         message="Your account balance is insufficient",
         parameter="balance",
         retryAfter=30,
@@ -359,6 +377,11 @@ def test_classification_reads_only_the_code_field(api):  # noqa: F811
     response = post(api, body)
     assert response.status_code == 503
     assert job(api["db"]).result_payload["error_code"] == "FITTING_MODEL_FAILED"
+    # 알 수 없는 코드는 같은 문구가 있어도 잔액·생성 실패로 보지 않는다(근거 부족, 상태 그대로).
+    other = submitted(api["db"], 7)
+    response = post(api, error_body(other, code="someNewCode", message="balance is insufficient"))
+    assert response.status_code == 200
+    assert job(api["db"], 7).result_payload is None and job(api["db"], 7).next_action is None
 
 
 def test_no_unverified_balance_mapping_was_added():

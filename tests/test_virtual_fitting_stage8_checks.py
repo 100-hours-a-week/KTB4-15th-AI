@@ -268,7 +268,8 @@ def test_worker_gives_up_after_its_own_wait_budget_without_changing_the_shared_w
 def test_http_retry_after_header_is_used_when_the_body_has_none():
     result = submit_real_provider(http_429(**{"Retry-After": "120"}))
     assert result.outcome is SubmissionOutcome.UNKNOWN
-    assert result.retry_after == 120 and result.retryable
+    # 2-1 보완: 대기 안내·429 만으로는 재요청 가능(확실한 미접수)으로 보지 않는다. 안내는 공유 대기에만 쓴다.
+    assert result.retry_after == 120 and not result.retryable
 
 
 def test_header_only_guidance_without_an_error_body_is_used():
@@ -314,8 +315,8 @@ def test_invalid_values_are_not_used_as_guidance(bad_body, bad_header):
         429, body.encode(), TASK, retry_after_header=headers.get("Retry-After")
     )
     assert result.retry_after is None and not result.retry_after_unrepresentable
-    # 429 자체는 여전히 다시 보내도 될 수 있는 응답이다(자동 재시도는 하지 않음)
-    assert result.retryable
+    # 2-1 보완: 429 자체는 미접수 근거가 아니다(접수 불명확, 자동 재시도도 하지 않음)
+    assert not result.retryable
 
 
 def test_invalid_body_value_does_not_hide_a_valid_header():
@@ -443,7 +444,9 @@ def test_unrepresentable_guidance_is_reported_not_dropped(body, header):
     headers = {} if header is None else {"Retry-After": header}
     result = submit_real_provider(http_429(body, **headers))
     assert result.retry_after is None and result.retry_after_unrepresentable
-    assert result.retryable and result.outcome is SubmissionOutcome.UNKNOWN
+    assert (
+        not result.retryable and result.outcome is SubmissionOutcome.UNKNOWN
+    )  # 2-1 보완: 429 는 근거 아님
 
 
 def test_infinity_literal_is_invalid_not_unrepresentable():

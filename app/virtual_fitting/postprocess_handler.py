@@ -1,31 +1,3 @@
-"""가상피팅 V2 POSTPROCESS 핸들러 (11단계): 결과 이미지 S3 확인 → 제목·코멘트 생성 → V2 결과 저장.
-
-10단계 후처리 Worker 가 실행 권한(token)을 확보한 뒤 POSTPROCESSING / POSTPROCESS 작업의 최신 기록으로 부른다.
-DB 변경은 모두 5단계의 토큰 검증 메서드로 한다(외부 호출 중에는 트랜잭션·행 잠금을 잡지 않는다). 새 외부 호출(S3 HEAD,
-Presigned 발급 뒤 LLM 호출, 저장) 직전마다 context.may_continue() 로 종료·연장 실패를 확인한다.
-
-1. S3 확인 (verified_image_key 가 없을 때만)
-   - 이미지 위치는 DB 의 async_image_key 다(Webhook imageURL·사용자 원본 사진을 쓰지 않음). 내려받지 않고 HEAD 만 한다.
-   - 한 묶음 = 시작 후 0·2·7초 시점 HEAD(대기 2초 → 5초). 성공하면 남은 HEAD 는 생략한다.
-   - 묶음 시작 직전에 claim_s3_check_attempt 로 횟수를 확보한다(최초 포함 최대 2묶음, 되돌리지 않음).
-   - EXISTS → record_image_verified(저장이 확인돼야 다음 단계). NOT_FOUND·일시 오류 → 같은 묶음의 다음 HEAD.
-   - ACCESS_DENIED·ERROR(권한·설정) → 묶음을 멈추고 운영 확인으로 보류한다(V1 fallback 하지 않음).
-   - 이 핸들러가 두 번째 묶음을 현재 lease 로 끝까지 돌렸고 마지막 HEAD 가 NOT_FOUND 일 때만 move_to_fallback.
-     마지막이 일시 오류면 객체가 없다고 단정하지 않고 보류한다.
-   - 횟수를 이미 다 썼는데(이전 Worker 가 두 번째 묶음 도중 멈췄을 수 있음) 확인 결과를 모르면 보류한다(15단계 복구 대상).
-2. 코멘트·제목 (확인한 이미지로만, S3 확인으로 되돌아가지 않음) — title_and_comment
-   - V1 RunwareCommentProvider 를 쓴다(호출 1번 = HTTP 1번, 내부 재시도 없음). 재시도는 이 함수 한 곳에서만 한다.
-   - 코멘트: 최초 1회 + 재시도 1회. 두 번 모두 실패하면 제목은 부르지 않고 기본 코멘트 + 기본 제목.
-   - 제목: 성공한 코멘트로 최초 1회 + 재시도 1회(재시도에도 같은 코멘트). 두 번 모두 실패하면 생성 코멘트 + 기본 제목.
-     앞뒤 공백 제거 후 1~100자만 통과(초과는 실패, 잘라서 저장하지 않음).
-   - 호출마다: 최신 기록·상태·실행 권한 확인 → (코멘트만) 확인한 Key 로 새 Presigned GET → claim_llm_generation_attempt
-     (호출 1번 = 1, 최대 코멘트 2 + 제목 2 = 4, 되돌리지 않음)로 원자적으로 횟수 확보 → 호출. 서명 실패는 S3 오류로 보류하고
-     횟수를 쓰지 않는다. 종료·실행 권한 상실·상태 변경은 보류(기본 문구로 성공 처리하지 않음), DB 오류는 그대로 올린다.
-3. 저장: save_final_result 로 COMPLETED 결과(result_image_key = 확인한 이미지 Key)와 PUBLISH_RESULT 를 함께 저장한다.
-   이미 결과가 있으면 덮어쓰지 않는다. 결과 발행·최종 상태 확정(14단계)은 하지 않는다.
-LLM 이 실패해도 이미지 생성 성공은 유지한다(기본 문구로 COMPLETED, fallback·Pruna 재생성 없음).
-"""
-
 import logging
 import time
 from collections.abc import Callable, Sequence
@@ -86,11 +58,14 @@ class PostprocessHandler:
         sleep: Callable[[float], None] = time.sleep,
         offsets: Sequence[float] = S3_CHECK_OFFSETS,
         result_url_expires_seconds: int | None = None,
+        store_result: Callable[..., Any] | None = None,
     ) -> None:
         self._given = (jobs, state, products, storage, comments)
         self._deps: _Deps | None = None
         self._clock, self._sleep, self._offsets = clock, sleep, tuple(offsets)
         self._expires = result_url_expires_seconds
+        # AI 저장 작업의 결과 저장(기본 store_runware_result_image). 처음 쓸 때 가져온다.
+        self._store_result = store_result
 
     # --- 의존성 ---
 
@@ -130,7 +105,10 @@ class PostprocessHandler:
             return HandlerResult(HandlerStatus.DONE, "result_already_saved")
         verified = job.verified_image_key
         if verified is None:
-            verified, stop = self._verify_image(deps, job, token, context)
+            if job.ai_stores_result:
+                verified, stop = self._store_image(deps, job, token, context)
+            else:
+                verified, stop = self._verify_image(deps, job, token, context)
             if stop is not None:
                 return stop
         title, comment, stop = title_and_comment(
@@ -147,6 +125,59 @@ class PostprocessHandler:
         if not context.may_continue():
             return HandlerResult(HandlerStatus.DEFERRED, "stopped_before_save")
         return save_completed(deps.state, job_id, token, verified, title, comment)
+
+    # --- 1'. AI 저장 작업: 결과 다운로드·저장 ---
+
+    def _store_image(self, deps, job, token, context) -> tuple[str | None, HandlerResult | None]:
+        from app.virtual_fitting.result_image import ResultImageError, store_runware_result_image
+
+        job_id, key = job.fitting_job_id, job.async_image_key
+        if key is None:
+            logger.error("postprocess job has no async_image_key fitting_job_id=%s", job_id)
+            return None, HandlerResult(HandlerStatus.DEFERRED, "no_async_image_key")
+        if job.runware_image_url is None:
+            # 다운로드할 URL 이 없다. 있다고 가정하지 않고, Watchdog 의 같은 task 조회(참조 복구)를 기다린다.
+            logger.warning(
+                "postprocess result url missing fitting_job_id=%s; waiting for reference recovery",
+                job_id,
+            )
+            return None, HandlerResult(HandlerStatus.DEFERRED, "result_url_missing")
+        if not context.may_continue():
+            return None, HandlerResult(HandlerStatus.DEFERRED, "stopped_before_result_store")
+        store = self._store_result or store_runware_result_image
+        try:
+            stored = store(
+                deps.storage,
+                fitting_job_id=job_id,
+                task_uuid=job.task_uuid,
+                image_url=job.runware_image_url,
+                result_key=key,
+            )
+        except ResultImageError as error:
+            # 생성 실패가 아니다. fallback·FAILED 로 넘기지 않고 메시지를 남긴다(재수신·Watchdog 이 이어 감).
+            log = logger.warning if error.retryable else logger.error
+            log(
+                "postprocess result store deferred fitting_job_id=%s reason=%s retryable=%s "
+                "http_status=%s",
+                job_id,
+                error.reason,
+                error.retryable,
+                error.http_status,
+            )
+            return None, HandlerResult(HandlerStatus.DEFERRED, f"result_store_{error.reason}")
+        except ValueError:
+            # 이 작업의 예정 WebP Key·URL 이 아니다(기록 이상). 운영 확인 대상이며 다른 Key 로 저장하지 않는다.
+            logger.error("postprocess result store input rejected fitting_job_id=%s", job_id)
+            return None, HandlerResult(HandlerStatus.DEFERRED, "result_store_invalid_input")
+        if not context.may_continue():
+            # 저장은 끝났을 수 있지만 실행 권한을 잃었다. 기록하지 않는다(다음 실행이 같은 객체를 확인해 재사용).
+            return None, HandlerResult(HandlerStatus.DEFERRED, "stopped_before_verify_save")
+        recorded = deps.state.record_image_verified(job_id, token, stored.key)
+        if recorded.applied:
+            return stored.key, None
+        if recorded.reason is ChangeReason.ALREADY_RECORDED and recorded.job is not None:
+            return recorded.job.verified_image_key, None
+        return None, HandlerResult(HandlerStatus.DEFERRED, f"verify_save_{recorded.reason.value}")
 
     # --- 1. S3 확인 ---
 

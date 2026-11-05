@@ -140,6 +140,30 @@ def connected_postprocess_handlers() -> PostprocessHandlers:
     return PostprocessHandlers(postprocess=PostprocessHandler(), run_fallback=RunFallbackHandler())
 
 
+# --- 실행 중인 후처리 Worker (인계 판단용) ---
+
+_registered: Any = None
+
+
+def register_postprocess_worker(worker: Any) -> None:
+    """lifespan 이 시작한 후처리 Worker 를 등록한다(종료 때 None). 요청 메시지의 POSTPROCESS 인계 판단이 실제 실행 여부를 본다."""
+    global _registered
+    _registered = worker
+
+
+def postprocess_worker_running() -> bool:
+    """등록된 후처리 Worker 가 지금 ai-fitting-response 를 소비하고 있다(실행 중, 비정상 종료·종료 요청 아님)."""
+    worker = _registered
+    status = getattr(worker, "status", None)
+    return (
+        worker is not None
+        and status is not None
+        and bool(status.running)
+        and not status.crashed
+        and not getattr(worker, "stopping", False)
+    )
+
+
 # --- 메시지 하나 처리 ---
 
 

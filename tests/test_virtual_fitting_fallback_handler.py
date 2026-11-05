@@ -209,8 +209,11 @@ def failed(code, message):
 # --- 정상 ---
 
 
-def test_fallback_generates_once_stores_fixed_key_and_saves_the_result(db):  # noqa: F811
+@pytest.mark.parametrize("input_extension", ["jpg", "png", "webp"])
+def test_fallback_generates_once_stores_fixed_key_and_saves_the_result(db, input_extension):  # noqa: F811
     async_task = fallback_job(db)
+    input_key = f"users/123/body.{input_extension}"
+    db["sql"]("UPDATE virtual_fitting_async_jobs SET user_image_key = %s WHERE fitting_job_id = %s", (input_key, JOB))
     e = env(db, success(0.015))
     outcome = run(db, e)
     current = job(db)
@@ -221,7 +224,7 @@ def test_fallback_generates_once_stores_fixed_key_and_saves_the_result(db):  # n
     assert request[0]["deliveryMethod"] == "sync"
     person = request[0]["inputs"]["referenceImages"][0]
     assert person["role"] == "person" and person["image"].startswith(
-        "https://bucket.s3.ap-northeast-2.amazonaws.com/users/"
+        f"https://bucket.s3.ap-northeast-2.amazonaws.com/{input_key}?"
     )
     assert (
         current.task_uuid == async_task and current.async_image_key == ASYNC_KEY

@@ -266,8 +266,8 @@ def warmup_image_bytes() -> bytes:
 
 
 def warm_up(models) -> dict[str, float]:
-    """요청과 같은 전처리·검출·rembg·PNG 단계를 한 번씩 돌린다. 모델만 쓰고 S3·service 는 쓰지 않는다."""
-    from app.body_image_validation.background import encode_png
+    """요청과 같은 전처리·검출·rembg·WebP 단계를 한 번씩 돌린다. 모델만 쓰고 S3·service 는 쓰지 않는다."""
+    from app.body_image_validation.background import encode_webp
     from app.body_image_validation.detectors import DetectionImage
     from app.body_image_validation.image_io import load_image, open_image
 
@@ -296,8 +296,8 @@ def warm_up(models) -> dict[str, float]:
         try:
             timings["rembg"] = (time.perf_counter() - start) * 1000
             start = time.perf_counter()
-            encode_png(result)
-            timings["png"] = (time.perf_counter() - start) * 1000
+            encode_webp(result)
+            timings["webp"] = (time.perf_counter() - start) * 1000
         finally:
             result.close()
     finally:

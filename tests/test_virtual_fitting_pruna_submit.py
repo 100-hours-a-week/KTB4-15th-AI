@@ -514,13 +514,24 @@ class FakeProvider:
     def __init__(self, outcome=SubmissionOutcome.ACCEPTED, during=None, **fields):
         self.outcome, self.during, self.fields, self.calls = outcome, during, fields, []
 
-    def submit(self, fitting_input, *, task_uuid, webhook_url, upload_endpoint):
+    def submit(
+        self,
+        fitting_input,
+        *,
+        task_uuid,
+        webhook_url,
+        upload_endpoint,
+        output_format,
+        ai_stores_result=False,
+    ):
         self.calls.append(
             {
                 "input": fitting_input,
                 "task": task_uuid,
                 "webhook": webhook_url,
                 "upload": upload_endpoint,
+                "output_format": output_format,
+                "ai_stores_result": ai_stores_result,
             }
         )
         if self.during:
@@ -588,7 +599,11 @@ def job(db, job_id=JOB):
     return db["jobs"].find_by_fitting_job_id(job_id)
 
 
-def test_accepted_submission_order_and_records(db):
+def test_accepted_submission_order_and_records(db, monkeypatch):
+    # 이전 계약 검증: 전환 전 코드가 준비한 기존 직접 업로드 작업(ai_stores_result=False)
+    from tests.v2_integration_harness import prepared_by_previous_version
+
+    prepared_by_previous_version(monkeypatch, JOB)
     seen = {}
 
     def during(task):
@@ -610,8 +625,9 @@ def test_accepted_submission_order_and_records(db):
     (call,) = provider.calls
     # task_uuid·Key·호출 시작 기록은 전송 전에 DB 에 있었다.
     assert seen["task"] == call["task"] and seen["started"] is not None and seen["result"] is None
-    assert seen["key"] == f"virtual-fitting/results/{JOB}/pruna-async.jpg"
+    assert seen["key"] == f"virtual-fitting/results/{JOB}/pruna-async.webp"
     assert seen["in_flight"] == (1, 1)
+    assert call["output_format"] == "WEBP"
     assert call["webhook"] == WEBHOOK and "PUTSIG" in call["upload"]
     assert "GETSIG" in call["input"].person_image_url
     assert call["input"].garment_image_urls == [TOP.image_url, BOTTOM.image_url]
@@ -641,25 +657,43 @@ def test_balance_exhausted_rejection_saves_failure_without_fallback(db):
     assert counts(db) == (0, 0)
 
 
-def test_retryable_rejection_moves_to_fallback_and_frees_the_slot(db):
+# 2-1 보완: 예전에는 retryable 거절을 fallback 으로, 그 밖의 4xx 를 FITTING_MODEL_FAILED 로 넘겼다. 확실한 미접수는
+# 생성 실패가 아니고(재요청 후보, 자동 재요청은 아직 연결 안 됨) 의미가 불명확한 4xx 는 운영 확인으로 보류한다.
+
+
+def test_not_accepted_rejection_is_held_without_fallback_failure_or_resend(db):
     provider = FakeProvider(
-        SubmissionOutcome.REJECTED, reason="error_response", retryable=True, http_status=200
+        SubmissionOutcome.REJECTED,
+        reason="not_accepted",
+        retryable=True,
+        http_status=503,
+        error_codes=("serviceOverloaded",),
     )
     processor, _ = build(db, provider, follow_up=Ready(NextStep.RUN_FALLBACK))
-    assert processor.process(valid_message()).delete is True
+    first = processor.process(valid_message())
     after = job(db)
-    assert (after.status, after.next_action) == (
-        AsyncJobStatus.FALLBACK_RUNNING,
-        NextAction.RUN_FALLBACK,
+    assert (after.status, after.next_action, after.result_payload) == (
+        AsyncJobStatus.RECEIVED,
+        NextAction.SUBMIT_PRUNA,
+        None,
     )
-    assert counts(db) == (0, 0)
+    assert after.fallback_attempt_count == 0 and after.pruna_submit_started_at is not None
+    assert counts(db) == (0, 0)  # 처리되지 않은 task 의 자리만 놓는다
+    assert first.delete is False  # 이어 갈 경로(재요청)가 없으므로 메시지를 지우지 않는다
+    db["sql"](
+        "UPDATE virtual_fitting_async_jobs SET worker_lease_until = now() - interval '1 second'"
+    )
+    processor.process(valid_message(message_id="m-2", receive_count=2))
+    assert len(provider.calls) == 1 and job(db).task_uuid == after.task_uuid  # 재전송·새 task 없음
 
 
-def test_plain_rejection_is_a_model_failure(db):
+def test_plain_rejection_is_held_not_a_model_failure(db):
     provider = FakeProvider(SubmissionOutcome.REJECTED, reason="client_error", http_status=400)
     processor, _ = build(db, provider)
     processor.process(valid_message())
-    assert job(db).result_payload["error_code"] == "FITTING_MODEL_FAILED"
+    after = job(db)
+    assert after.result_payload is None and after.next_action is NextAction.SUBMIT_PRUNA
+    assert after.pruna_submit_started_at is not None and after.fallback_attempt_count == 0
 
 
 def test_auth_rejection_is_not_a_user_failure_and_is_not_resent(db):

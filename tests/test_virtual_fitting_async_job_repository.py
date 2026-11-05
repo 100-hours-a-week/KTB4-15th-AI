@@ -1,11 +1,3 @@
-"""가상피팅 V2 비동기 작업 테이블과 Repository.
-
-앞부분은 DB 없이 입력 검증과 SQL 모양만 본다. 뒷부분은 실제 PostgreSQL 에서 마이그레이션을 적용해
-제약조건·JSONB·timestamptz·트랜잭션을 확인한다. pytest 는 .env 를 읽지 않는다.
-    TEST_DATABASE_URL=postgresql://... (없거나 연결할 수 없으면 PostgreSQL 테스트는 건너뛴다)
-테스트마다 고유한 schema 를 만들어 그 안에만 테이블을 만들고 끝나면 지운다. 다른 테이블은 건드리지 않는다.
-"""
-
 import os
 import re
 import uuid
@@ -35,6 +27,9 @@ MIGRATION = (
 # 13단계 변경 SQL(fallback 진행 기록 컬럼). 신규 생성 SQL 뒤에 적용한다(배포 순서와 같음).
 FALLBACK_MIGRATION = MIGRATION.with_name("virtual_fitting_fallback.sql")
 AUTH_HOLD_MIGRATION = MIGRATION.with_name("virtual_fitting_auth_hold.sql")
+IMAGE_REF_MIGRATION = MIGRATION.with_name("virtual_fitting_runware_image_ref.sql")
+AI_RESULT_MIGRATION = MIGRATION.with_name("virtual_fitting_ai_result_storage.sql")
+PRUNA_RETRY_MIGRATION = MIGRATION.with_name("virtual_fitting_pruna_retry.sql")
 KST = timezone(timedelta(hours=9))
 REQUESTED_AT = datetime(2026, 10, 13, 9, 30, tzinfo=KST)  # = 2026-10-13 00:30 UTC
 TASK_UUID = "a770f077-f413-47de-9dac-be0b26a35da6"
@@ -129,7 +124,13 @@ def _migration_columns():
     ]
     added = [
         column
-        for migration in (FALLBACK_MIGRATION, AUTH_HOLD_MIGRATION)
+        for migration in (
+            FALLBACK_MIGRATION,
+            AUTH_HOLD_MIGRATION,
+            IMAGE_REF_MIGRATION,
+            AI_RESULT_MIGRATION,
+            PRUNA_RETRY_MIGRATION,
+        )
         for column in re.findall(
             r"ADD COLUMN IF NOT EXISTS ([a-z0-9_]+)\s", migration.read_text(encoding="utf-8")
         )
@@ -164,6 +165,9 @@ def pg():
         connection.execute(MIGRATION.read_text(encoding="utf-8"))
         connection.execute(FALLBACK_MIGRATION.read_text(encoding="utf-8"))
         connection.execute(AUTH_HOLD_MIGRATION.read_text(encoding="utf-8"))
+        connection.execute(IMAGE_REF_MIGRATION.read_text(encoding="utf-8"))
+        connection.execute(AI_RESULT_MIGRATION.read_text(encoding="utf-8"))
+        connection.execute(PRUNA_RETRY_MIGRATION.read_text(encoding="utf-8"))
     pool = ConnectionPool(url, min_size=1, max_size=2, kwargs={"options": options}, open=True)
 
     def sql(statement, params=None):
@@ -560,6 +564,11 @@ EXPECTED_COLUMNS = {
     "auth_hold_task_uuid": ("uuid", "YES"),
     "auth_hold_reason": ("text", "YES"),
     "auth_hold_at": ("timestamp with time zone", "YES"),
+    "runware_image_url": ("text", "YES"),
+    "runware_image_uuid": ("uuid", "YES"),
+    "ai_stores_result": ("boolean", "NO"),
+    "pruna_not_accepted_at": ("timestamp with time zone", "YES"),
+    "pruna_retry_at": ("timestamp with time zone", "YES"),
 }
 
 
@@ -595,4 +604,7 @@ def test_migration_can_run_again(pg):
         connection.execute(MIGRATION.read_text(encoding="utf-8"))
         connection.execute(FALLBACK_MIGRATION.read_text(encoding="utf-8"))
         connection.execute(AUTH_HOLD_MIGRATION.read_text(encoding="utf-8"))
+        connection.execute(IMAGE_REF_MIGRATION.read_text(encoding="utf-8"))
+        connection.execute(AI_RESULT_MIGRATION.read_text(encoding="utf-8"))
+        connection.execute(PRUNA_RETRY_MIGRATION.read_text(encoding="utf-8"))
     assert pg["sql"]("SELECT count(*) FROM virtual_fitting_async_jobs") == [(1,)]

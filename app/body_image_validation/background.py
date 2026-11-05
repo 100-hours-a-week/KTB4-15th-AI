@@ -119,9 +119,10 @@ def summarize_ort_profile(path: str) -> list[dict]:
     return runs
 
 
-def encode_png(image: Image.Image) -> bytes:
-    # 압축 수준만 Pillow 기본값(6) 대신 4 로 둔다. 픽셀은 그대로이고, 대표 이미지(RGBA 1069x1600)
-    # 측정에서 encode 가 약 50ms(-36%) 빨라지고 파일은 4.4% 커졌다. optimize 는 기본값(False) 그대로다.
+def encode_webp(image: Image.Image) -> bytes:
     output = BytesIO()
-    image.save(output, format="PNG", compress_level=4)
+    image.save(
+        output, format="WEBP", lossless=False, quality=90, method=4,
+        alpha_quality=100, exact=True,
+    )
     return output.getvalue()

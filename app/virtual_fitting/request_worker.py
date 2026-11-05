@@ -589,8 +589,13 @@ class RequestProcessor:
                     error_code=check.error_code,
                     change=saved.reason.value,
                 )
-                # 결과 발행(14단계)이 아직 없다. 저장만으로 삭제하지 않는다.
-                return outcome(f"failure_saved_{check.error_code}")
+                # 저장만으로 지우지 않는다. 다른 단계와 같은 판단(최신 기록 + 결과 전송 루프가 실제로 이어 갈 수 있는지).
+                return outcome(
+                    f"failure_saved_{check.error_code}",
+                    delete=deletion_allowed(
+                        self._jobs.find_by_fitting_job_id(job_id), self._follow_up
+                    ),
+                )
             if self._submit is None:
                 # submit 이 연결되지 않은 조립(테스트 등). 제출·삭제하지 않는다. 실제 Worker 는 PrunaSubmitter 를 쓴다.
                 return outcome("prechecked_awaiting_submit")
@@ -893,14 +898,20 @@ def _verified_ids(item: Any) -> dict[str, Any]:
         return {}
 
 
-def create_request_worker() -> RequestWorker:
-    """실제 의존성으로 조립한다(blocking: DB pool·boto3 client). lifespan 이 thread 에서 부른다."""
+def _pruna_submit_parts(
+    *,
+    sqs: Any,
+    follow_up: Any,
+    should_stop: Callable[[], bool],
+    max_wait_seconds: float | None = None,
+) -> tuple[Any, Any, Any, Any]:
+    """요청 Worker 와 Watchdog 재요청이 같이 쓰는 사전 확인·Submitter 조립(같은 설정·같은 제한). (jobs, state, precheck,
+    submitter). Webhook URL 의 token 이 이 서버의 검증값과 다르면 ValueError(모든 완료 알림이 401 이 되므로 시작 전에 멈춘다)."""
     from datetime import timedelta
 
     from app.clients.s3 import S3ImageStorage
     from app.config import settings
     from app.config.database import get_connection_pool
-    from app.virtual_fitting.async_request import receive_fitting_requests
     from app.virtual_fitting.budget import FittingBudget
     from app.virtual_fitting.providers.runware_async import (
         DEFAULT_SUBMIT_TIMEOUT,
@@ -917,7 +928,6 @@ def create_request_worker() -> RequestWorker:
     from app.virtual_fitting.repositories.usage_repository import UsageRepository
     from app.virtual_fitting.runware_webhook import webhook_url_matches_token
 
-    # Runware 에 넘길 Webhook URL 의 token 이 이 서버의 검증값과 다르면 모든 완료 알림이 401 이 된다. 시작 전에 멈춘다.
     if not webhook_url_matches_token(
         settings.VIRTUAL_FITTING_RUNWARE_WEBHOOK_URL, settings.WEBHOOK_TOKEN
     ):
@@ -925,12 +935,7 @@ def create_request_worker() -> RequestWorker:
             "VIRTUAL_FITTING_RUNWARE_WEBHOOK_URL 이 https://<host>/api/v2/webhooks/runware?token=<WEBHOOK_TOKEN> "
             "형식이 아니거나 token 이 WEBHOOK_TOKEN 과 다릅니다."
         )
-    from app.virtual_fitting.watchdog import follow_up_paths
-
-    # 실제로 도는 경로만 준비됐다고 본다: 결과 발행(14단계 결과 전송 루프) + 접수 대기·접수 불명확 확인(15단계 Watchdog).
-    follow_up = follow_up_paths()
     pool = get_connection_pool()
-    sqs = SqsQueueClient()
     storage = S3ImageStorage()
     budget = FittingBudget(
         UsageRepository(pool),
@@ -941,9 +946,7 @@ def create_request_worker() -> RequestWorker:
     balance = MinimumBalanceCheck(RunwareBalanceClient(), settings.FITTING_MIN_BALANCE_USD)
     precheck = RequestPrecheck(ProductRepository(pool), storage, budget, balance)
     jobs, state = AsyncJobRepository(pool), AsyncJobStateRepository(pool)
-    worker: RequestWorker
-    # 기본 NoFollowUpPaths 를 쓴다. Webhook(9단계)은 구현됐지만 Webhook 이 오지 않을 때의 복구(Watchdog 15단계)와
-    # 후처리(10~11단계)·결과 발행(14단계)이 없어, 접수 뒤 요청 메시지를 지워도 되는 경로는 아직 없다.
+    extra = {} if max_wait_seconds is None else {"max_wait_seconds": max_wait_seconds}
     submitter = PrunaSubmitter(
         jobs=jobs,
         state=state,
@@ -961,8 +964,46 @@ def create_request_worker() -> RequestWorker:
         webhook_url=settings.VIRTUAL_FITTING_RUNWARE_WEBHOOK_URL,
         follow_up=follow_up,
         follow_up_queue=sqs,
-        should_stop=lambda: worker.stopping,
+        should_stop=should_stop,
         keepalive_seconds=settings.VIRTUAL_FITTING_REQUEST_LEASE_SECONDS / 3,
+        **extra,
+    )
+    return jobs, state, precheck, submitter
+
+
+def create_pruna_resubmitter(should_stop: Callable[[], bool]) -> Any:
+    """Watchdog 이 쓰는 확실한 미접수 재요청 실행기(blocking 조립). 요청 Worker 와 같은 사전 확인·Submitter 를 쓰되, 공유 제한을
+    기다리지 않는다(max_wait 0: 지금 보낼 수 없으면 다음 점검에서 다시)."""
+    from app.config import settings
+    from app.virtual_fitting.pruna_resubmit import PrunaResubmitter
+    from app.virtual_fitting.watchdog import follow_up_paths
+
+    sqs = SqsQueueClient()
+    jobs, state, precheck, submitter = _pruna_submit_parts(
+        sqs=sqs, follow_up=follow_up_paths(), should_stop=should_stop, max_wait_seconds=0.0
+    )
+    return PrunaResubmitter(
+        jobs=jobs,
+        state=state,
+        precheck=precheck,
+        submit=submitter,
+        lease_seconds=settings.VIRTUAL_FITTING_REQUEST_LEASE_SECONDS,
+        should_stop=should_stop,
+    )
+
+
+def create_request_worker() -> RequestWorker:
+    """실제 의존성으로 조립한다(blocking: DB pool·boto3 client). lifespan 이 thread 에서 부른다."""
+    from app.config import settings
+    from app.virtual_fitting.async_request import receive_fitting_requests
+    from app.virtual_fitting.watchdog import follow_up_paths
+
+    # 실제로 도는 경로만 준비됐다고 본다: 결과 발행(14단계 결과 전송 루프) + 접수 대기·접수 불명확 확인·예약 재요청(Watchdog).
+    follow_up = follow_up_paths()
+    sqs = SqsQueueClient()
+    worker: RequestWorker
+    jobs, state, precheck, submitter = _pruna_submit_parts(
+        sqs=sqs, follow_up=follow_up, should_stop=lambda: worker.stopping
     )
 
     processor = RequestProcessor(
