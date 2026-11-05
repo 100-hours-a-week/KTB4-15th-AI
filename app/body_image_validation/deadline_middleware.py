@@ -64,7 +64,7 @@ class BodyImageDeadlineMiddleware:
         timed_out = True
         call.cancel()
         log_request_before_service(limit, "deadline_exceeded", WORKER_TIMEOUT)
-        logger.error("body image validation failed: %s", WORKER_TIMEOUT)
+        logger.warning("body image validation failed: %s", WORKER_TIMEOUT)
         if not response_started:  # 이미 시작한 응답에는 status 를 다시 보낼 수 없다
             response = error_response(status.HTTP_504_GATEWAY_TIMEOUT, WORKER_TIMEOUT, SYSTEM_FAILURE_MESSAGE)
             await response(scope, receive, send)

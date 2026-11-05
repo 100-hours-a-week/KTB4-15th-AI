@@ -446,7 +446,9 @@ def test_off_validate_never_enters_the_diagnostic_path(real_models, monkeypatch,
     with caplog.at_level(logging.INFO):
         service_for(real_models, diagnostic=False).validate(png())
 
-    assert caplog.text == ""
+    # 요청 요약 한 줄만 남는다(진단 기록·Lock·메모리 없음).
+    [record] = caplog.records
+    assert record.getMessage().startswith("body image validation request: ")
 
 
 def test_timing_line_keeps_its_format_and_the_json_line_repeats_it_with_the_id(real_models, sampler, caplog):
@@ -602,14 +604,16 @@ def test_ai_request_id_is_recorded_as_given_and_is_null_without_one(real_models,
     assert "85c390e8344842ad" not in {traced["request_id"], plain["request_id"]}
 
 
-def test_ai_request_id_changes_nothing_when_diagnostics_are_off(real_models, caplog):
+def test_ai_request_id_reaches_only_the_request_line_when_diagnostics_are_off(real_models, caplog):
     service = service_for(real_models, diagnostic=False)
 
     with caplog.at_level(logging.INFO):
         result = service.validate(jpeg(), "85c390e8344842ad")
 
     assert result.s3_key.startswith("body-images/")
-    assert "85c390e8344842ad" not in caplog.text
+    [record] = caplog.records
+    assert "ai_request_id=85c390e8344842ad outcome=success" in record.getMessage()
+    assert diagnostic_lines(caplog) == []
 
 
 @pytest.mark.parametrize("value", ["85c390e8344842ad", "0" * 16])

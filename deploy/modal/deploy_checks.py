@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 WORKER_FILE = Path(__file__).resolve().parent / "body_image_worker.py"
 DOTENV_FILE = Path(__file__).resolve().parents[2] / ".env"
@@ -105,32 +106,78 @@ def load_worker(stage: str, diagnostics: bool = False, gpu_snapshot: bool = Fals
 
 
 def check_concurrency(module, calls, max_inputs: int) -> list[Check]:
-    """Modal 입력 동시성과 Worker Limiter 가 같은 값으로 등록되는지. 1 이면 둘 다 건드리지 않는다."""
+    """Modal 입력 동시성과 Worker Limiter 가 같은 값으로 등록되는지. 1 이면 둘 다 건드리지 않는다.
+
+    컨테이너는 함수 env 의 입력 수와 Limiter 를 비교해 다르면 멈춘다. 둘 중 하나라도 빠지면 그 비교가 되지 않는다.
+    """
     registered = [options for name, options in calls if name == "concurrent"]
     expected = [{"max_inputs": max_inputs, "target_inputs": max_inputs}] if max_inputs > 1 else []
     function_env = module.STAGE_ENV.get("env", {})
+    wanted = str(max_inputs) if max_inputs > 1 else None
     limiter = function_env.get(WORKER_LIMITER_VAR)
+    inputs = function_env.get(module.MAX_INPUTS_VAR)
     return [
         Check("max inputs", module.MAX_INPUTS == max_inputs, f"MAX_INPUTS={module.MAX_INPUTS!r}"),
         Check("modal concurrency", registered == expected, f"registered={registered!r} expected={expected!r}"),
-        Check("worker limiter env", limiter == (str(max_inputs) if max_inputs > 1 else None),
-              f"{WORKER_LIMITER_VAR}={limiter!r}"),
+        Check("worker limiter env", limiter == wanted, f"{WORKER_LIMITER_VAR}={limiter!r}"),
+        Check("worker max inputs env", inputs == wanted, f"{module.MAX_INPUTS_VAR}={inputs!r}"),
     ]
 
 
-def check_registered(function_info: dict, max_inputs: int) -> list[Check]:
-    """Modal 에 등록된 함수가 기대한 동시성·GPU·컨테이너 상한인지. 읽기만 한다."""
+def check_registered(function_info: dict, max_inputs: int, *, max_containers: int, label: str) -> list[Check]:
+    """Modal 에 등록된 함수가 기대한 동시성·GPU·컨테이너 수·endpoint 인지. 읽기만 한다.
+
+    GPU snapshot 여부와 Worker Limiter 값은 등록 정보에 나오지 않는다. 배포 전에는 preflight 가 배포 파일로,
+    배포 뒤에는 컨테이너가 시작하며(check_worker_concurrency, lifecycle 로그의 max_inputs·limiter) 확인한다.
+    """
     concurrency = function_info.get("concurrency_info") or {}
     expected = {"max_inputs": max_inputs, "target_inputs": max_inputs} if max_inputs > 1 else {}
     registered = {key: concurrency.get(key) for key in expected}
     gpus = [gpu for gpu, _ in function_info.get("gpus") or []]
+    web = (function_info.get("method_details") or {}).get("web") or {}
+    host = urlsplit(web.get("web_url") or "").hostname or ""
     return [
         Check("registered gpu", gpus == [EXPECTED_GPU], f"gpus={function_info.get('gpus')!r}"),
-        Check("registered max containers", function_info.get("max_containers") == 1,
-              f"max_containers={function_info.get('max_containers')!r}"),
+        Check("registered max containers", function_info.get("max_containers") == max_containers,
+              f"max_containers={function_info.get('max_containers')!r} expected={max_containers!r}"),
+        Check("registered min containers", function_info.get("min_containers") in (None, 0),
+              f"min_containers={function_info.get('min_containers')!r}"),
         Check("registered concurrency", registered == expected and (max_inputs > 1 or not concurrency),
               f"concurrency_info={function_info.get('concurrency_info')!r} expected={expected or None!r}"),
+        Check("registered proxy auth", web.get("unauthenticated") is False,
+              f"unauthenticated={web.get('unauthenticated')!r}"),
+        # URL 은 <workspace>[-<environment>]--<label>.modal.run 이다. label 만 본다.
+        Check("registered label", host.split(".")[0].endswith(f"--{label}"), f"host={host!r} label={label!r}"),
     ]
+
+
+def registered_checks(ops, stage: str, workspace: str, max_inputs: int, max_containers: int | None) -> list[Check]:
+    """등록된 함수 설정을 기대값과 비교한다. app·function 정보만 읽고 배포·호출은 하지 않는다.
+
+    production 은 Workspace 가 PRODUCTION_WORKSPACE 여야 하고 max_containers 기대값을 명시해야 한다. staging 은 1 이다.
+    기대값이 정해지지 않으면 Modal 을 조회하지 않는다.
+    """
+    checks = [Check("expected max inputs", max_inputs in (1, 2), f"--max-inputs={max_inputs!r} (1 또는 2)")]
+    if stage == "production":
+        checks.append(Check("production workspace", workspace == PRODUCTION_WORKSPACE,
+                            f"--workspace={workspace!r} (production 은 {PRODUCTION_WORKSPACE!r})"))
+        checks.append(Check("expected max containers", max_containers is not None,
+                            f"--max-containers={max_containers!r} (production 은 필수)"))
+    else:
+        checks.append(Check("expected max containers", max_containers in (None, 1),
+                            f"--max-containers={max_containers!r} (staging 은 1 고정)"))
+        max_containers = 1
+    if not all(check.ok for check in checks):
+        return checks
+    app_name = APP_NAMES[stage]
+    try:
+        functions = ops.app_info(app_name)["functions"]
+        [function] = functions.values()
+        info = ops.function_info(function["id"])
+    except (RuntimeError, KeyError, ValueError) as error:  # 없는 App·함수 수가 다름·JSON 오류
+        return checks + [Check("registered app", False, f"{app_name}: {type(error).__name__}: {str(error)[:200]}")]
+    checks.append(Check("registered app", True, f"{app_name} (workspace={workspace})"))
+    return checks + check_registered(info, max_inputs, max_containers=max_containers, label=LABELS[stage])
 
 
 def check_deploy_config(module, calls, stage: str, gpu_snapshot: bool = False,
@@ -169,9 +216,11 @@ def check_deploy_config(module, calls, stage: str, gpu_snapshot: bool = False,
                   f"image env={baked!r}"),
         ]
     else:
+        # CPU snapshot 은 stage 를 넘기지 않는다. 입력 2 의 동시성 env 만 있을 수 있다(값은 check_concurrency 가 본다).
+        concurrency_vars = {module.MAX_INPUTS_VAR, WORKER_LIMITER_VAR}
         checks += [
             Check("gpu snapshot off", module.STAGE_SNAPSHOT == {}, f"STAGE_SNAPSHOT={module.STAGE_SNAPSHOT!r}"),
-            Check("no stage env", module.STAGE_ENV == {}, f"STAGE_ENV={module.STAGE_ENV!r}"),
+            Check("no stage env", set(function_env) <= concurrency_vars, f"function env={sorted(function_env)}"),
             Check("no image stage env", baked == [], f"image env={baked!r}"),
         ]
     if stage == "staging":
@@ -836,10 +885,12 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--max-containers", type=int,
                              help="production max_containers(배포 시 BODY_IMAGE_WORKER_MAX_CONTAINERS). GPU snapshot 에 필수")
         command.add_argument("--max-inputs", type=int, default=1,
-                             help="컨테이너당 입력·Worker Limiter(배포 시 BODY_IMAGE_WORKER_MAX_INPUTS). 2 는 staging 만")
-    registered_cmd = sub.add_parser("registered")
+                             help="컨테이너당 입력·Worker Limiter(배포 시 BODY_IMAGE_WORKER_MAX_INPUTS). 1 또는 2")
+    registered_cmd = sub.add_parser("registered", help="등록된 함수 설정을 읽기만 해서 기대값과 비교한다")
+    registered_cmd.add_argument("--stage", choices=sorted(APP_NAMES), default="staging")
     registered_cmd.add_argument("--workspace", required=True)
     registered_cmd.add_argument("--max-inputs", type=int, default=1)
+    registered_cmd.add_argument("--max-containers", type=int, help="기대하는 max_containers. production 은 필수")
     smoke_cmd = sub.add_parser("smoke")
     smoke_cmd.add_argument("--workspace", required=True)
     smoke_cmd.add_argument("--image", required=True, type=Path, help="정상 전신사진(JPEG)")
@@ -877,11 +928,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     os.environ["MODAL_PROFILE"] = profile
     ops = ModalOps(profile)
+    if args.command == "registered":
+        checks = registered_checks(ops, args.stage, args.workspace, args.max_inputs, args.max_containers)
+        return 0 if print_checks(checks) else 1
     module, _ = load_worker("staging")
     app_name = module.APP_NAME
-    if args.command == "registered":
-        [function] = ops.app_info(app_name)["functions"].values()
-        return 0 if print_checks(check_registered(ops.function_info(function["id"]), args.max_inputs)) else 1
     report: dict = {"workspace": args.workspace, "profile": profile}
     try:
         report.update(smoke(ops, app_name, load_credentials(args.credentials_file), args.image,
