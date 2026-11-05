@@ -5,14 +5,11 @@ PYTHON_VERSION = "3.10"
 GPU = "L40S"
 TIMEOUT_SECONDS = 600
 
-# CUDA 11.8 빌드 wheel(+cu118)은 PyTorch index 에만 있다. 나머지 의존성은 PyPI 에서 받도록 extra index 로 둔다.
 TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu118"
 TORCH_VERSION = "2.0.1+cu118"
 TORCHVISION_VERSION = "0.15.2+cu118"
 TORCHAUDIO_VERSION = "2.0.2+cu118"
 EXPECTED_CUDA_RUNTIME = "11.8"
-# torch 2.0.1 은 NumPy 1.x 로 빌드됐다. 고정하지 않으면 torchvision 의존성으로 NumPy 2 가 깔려
-# tensor↔ndarray 변환이 깨진다.
 NUMPY_VERSION = "1.24.4"
 
 image = modal.Image.debian_slim(python_version=PYTHON_VERSION).pip_install(
@@ -94,15 +91,15 @@ def check_environment() -> dict:
 
     print("=== Environment Check Passed ===", flush=True)
     return {
-        "python": python_version,
-        "torch": torch.__version__,
-        "torchvision": torchvision.__version__,
-        "cuda_runtime": cuda_runtime,
-        "cuda_available": cuda_available,
-        "gpu_name": properties.name,
-        "gpu_memory_gib": round(memory_gib, 2),
-        "matmul_elapsed_ms": round(elapsed_ms, 2),
-        "matmul_max_abs_diff_vs_cpu": max_abs_diff,
+        "python": str(python_version),
+        "torch": str(torch.__version__),
+        "torchvision": str(torchvision.__version__),
+        "cuda_runtime": str(cuda_runtime),
+        "cuda_available": bool(cuda_available),
+        "gpu_name": str(properties.name),
+        "gpu_memory_gib": float(round(memory_gib, 2)),
+        "matmul_elapsed_ms": float(round(elapsed_ms, 2)),
+        "matmul_max_abs_diff_vs_cpu": float(max_abs_diff),
     }
 
 
