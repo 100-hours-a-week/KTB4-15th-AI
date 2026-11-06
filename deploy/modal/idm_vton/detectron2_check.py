@@ -1,5 +1,7 @@
 import modal
-from dependency_check import image
+from dependency_check import image as base_image
+
+image = base_image.add_local_python_source("dependency_check")
 
 app = modal.App("lookddak-idm-vton-detectron2-check")
 
