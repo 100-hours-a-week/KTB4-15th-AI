@@ -240,12 +240,15 @@ jobs:
   # V2 prod(ECS) 배포. main push와 수동 실행(target: v2, all)에서 실행한다.
   # - Task Definition 설정은 CLOUD 레포 Terraform이 S3 템플릿으로 관리한다.
   #   이 job은 템플릿의 __DIGEST__만 이번 이미지 digest로 바꿔 revision을 등록한다.
+  # V2 prod(ECS) 배포 동결 (2026-11-08): V3(EKS) 전환 준비 중 V2 prod 배포를 멈춘다 (서비스 중인 Task는 유지).
+  # 저장소 변수 V2_PROD_DEPLOY_ENABLED를 두지 않으므로 skipped. 긴급 배포·롤백이 필요하면 변수를 'true'로 만들면 PR 없이 다시 켜진다.
   deploy-v2:
     name: prod-v2-deploy
     needs: build-and-push
     if: >-
       ${{
         always() &&
+        vars.V2_PROD_DEPLOY_ENABLED == 'true' &&
         (
           (github.event_name == 'push' && needs.build-and-push.result == 'success') ||
           (github.event_name == 'workflow_dispatch' && inputs.target != 'v1')
