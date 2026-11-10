@@ -1,14 +1,25 @@
-"""deploy/modal/body_image_worker.py 의 Modal 정의. Modal SDK 가 있을 때만 돈다(원격 호출 없음).
-
-Modal 객체 정의는 import 시점에 검증되므로(asgi_app 은 인자 없는 sync method 여야 하는 등) 모듈을
-불러오는 것만으로 구성 오류를 잡는다. 자원·환경변수·CUDA 버전은 모듈 상수로 확인한다.
-"""
-
 import importlib.util
+import json
+import logging
 import os
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from fastapi.testclient import TestClient
+
+from app.body_image_validation.concurrency import BodyValidationLimiter
+from app.body_image_validation.diagnostics import ExecutionTracker, ResourceSampler, TimedLock
+from app.config import body_image_validation as config
+from tests.test_body_image_worker import (  # noqa: F401 (pytest fixture)
+    FakePersonDetector,
+    FakeRemover,
+    jpeg,
+    post,
+    snapshot_env,
+    worker_env,
+)
 
 pytest.importorskip("modal")
 WORKER_FILE = Path(__file__).resolve().parents[1] / "deploy/modal/body_image_worker.py"
@@ -21,13 +32,14 @@ PREFIX = "BODY_IMAGE_WORKER_"
 
 def _with_env(env, action):
     """셸의 BODY_IMAGE_WORKER_* 를 모두 치우고 env 만 둔 채 action 을 실행한다."""
-    saved = {name: os.environ.pop(name) for name in list(os.environ) if name.startswith(PREFIX)}
+    saved = dict(os.environ)
+    for name in [name for name in os.environ if name.startswith(PREFIX)]:
+        del os.environ[name]
     os.environ.update(env)
     try:
         return action()
     finally:
-        for name in [name for name in os.environ if name.startswith(PREFIX)]:
-            del os.environ[name]
+        os.environ.clear()
         os.environ.update(saved)
 
 
@@ -454,7 +466,7 @@ def test_invalid_diagnostics_value_stops_before_deploy():
 
 
 def test_container_config_does_not_require_deploy_only_settings(module):
-    # 컨테이너: stage 가 없으면(CPU snapshot production 은 함수 env 를 등록하지 않는다) production. 상한·진단은 보지 않는다.
+    # 컨테이너: stage 가 없으면(CPU snapshot production 은 stage 를 넘기지 않는다) production. 상한·진단은 보지 않는다.
     assert module.resolve_deploy_config({}, in_container=True).stage == "production"
     config = module.resolve_deploy_config(
         {"BODY_IMAGE_WORKER_STAGE": "production", "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "true",
@@ -710,3 +722,280 @@ def test_production_gpu_container_import_does_not_require_the_cap():
     loaded = load_as_in_container(**production.STAGE_ENV["env"])
 
     assert loaded["GPU_SNAPSHOT"] is True and loaded["LOCAL_PROJECT_ROOT"] is None
+
+
+# --- 컨테이너당 입력(BODY_IMAGE_WORKER_MAX_INPUTS) ---
+
+
+def load_recording_registration(monkeypatch, **env):
+    """배포 파일을 불러올 때 SDK 가 등록하는 함수 옵션. Modal 에 아무것도 보내지 않는다."""
+    import modal.app as modal_app
+
+    seen = {}
+    original = modal_app._Function._from_local
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(modal_app._Function, "_from_local", staticmethod(spy))
+    return load(**env), seen
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"BODY_IMAGE_WORKER_STAGE": "staging"},
+        {"BODY_IMAGE_WORKER_STAGE": "staging", "BODY_IMAGE_WORKER_MAX_INPUTS": "1"},
+        {"BODY_IMAGE_WORKER_STAGE": "production"},
+    ],
+    ids=["staging-default", "staging-1", "production-default"],
+)
+def test_one_input_registers_no_concurrency_and_no_worker_env(monkeypatch, env):
+    worker, options = load_recording_registration(monkeypatch, **env)
+
+    assert worker.MAX_INPUTS == 1
+    assert worker.CONCURRENCY_ENV == {}
+    assert options["max_concurrent_inputs"] is None
+    assert options["target_concurrent_inputs"] is None
+
+
+def test_staging_two_inputs_register_modal_and_the_worker_limiter_with_one_value(monkeypatch):
+    worker, options = load_recording_registration(
+        monkeypatch, BODY_IMAGE_WORKER_STAGE="staging", BODY_IMAGE_WORKER_MAX_INPUTS="2"
+    )
+
+    assert (options["max_concurrent_inputs"], options["target_concurrent_inputs"]) == (2, 2)
+    assert worker.STAGE_ENV["env"]["MAX_CONCURRENT_BODY_VALIDATIONS"] == "2"
+    assert worker.STAGE_ENV["env"]["BODY_IMAGE_WORKER_MAX_INPUTS"] == "2"
+
+
+def test_two_inputs_keep_one_container_and_the_gpu_snapshot(monkeypatch):
+    worker, options = load_recording_registration(
+        monkeypatch, BODY_IMAGE_WORKER_STAGE="staging", BODY_IMAGE_WORKER_MAX_INPUTS="2"
+    )
+
+    assert options["max_containers"] == 1
+    assert worker.STAGE_SNAPSHOT == {"experimental_options": {"enable_gpu_snapshot": True}}
+    assert worker.WORKER_RESOURCES["enable_memory_snapshot"] is True
+    assert worker.WORKER_RESOURCES["gpu"] == "T4"
+
+
+@pytest.mark.parametrize("gpu_snapshot", [True, False], ids=["gpu-snapshot", "cpu-snapshot"])
+def test_production_registers_two_inputs_when_set_explicitly(monkeypatch, gpu_snapshot):
+    env = PRODUCTION_GPU if gpu_snapshot else {"BODY_IMAGE_WORKER_STAGE": "production"}
+    worker, options = load_recording_registration(monkeypatch, **env, BODY_IMAGE_WORKER_MAX_INPUTS="2")
+
+    assert worker.MAX_INPUTS == 2 and worker.GPU_SNAPSHOT is gpu_snapshot
+    assert (options["max_concurrent_inputs"], options["target_concurrent_inputs"]) == (2, 2)
+    # snapshot 방식과 상관없이 입력 수와 Limiter 가 같이 컨테이너로 간다.
+    function_env = worker.STAGE_ENV["env"]
+    assert function_env["BODY_IMAGE_WORKER_MAX_INPUTS"] == function_env["MAX_CONCURRENT_BODY_VALIDATIONS"] == "2"
+    # stage 는 GPU snapshot 일 때만 넘긴다(CPU snapshot production 은 기존 그대로 production 기본값).
+    assert ("BODY_IMAGE_WORKER_STAGE" in function_env) is gpu_snapshot
+
+
+@pytest.mark.parametrize(("limiter", "starts"), [(2, True), (1, False)], ids=["same", "different"])
+def test_production_cpu_container_with_two_inputs_compares_the_limiter(
+    fake_worker, monkeypatch, capsys, limiter, starts
+):
+    production = load_production(BODY_IMAGE_WORKER_MAX_INPUTS="2")
+    namespace = load_as_in_container(**production.STAGE_ENV["env"])
+    set_container_stages(monkeypatch, None, None, None, None)
+    monkeypatch.setattr(config, "MAX_CONCURRENT_BODY_VALIDATIONS", limiter)
+    _, pre, post, _ = lifecycle(SimpleNamespace(**namespace))
+
+    assert namespace["MAX_INPUTS"] == 2 and namespace["GPU_SNAPSHOT"] is False
+    if starts:
+        run(pre)
+        run(post)
+        assert [call[0] for call in fake_worker["calls"]] == ["prepare_cpu", "start_gpu"]  # 기존 production 순서
+        assert "max_inputs=2 limiter=2" in capsys.readouterr().out  # 배포 뒤 로그로 확인하는 값
+    else:
+        with pytest.raises(namespace["StageConfigError"], match="다릅니다"):
+            run(pre)
+        assert fake_worker["calls"] == []
+
+
+def test_production_gpu_container_reads_the_two_inputs():
+    production = load(**PRODUCTION_GPU, BODY_IMAGE_WORKER_MAX_INPUTS="2")
+    loaded = load_as_in_container(**production.STAGE_ENV["env"], BODY_IMAGE_WORKER_IMAGE_STAGE="production",
+                                  BODY_IMAGE_WORKER_IMAGE_GPU_SNAPSHOT="true")
+
+    assert loaded["MAX_INPUTS"] == 2 and loaded["GPU_SNAPSHOT"] is True and loaded["STAGE"] == "production"
+
+
+@pytest.mark.parametrize("stage", ["staging", "production"])
+@pytest.mark.parametrize("value", ["0", "-1", "3", "10", "two", "1.5", "02", "true"])
+def test_invalid_max_inputs_stop_before_deploy(stage, value):
+    with pytest.raises(ValueError, match="1 또는 2"):
+        load(BODY_IMAGE_WORKER_STAGE=stage, BODY_IMAGE_WORKER_MAX_INPUTS=value)
+
+
+def test_container_reads_the_inputs_passed_by_the_function_env(module):
+    env = {"BODY_IMAGE_WORKER_STAGE": "staging", "BODY_IMAGE_WORKER_MAX_INPUTS": "2"}
+
+    assert module.resolve_deploy_config(env, in_container=True).max_inputs == 2
+
+
+def test_container_stops_when_the_limiter_differs_from_the_modal_inputs():
+    worker = load(BODY_IMAGE_WORKER_STAGE="staging", BODY_IMAGE_WORKER_MAX_INPUTS="2")
+
+    worker.check_worker_concurrency(2)
+    with pytest.raises(worker.StageConfigError, match="다릅니다"):
+        worker.check_worker_concurrency(1)
+
+
+def test_one_input_does_not_judge_the_limiter(module):
+    module.check_worker_concurrency(1)
+    module.check_worker_concurrency(3)  # 입력이 1 이면 Limiter 값과 무관하게 기존처럼 시작한다
+
+
+# --- 배포 클래스의 snapshot → 복원 → 요청(입력 2). Modal SDK 안의 원본 method 를 fake 모델로 부른다 ---
+
+
+SAMPLER_THREAD = "body-image-resource-sampler"
+
+
+class Container:
+    """staging 배포 파일을 컨테이너 경로로 불러와 lifecycle method 를 순서대로 부른다. GPU·Modal 없이 돈다."""
+
+    def __init__(self, monkeypatch):
+        staging = load(
+            BODY_IMAGE_WORKER_STAGE="staging", BODY_IMAGE_WORKER_MAX_INPUTS="2", BODY_IMAGE_WORKER_DIAGNOSTICS="true"
+        )
+        env = {
+            **staging.STAGE_ENV["env"],
+            "BODY_IMAGE_WORKER_IMAGE_STAGE": "staging",
+            "BODY_IMAGE_WORKER_IMAGE_GPU_SNAPSHOT": "true",
+        }
+        self.namespace = load_as_in_container(**env)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        self.cls = self.namespace["BodyImageWorker"]._get_user_cls()
+        self.instance = self.cls.__new__(self.cls)
+
+    def run(self, method):
+        return self.cls.__dict__[method]._get_raw_f()(self.instance)
+
+
+@pytest.fixture
+def two_inputs(snapshot_env, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(config, "DIAGNOSTICS", True)
+    monkeypatch.setattr(config, "MAX_CONCURRENT_BODY_VALIDATIONS", 2)
+    for fake in (FakePersonDetector, FakeRemover):
+        monkeypatch.setattr(fake, "_lock", threading.Lock(), raising=False)
+    return snapshot_env
+
+
+def sampler_threads():
+    return [thread for thread in threading.enumerate() if thread.name == SAMPLER_THREAD]
+
+
+def diagnostics_of(run):
+    messages = []
+    handler = logging.Handler()
+    handler.emit = lambda record: messages.append(record.getMessage())
+    logger = logging.getLogger("app.body_image_validation")
+    level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        run()
+    finally:
+        logger.setLevel(level)
+        logger.removeHandler(handler)
+    prefix = "body image validation diagnostics: "
+    return [json.loads(message[len(prefix):]) for message in messages if message.startswith(prefix)]
+
+
+def test_snapshot_holds_no_request_state_and_the_restored_worker_runs_two_at_once(two_inputs, monkeypatch):
+    s3 = two_inputs["s3"]
+    both = threading.Barrier(2, timeout=10)
+    real_put = s3.put_object
+
+    def put_object(**kwargs):
+        both.wait()
+        real_put(**kwargs)
+
+    s3.put_object = put_object
+    container = Container(monkeypatch)
+
+    container.run("prepare_snapshot")
+
+    state = (BodyValidationLimiter, ExecutionTracker, ResourceSampler, TimedLock)
+    assert not any(isinstance(value, state) for value in vars(container.instance).values())
+    assert not isinstance(container.instance.models.person_detector._lock, TimedLock)
+    assert two_inputs["manager"].runtime is None
+    assert sampler_threads() == []
+
+    container.run("start_after_restore")
+
+    runtime_after = two_inputs["manager"].runtime
+    service = runtime_after.service
+    assert service.limiter._max_running == 2
+    assert (service.limiter.running, service.limiter.waiting) == (0, 0)
+    assert service._execution._running == []
+    assert runtime_after.resources._windows == [] and runtime_after.resources._thread is None
+    assert isinstance(runtime_after.person_detector._lock, TimedLock)
+    assert container.namespace["MAX_INPUTS"] == 2
+
+    client = TestClient(container.run("web"), raise_server_exceptions=False)
+    answers = []
+
+    def run():
+        threads = [threading.Thread(target=lambda: answers.append(post(client, jpeg()))) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+
+    lines = diagnostics_of(run)
+
+    assert [answer.status_code for answer in answers] == [200, 200]
+    assert sorted(line["seq"] for line in lines) == [1, 2]  # warm-up 은 요청으로 세지 않았다
+    assert [line["execution"]["active_max"] for line in lines] == [2, 2]
+    assert {line["execution"]["process_id"] for line in lines} == {service._execution.process_id}
+    assert (service.limiter.running, service._execution._running) == (0, [])
+
+
+def test_each_restored_container_starts_from_zero(two_inputs, monkeypatch):
+    def serve_once():
+        container = Container(monkeypatch)
+        container.run("prepare_snapshot")
+        container.run("start_after_restore")
+        client = TestClient(container.run("web"), raise_server_exceptions=False)
+        lines = diagnostics_of(lambda: post(client, jpeg()))
+        service = two_inputs["manager"].runtime.service
+        two_inputs["manager"].close()
+        return lines[0], service
+
+    first, first_service = serve_once()
+    second, second_service = serve_once()
+
+    assert second_service is not first_service
+    assert second["seq"] == first["seq"] == 1
+    assert second["execution"]["process_id"] != first["execution"]["process_id"]
+    assert second["execution"]["active_max"] == 1
+
+
+def test_snapshot_refuses_a_limiter_that_differs_from_the_two_inputs_before_building_models(two_inputs, monkeypatch):
+    monkeypatch.setattr(config, "MAX_CONCURRENT_BODY_VALIDATIONS", 1)
+    container = Container(monkeypatch)
+
+    with pytest.raises(container.namespace["StageConfigError"], match="다릅니다"):
+        container.run("prepare_snapshot")
+
+    assert two_inputs["built"] == {}
+
+
+def test_restore_refuses_a_limiter_that_differs_from_the_two_inputs(two_inputs, monkeypatch):
+    container = Container(monkeypatch)
+    container.run("prepare_snapshot")
+    monkeypatch.setattr(config, "MAX_CONCURRENT_BODY_VALIDATIONS", 1)
+
+    with pytest.raises(container.namespace["StageConfigError"], match="다릅니다"):
+        container.run("start_after_restore")
+
+    assert two_inputs["manager"].runtime is None
+    container.instance.models.close()

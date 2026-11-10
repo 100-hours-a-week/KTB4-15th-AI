@@ -1,5 +1,4 @@
-"""전신 이미지 fail-fast 검증, 전처리, S3 저장 orchestration."""
-
+import itertools
 import logging
 import threading
 import time
@@ -10,10 +9,18 @@ from typing import Protocol
 from PIL import Image
 
 from app.body_image_validation import deadline, validation_rules
-from app.body_image_validation.background import encode_png
+from app.body_image_validation.background import encode_webp
 from app.body_image_validation.brightness import BrightnessCheckError, validate_brightness
 from app.body_image_validation.concurrency import BodyValidationLimiter
 from app.body_image_validation.detectors import DetectionImage, PersonDetector, PoseDetector
+from app.body_image_validation.diagnostics import (
+    ExecutionTracker,
+    ResourceSampler,
+    begin_request,
+    current_request,
+    end_request,
+    new_request_id,
+)
 from app.body_image_validation.exceptions import BodyImageSystemError
 from app.body_image_validation.gpu_preprocessing import GpuImagePreprocessor
 from app.body_image_validation.image_io import load_image, open_image
@@ -22,6 +29,11 @@ from app.clients.s3 import ImageStorage, ImageStorageError
 from app.config import body_image_validation as config
 
 logger = logging.getLogger(__name__)
+
+
+def _outcome(error: Exception) -> str:
+    """오류 코드나 예외 클래스 이름. 예외 메시지는 쓰지 않는다."""
+    return getattr(error, "code", None) or type(error).__name__
 
 
 class BackgroundRemover(Protocol):
@@ -38,6 +50,7 @@ class BodyImageValidationService:
         limiter: BodyValidationLimiter | None = None,
         gpu_preprocessor: GpuImagePreprocessor | None = None,
         diagnostics: bool = False,
+        resources: ResourceSampler | None = None,
     ) -> None:
         self.person_detector = person_detector
         self.pose_detector = pose_detector
@@ -53,11 +66,42 @@ class BodyImageValidationService:
         # 진단(기본 꺼짐). 켜면 요청마다 단계별 처리 시간(ms)을 로그 한 줄로 남긴다. 요청별 기록은
         # thread 마다 따로 둔다(endpoint 는 threadpool 에서 돈다).
         self._diagnostics = threading.local() if diagnostics else None
+        self._resources = resources
+        self._execution = ExecutionTracker() if diagnostics else None
+        self._request_numbers = itertools.count(1)
 
-    def validate(self, image_body: bytes) -> BodyImageValidationResult:
-        if self._diagnostics is None:
-            return self._validate(image_body)
+    def validate(self, image_body: bytes, ai_request_id: str | None = None) -> BodyImageValidationResult:
+        """요청마다 진단과 관계없이 요약 한 줄(request_id·AI Server 의 request_id·outcome·처리 시간)을 남긴다.
+
+        이미지·S3 key·예외 원문은 남기지 않는다. 진단이 켜져 있으면 같은 request_id 로 상세 기록을 더 남긴다.
+        """
+        request_id = new_request_id()
+        started = time.perf_counter()
+        outcome = "error"
+        try:
+            if self._diagnostics is None:
+                result = self._validate(image_body)
+            else:
+                result = self._validate_with_diagnostics(image_body, request_id, ai_request_id)
+            outcome = "success"
+            return result
+        except Exception as error:
+            outcome = _outcome(error)
+            raise
+        finally:
+            logger.info(
+                "body image validation request: request_id=%s ai_request_id=%s outcome=%s total=%.3fs",
+                request_id, ai_request_id or "-", outcome, time.perf_counter() - started,
+            )
+
+    def _validate_with_diagnostics(
+        self, image_body: bytes, request_id: str, ai_request_id: str | None
+    ) -> BodyImageValidationResult:
         timings = self._diagnostics.timings = {}
+        record, token = begin_request(
+            next(self._request_numbers), self._execution.process_id, ai_request_id, request_id=request_id
+        )
+        window = self._resources.open() if self._resources is not None else None
         started = time.perf_counter()
         outcome = "error"
         try:
@@ -65,15 +109,16 @@ class BodyImageValidationService:
             outcome = "success"
             return result
         except Exception as error:
-            outcome = getattr(error, "code", None) or type(error).__name__
+            outcome = _outcome(error)
             raise
         finally:
             timings["total"] = (time.perf_counter() - started) * 1000
             self._diagnostics.timings = None
-            logger.info(
-                "body image validation timings: outcome=%s ms=%s",
-                outcome, {name: round(value, 1) for name, value in timings.items()},
-            )
+            end_request(token)
+            rounded = {name: round(value, 1) for name, value in timings.items()}
+            logger.info("body image validation timings: outcome=%s ms=%s", outcome, rounded)
+            resources = self._resources.finish(window) if window is not None else None
+            logger.info("body image validation diagnostics: %s", record.to_json(outcome, rounded, resources))
 
     def _validate(self, image_body: bytes) -> BodyImageValidationResult:
         # 헤더만 읽는 입력 검증은 슬롯 밖에서 한다. 잘못된 이미지가 대기열을 차지하지 않게 하기
@@ -81,7 +126,7 @@ class BodyImageValidationService:
         # PIL 의 `with image:` 는 픽셀 메모리를 놓지 않으므로 close() 를 직접 부른다.
         source = open_image(image_body)
         try:
-            with self.limiter.slot():
+            with self._execution_slot():
                 # Modal worker 에서만 의미가 있다(AI Server 가 deadline 을 보냈을 때). 이미 지났으면 GPU 작업 전에 멈춘다.
                 deadline.check("before_processing")
                 with self._timed("preprocess"):
@@ -95,8 +140,26 @@ class BodyImageValidationService:
             source.close()
 
     @contextmanager
+    def _execution_slot(self):
+        """limiter 슬롯. 진단이 켜져 있으면 슬롯 대기시간과 실행 구간(슬롯 획득부터 반환 직전까지)을 기록한다."""
+        if self._execution is None:
+            with self.limiter.slot():
+                yield
+            return
+        record = current_request()
+        requested = time.perf_counter()
+        with self.limiter.slot():
+            record.slot_acquired = time.perf_counter()
+            self._diagnostics.timings["slot_wait"] = (record.slot_acquired - requested) * 1000
+            self._execution.enter(record)
+            try:
+                yield
+            finally:
+                self._execution.leave(record)
+
+    @contextmanager
     def _timed(self, stage: str):
-        """진단이 켜져 있으면 이 블록의 경과 시간(ms)을 stage 이름으로 기록한다."""
+        """진단이 켜져 있으면 이 블록의 경과 시간(ms)과 구간을 stage 이름으로 기록한다."""
         timings = getattr(self._diagnostics, "timings", None) if self._diagnostics else None
         if timings is None:
             yield
@@ -105,7 +168,9 @@ class BodyImageValidationService:
         try:
             yield
         finally:
-            timings[stage] = (time.perf_counter() - started) * 1000
+            ended = time.perf_counter()
+            timings[stage] = (ended - started) * 1000
+            current_request().spans[stage] = (started, ended)
 
     def _load(self, source: Image.Image, image_body: bytes) -> Image.Image:
         """GPU 로 처리할 수 있는 JPEG 는 GPU 로, 나머지와 GPU 실패는 기존 Pillow load_image 로.
@@ -135,20 +200,19 @@ class BodyImageValidationService:
                 result = self.background_remover.remove(image)
         except Exception as error:
             raise BodyImageSystemError("BACKGROUND_REMOVAL_FAILED") from error
-        # RGBA 결과는 PNG 로 인코딩한 직후 닫는다. 업로드 동안에는 PNG bytes 만 남긴다.
         try:
-            with self._timed("png"):
-                png = encode_png(result)
+            with self._timed("webp"):
+                webp = encode_webp(result)
         except (OSError, ValueError) as error:
             raise BodyImageSystemError("IMAGE_ENCODING_FAILED") from error
         finally:
             result.close()
         # AI Server 가 결과를 받을 시간이 남지 않았으면 올리지 않는다(아무도 받지 않을 객체를 만들지 않는다).
         deadline.check("before_upload", margin=deadline.UPLOAD_MARGIN_SECONDS)
-        key = f"body-images/{uuid.uuid4()}.png"
+        key = f"body-images/{uuid.uuid4()}.webp"
         try:
             with self._timed("s3_upload"):
-                self.image_storage.upload_bytes(png, key, "image/png")
+                self.image_storage.upload_bytes(webp, key, "image/webp")
         except ImageStorageError as error:
             raise BodyImageSystemError("IMAGE_UPLOAD_FAILED") from error
         return BodyImageValidationResult(s3_key=key)

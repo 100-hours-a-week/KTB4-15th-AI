@@ -29,7 +29,7 @@ OTHER_UUID = "0b8f8a3e-2c55-4c1e-9d5e-7c0f3b0a9e11"
 PERSON_URL = "https://bucket.s3.amazonaws.com/users/1/body.jpg?X-Amz-Signature=PERSONSIG"
 WEBHOOK_URL = "https://ai.example.com/api/v2/webhooks/runware?token=WEBHOOKTOKEN"
 UPLOAD_URL = (
-    "https://bucket.s3.amazonaws.com/virtual-fitting/results/3/pruna-async.jpg"
+    "https://bucket.s3.amazonaws.com/virtual-fitting/results/3/pruna-async.webp"
     "?X-Amz-Signature=UPLOADSIG&X-Amz-Expires=3600"
 )
 SECRETS = (API_KEY, "PERSONSIG", "WEBHOOKTOKEN", "UPLOADSIG")
@@ -111,7 +111,8 @@ def test_async_payload_matches_design():
             ]
         },
         "outputType": "URL",
-        "outputFormat": "JPG",
+        "outputFormat": "WEBP",
+        "outputQuality": 90,
         "numberResults": 1,
         "includeCost": True,
         "deliveryMethod": "async",
@@ -250,7 +251,11 @@ def test_202_ack_is_accepted():
 # --- 4. 오류 응답 ---
 
 
-def test_errors_in_2xx_body_are_rejected():
+# 2-1 보완: 예전에는 2xx 의 오류 본문을 모두 REJECTED(error_response)로, 429·5xx·retryAfter·
+# providerRateLimitExceeded 를 retryable 로 봤다. 이제 이 task 에 연결된 근거 코드만 분류에 쓴다.
+
+
+def test_unclear_task_error_in_2xx_body_is_unknown_not_a_failure():
     body = {
         "errors": [
             {"code": "invalidReferenceImages", "message": "bad image", "taskUUID": TASK_UUID}
@@ -259,21 +264,22 @@ def test_errors_in_2xx_body_are_rejected():
     }
     result = _submit(FakeOpener(body))
 
-    assert result.outcome is SubmissionOutcome.REJECTED
-    assert result.reason == "error_response"
+    assert result.outcome is SubmissionOutcome.UNKNOWN
+    assert result.reason == "error_response_unclear"
     assert result.error_codes == ("invalidReferenceImages",)
     assert not result.retryable
 
 
-def test_retryable_error_code_and_retry_after_are_reported_not_retried():
+def test_provider_rate_limit_and_retry_after_alone_are_not_retryable():
     body = {
         "errors": [{"code": "providerRateLimitExceeded", "message": "slow down", "retryAfter": 5}]
     }
     opener = FakeOpener(body)
     result = _submit(opener)
 
-    assert result.outcome is SubmissionOutcome.REJECTED
-    assert result.retryable and result.retry_after == 5
+    assert result.outcome is SubmissionOutcome.UNKNOWN
+    assert result.reason == "error_response_unmatched"  # 이 task 에 연결되지 않은 오류
+    assert not result.retryable and result.retry_after == 5  # 대기 안내는 공유 대기용으로만 남긴다
     assert len(opener.calls) == 1  # 자동 재시도 없음
 
 
@@ -282,7 +288,7 @@ def test_definitive_4xx_is_rejected(code):
     result = _submit(FakeOpener(error=_http_error(code)))
 
     assert result.outcome is SubmissionOutcome.REJECTED
-    assert result.reason == "client_error"
+    assert result.reason == ("auth_error" if code in (401, 403) else "client_error")
     assert result.http_status == code
     assert result.error_codes == ("boom",)
 
@@ -302,11 +308,11 @@ def test_402_is_rejected_as_balance_exhausted():
 @pytest.mark.parametrize(
     "code, reason, retryable",
     [
-        (429, "rate_limited", True),
-        (500, "server_error", True),
-        (502, "server_error", True),
-        (503, "server_error", True),
-        (504, "server_error", True),
+        (429, "rate_limited", False),
+        (500, "server_error", False),
+        (502, "server_error", False),
+        (503, "server_error", False),
+        (504, "server_error", False),
         (408, "unexpected_status", False),
         (409, "unexpected_status", False),
         (302, "unexpected_status", False),
@@ -407,3 +413,26 @@ def test_missing_api_key_raises_config_error(monkeypatch):
     monkeypatch.delenv("RUNWARE_VTON_API_KEY", raising=False)
     with pytest.raises(RunwareConfigError):
         RunwarePrunaAsyncProvider()
+
+
+@pytest.mark.parametrize("result_format", ["JPG", "WEBP"])
+def test_prepared_output_contract_is_preserved(result_format):
+    task, = build_async_payload(_input(), task_uuid=TASK_UUID, webhook_url=WEBHOOK_URL,
+                               upload_endpoint=UPLOAD_URL.replace(".webp", ".jpg") if result_format == "JPG" else UPLOAD_URL,
+                               output_format=result_format)
+    assert task["outputFormat"] == result_format
+    assert (task.get("outputQuality") == 90) if result_format == "WEBP" else "outputQuality" not in task
+
+
+def test_webp_request_cannot_target_a_legacy_jpg_key():
+    opener = FakeOpener(ACK)
+    with pytest.raises(ValueError, match="확장자"):
+        _submit(opener, upload_endpoint=UPLOAD_URL.replace(".webp", ".jpg"))
+    assert opener.calls == []
+
+
+def test_legacy_jpg_submit_keeps_quality_unspecified():
+    opener = FakeOpener(ACK)
+    _submit(opener, upload_endpoint=UPLOAD_URL.replace(".webp", ".jpg"), output_format="JPG")
+    assert _sent_task(opener)["outputFormat"] == "JPG"
+    assert "outputQuality" not in _sent_task(opener)

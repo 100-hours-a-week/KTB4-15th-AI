@@ -1,17 +1,15 @@
-"""무거운 모델/session을 프로세스 생명주기 동안 한 번만 준비한다.
-
-모델(inference.BodyImageModels)과 연결·요청 상태(S3 client, service 의 limiter)를 나눠 만든다.
-모델은 secret 없이 먼저 만들 수 있고, 이 모듈은 S3 client 를 만들며 settings(secret)를 읽는다.
-"""
-
 import logging
 import threading
+from typing import TYPE_CHECKING
 
-from app.body_image_validation.concurrency import BodyValidationLimiter
+from app.body_image_validation.diagnostics import ResourceSampler, install_lock_timers
 from app.body_image_validation.inference import BodyImageModels, BodyImageRuntimeError
 from app.body_image_validation.service import BodyImageValidationService
 from app.clients.s3 import ImageStorage, S3ConfigError, S3ImageStorage, get_s3_bucket
 from app.config import body_image_validation as config
+
+if TYPE_CHECKING:
+    import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +23,11 @@ class BodyImageRuntime:
         self.person_detector = models.person_detector
         self.pose_detector = models.pose_detector
         self.background_remover = models.background_remover
+        # 진단 계측은 여기서만 설치한다. 이 객체는 snapshot 복원 뒤에 만들어지므로 snapshot 에 담기지 않는다.
+        self.resources = None
+        if config.DIAGNOSTICS:
+            install_lock_timers(models)
+            self.resources = ResourceSampler(config.DIAGNOSTICS_SAMPLE_INTERVAL_SECONDS)
         self.service = BodyImageValidationService(
             models.person_detector,
             models.pose_detector,
@@ -32,6 +35,7 @@ class BodyImageRuntime:
             storage,
             gpu_preprocessor=models.gpu_preprocessor,
             diagnostics=config.DIAGNOSTICS,
+            resources=self.resources,
         )
 
     @classmethod
@@ -53,13 +57,22 @@ class BodyImageRuntime:
         return cls(models, storage)
 
     def close(self) -> None:
+        if self.resources is not None:
+            self.resources.close()
         self.models.close()
 
 
 class RemoteBodyImageRuntime:
-    """remote 모드(AI Server). 모델·GPU·S3 client 를 만들지 않고 Modal worker 를 부르는 service 만 둔다."""
+    """remote 모드(AI Server). 모델·GPU·S3 client 를 만들지 않고 Modal worker 를 부르는 service 만 둔다.
 
-    def __init__(self) -> None:
+    service 가 공유 HTTP client 를 소유한다. lifespan 이 aopen()·aclose() 를 같은 event loop 에서 부른다. client 와
+    limiter 는 그 event loop 에 묶이므로 lifespan 마다 새 runtime 을 만든다(close() 가 manager 를 비운다).
+    """
+
+    def __init__(self, transport: "httpx.AsyncBaseTransport | None" = None) -> None:
+        import httpx
+
+        from app.body_image_validation.async_concurrency import AsyncBodyValidationLimiter
         from app.body_image_validation.remote import (
             RemoteBodyImageValidationService,
             RemoteWorkerConfigError,
@@ -72,26 +85,40 @@ class RemoteBodyImageRuntime:
                 proxy_key=settings.BODY_IMAGE_REMOTE_PROXY_KEY,
                 proxy_secret=settings.BODY_IMAGE_REMOTE_PROXY_SECRET,
                 api_key=settings.BODY_IMAGE_REMOTE_API_KEY,
-                timeout=config.REMOTE_TIMEOUT_SECONDS,
+                timeout=httpx.Timeout(
+                    connect=config.REMOTE_CONNECT_TIMEOUT_SECONDS,
+                    read=config.REMOTE_READ_TIMEOUT_SECONDS,
+                    write=config.REMOTE_WRITE_TIMEOUT_SECONDS,
+                    pool=config.REMOTE_POOL_TIMEOUT_SECONDS,
+                ),
                 total_deadline=config.REMOTE_TOTAL_DEADLINE_SECONDS,
-                limiter=BodyValidationLimiter(
-                    config.MAX_CONCURRENT_BODY_VALIDATIONS,
-                    config.MAX_WAITING_BODY_VALIDATIONS,
+                limiter=AsyncBodyValidationLimiter(
+                    config.REMOTE_MAX_CONCURRENT_BODY_VALIDATIONS,
+                    config.REMOTE_MAX_WAITING_BODY_VALIDATIONS,
                     max_wait_seconds=config.MAX_QUEUE_WAIT_SECONDS,
                 ),
+                transport=transport,
             )
         except RemoteWorkerConfigError as error:
             raise BodyImageRuntimeError(str(error)) from error
+
+    async def aopen(self) -> None:
+        await self.service.aopen()
+
+    async def aclose(self) -> None:
+        await self.service.aclose()
 
     def close(self) -> None:
         pass
 
 
 class BodyImageRuntimeManager:
-    def __init__(self) -> None:
+    def __init__(self, remote_transport: "httpx.AsyncBaseTransport | None" = None) -> None:
+        """remote_transport 는 remote service 가 쓸 HTTP transport 다(테스트). 공유 client 가 소유한다."""
         self._runtime: BodyImageRuntime | None = None
         self._error: Exception | None = None
         self._lock = threading.Lock()
+        self._remote_transport = remote_transport
 
     def start(self, models: BodyImageModels | None = None) -> None:
         """runtime 을 한 번만 만든다. models 는 Modal worker 가 미리 만든 모델이다(없으면 local 에서 만든다).
@@ -106,7 +133,7 @@ class BodyImageRuntimeManager:
                     # 업로드는 worker 가 하므로 S3 설정을 보지 않는다. 모델을 넘기는 쪽은 worker 뿐이다.
                     if models is not None:
                         raise BodyImageRuntimeError("remote 모드에는 미리 만든 모델을 넘길 수 없습니다.")
-                    self._runtime = RemoteBodyImageRuntime()
+                    self._runtime = RemoteBodyImageRuntime(self._remote_transport)
                 elif config.VALIDATION_MODE == "local":
                     get_s3_bucket()
                     self._runtime = BodyImageRuntime.create(models)
@@ -126,13 +153,29 @@ class BodyImageRuntimeManager:
         return self._runtime
 
     def get_service(self) -> BodyImageValidationService:
-        if self._runtime is None:
+        # remote runtime 은 lifespan 만 만든다. 여기서 만들면 공유 client 를 열 event loop 가 없다.
+        if self._runtime is None and config.VALIDATION_MODE != "remote":
             self.start()
         if self._runtime is None:
             if isinstance(self._error, S3ConfigError):
                 raise S3ConfigError(str(self._error)) from self._error
             raise BodyImageRuntimeError("전신 이미지 검증 runtime을 초기화하지 못했습니다.") from self._error
         return self._runtime.service
+
+    async def aopen(self) -> None:
+        """lifespan 시작에서 start() 뒤에 부른다. remote runtime 의 비동기 자원을 이 event loop 에서 만든다."""
+        runtime = self._runtime
+        if isinstance(runtime, RemoteBodyImageRuntime):
+            await runtime.aopen()
+
+    async def aclose(self) -> None:
+        """lifespan 종료에서 부른다. 비동기 자원을 닫고, 실패하거나 취소돼도 close() 로 마무리한다."""
+        runtime = self._runtime
+        try:
+            if isinstance(runtime, RemoteBodyImageRuntime):
+                await runtime.aclose()
+        finally:
+            self.close()
 
     def close(self) -> None:
         with self._lock:

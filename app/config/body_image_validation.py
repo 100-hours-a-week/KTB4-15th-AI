@@ -32,16 +32,46 @@ VALIDATION_MODE = os.getenv("BODY_IMAGE_VALIDATION_MODE", "local").strip().lower
 # worker 의 base URL(https). 경로 /api/v1/validation/body-image 는 코드가 붙인다.
 REMOTE_URL = os.getenv("BODY_IMAGE_REMOTE_URL", "").strip()
 # worker 호출 시간 제한은 환경변수가 아닌 코드 상수로 둔다(바꾸려면 이 파일을 고쳐 재배포한다).
-# 네트워크 timeout(초): 연결·전송·응답 대기·읽기 각 단계가 멈춰 있을 수 있는 최대 시간. 남은 전체 deadline 보다
-# 길게 쓰이지 않는다.
-REMOTE_TIMEOUT_SECONDS = 120.0
-# 전체 deadline(초): endpoint 가 요청을 받은 시점부터 입력 검사·대기열 대기·Modal 호출·최종 응답 수신까지.
+# 네트워크 timeout(초). 넷 모두 남은 전체 deadline 보다 길게 쓰이지 않고, 끝나면 재시도 없이 504 다.
+# connect: TCP 연결과 TLS handshake 에 각각 적용된다. Cold start 와 무관하다(Modal 앞단이 TLS 를 끝낸다).
+REMOTE_CONNECT_TIMEOUT_SECONDS = 10.0
+# read: 응답 데이터가 끊긴 시간. worker 는 처리 중 아무것도 보내지 않으므로 cold start·추론 시간 전체를 덮어야 한다.
+# 전체 deadline 과 같아 실제로는 deadline 이 먼저 끝난다.
+REMOTE_READ_TIMEOUT_SECONDS = 120.0
+# write: 이미지 전송. httpx 는 bytes 본문을 한 번에 쓰므로 업로드 전체에 걸린다. Modal 은 처리가 밀리면 TCP 로
+# backpressure 를 전하므로 cold start 동안 전송이 막힐 수 있다. 관측한 최악의 cold start(53초)보다 길게 둔다.
+REMOTE_WRITE_TIMEOUT_SECONDS = 60.0
+# pool: 공유 client 의 연결 확보 대기. 동시 호출이 limiter 로 제한돼 정상적으로는 기다리지 않는다.
+REMOTE_POOL_TIMEOUT_SECONDS = 5.0
+# 전체 deadline(초): ASGI 요청 진입부터 본문 수신·Multipart 파싱·인증·service 조회·파일 읽기·입력 검사·대기열
+# 대기·Modal 호출·최종 응답 수신까지.
 # redirect 를 따라가도 다시 시작하지 않고, 넘으면 재시도 없이 504 BODY_IMAGE_WORKER_TIMEOUT.
 # Modal 의 303 redirect(150초)보다 짧으므로 정상적으로는 303 을 받기 전에 끝난다.
 REMOTE_TOTAL_DEADLINE_SECONDS = 120.0
+# warm-up(worker 의 GET /health) 호출 시간 제한(초). 연결·전송·응답 대기·읽기 각 단계와 호출 전체에 같은 값을 쓴다.
+# 컨테이너가 0 이면 GPU 컨테이너 기동·snapshot 복원(enter hook)이 끝나야 응답이 오므로 그 시간까지 포함한다.
+# Modal 의 303 redirect(150초)보다 짧게 둔다. 90초는 초기 제안값이고 staging 실측 후 조정한다.
+WARMUP_TIMEOUT_SECONDS = 90.0
+# warm-up 성공(호출 완료 시점)부터 이 시간(초) 동안은 다시 부르지 않는다. Modal scaledown_window(30초)보다 짧게 둔다.
+# 이 시간 안이라도 컨테이너가 살아 있다는 보장은 아니다(다른 요청이 없으면 마지막 input 뒤 30초에 내려간다).
+WARMUP_COOLDOWN_SECONDS = 20.0
+# warm-up 실패(호출 완료 시점) 뒤 다시 부를 수 있을 때까지의 최소 간격(초). 그 전 요청은 RATE_LIMITED.
+WARMUP_MIN_RETRY_INTERVAL_SECONDS = 10.0
+# 시간 초과(NETWORK_TIMEOUT·DEADLINE_EXCEEDED) 뒤의 최소 간격(초). 연결을 끊어도 Modal input 은 계속 진행되므로
+# 일반 실패보다 길게 둔다. Modal 쪽 중복 실행을 완전히 막지는 못한다. staging 실측 후 조정한다.
+WARMUP_TIMEOUT_RETRY_INTERVAL_SECONDS = 30.0
+# 프로세스 전체에서 WARMUP_START_WINDOW_SECONDS 동안 새로 시작할 수 있는 warm-up 호출 수. 넘으면 RATE_LIMITED.
+# 성공만 이어지면 cooldown(20초) 때문에 60초에 3번을 넘지 않아 닿지 않는다. 빠른 실패(401 등)가 이어지면
+# 재시도 간격(10초)만으로는 60초에 6번이라 이 상한(4번)이 걸린다. 사용자별 제한은 Backend 몫이다.
+WARMUP_MAX_STARTS_PER_WINDOW = 4
+WARMUP_START_WINDOW_SECONDS = 60.0
 # 무거운 검증(모델 추론·rembg)의 프로세스 내 동시 실행 수와 대기 수. 넘치면 즉시 429.
+# local 모드(EC2·Modal worker) 값이다. Modal worker 는 입력 2 로 배포하면 배포가 실행 수 2 를 넘긴다.
 MAX_CONCURRENT_BODY_VALIDATIONS = int(os.getenv("MAX_CONCURRENT_BODY_VALIDATIONS", "1"))
 MAX_WAITING_BODY_VALIDATIONS = int(os.getenv("MAX_WAITING_BODY_VALIDATIONS", "1"))
+# remote 모드(AI Server) 값. 같은 환경변수를 읽어 값이 있으면 그 값을 쓰고, 없을 때의 기본값만 local 과 다르다.
+REMOTE_MAX_CONCURRENT_BODY_VALIDATIONS = int(os.getenv("MAX_CONCURRENT_BODY_VALIDATIONS", "2"))
+REMOTE_MAX_WAITING_BODY_VALIDATIONS = int(os.getenv("MAX_WAITING_BODY_VALIDATIONS", "2"))
 # remote 모드에서 대기열에 들어간 요청이 실행 슬롯을 기다리는 최대 시간(초). 넘으면 429 SERVER_BUSY. 이 대기도
 # 전체 deadline(REMOTE_TOTAL_DEADLINE_SECONDS) 안에 들어가고, deadline 이 먼저 끝나면 504.
 # local 모드에는 적용하지 않는다(기존처럼 대기 시간 제한 없음).
@@ -56,9 +86,11 @@ REMBG_ENABLE_CPU_MEM_ARENA = os.getenv("REMBG_ENABLE_CPU_MEM_ARENA", "false").lo
 REMBG_PROVIDERS = tuple(
     name.strip() for name in os.getenv("BODY_IMAGE_REMBG_PROVIDERS", "").split(",") if name.strip()
 )
-# 진단(staging 검증용, 기본 꺼짐). 켜면 요청마다 단계별 처리 시간(ms)을 INFO 로그 한 줄로 남긴다.
-# API 응답은 바꾸지 않는다.
+# 진단(staging 검증용, 기본 꺼짐). 켜면 요청마다 단계별 처리 시간(ms) 한 줄과, 같은 시간에 request_id·Lock 대기/보유·
+# 메모리(프로세스·컨테이너·GPU 장치 전체 값)를 더한 JSON 한 줄을 INFO 로그로 남긴다. API 응답은 바꾸지 않는다.
 DIAGNOSTICS = os.getenv("BODY_IMAGE_DIAGNOSTICS", "false").lower() == "true"
+# 진단이 켜진 worker 가 요청을 처리하는 동안 메모리를 읽는 간격(초). 유휴 때는 읽지 않는다.
+DIAGNOSTICS_SAMPLE_INTERVAL_SECONDS = 0.05
 # 0 보다 크면 rembg ONNX Runtime session 을 profiling 을 켜고 만들고, 이 횟수만큼 실행한 뒤 profiling 을 끝내
 # 실행별 provider(CUDA/CPU) 노드 수와 추론 시간을 로그로 남긴다. 그 뒤 실행은 profiling 하지 않는다(기본 0).
 REMBG_PROFILE_RUNS = int(os.getenv("BODY_IMAGE_REMBG_PROFILE_RUNS", "0"))

@@ -1,24 +1,3 @@
-"""Modal T4 worker 용 전신 이미지 검증 HTTP 앱과 초기화 순서.
-
-EC2 AI Server(app.main)와 같은 router·service·runtime 을 그대로 쓰고, 이 모듈은 Modal 컨테이너에서
-부르는 순서만 정한다. Modal 자체는 import 하지 않는다(정의는 deploy/modal/body_image_worker.py).
-
-초기화는 세 단계로 나뉜다. 앞의 두 단계는 secret(INTERNAL_API_KEY·AWS 자격증명)이 담긴 설정과 S3 client 를
-만들지 않으므로 snapshot 에 담겨도 된다. 세 번째 단계는 복원된 컨테이너마다 새로 해야 한다.
-
-1. prepare_cpu()               — 라이브러리 import 와 MediaPipe Person/Pose(CPU) 생성. CUDA 를 건드리지 않는다.
-2. prepare_gpu_for_snapshot()  — ort.preload_dlls·rembg CUDA session·CUDA context·nvJPEG decoder 를 만들고,
-                                 S3 없이 요청 경로를 한 번 돌려(warm_up) GPU 를 데운다. → BodyImageModels
-3. start_runtime(models)       — 실행 모드·INTERNAL_API_KEY 확인, S3 bucket 확인·S3 client, service 와
-                                 limiter(Condition) 생성, runtime 등록.
-
-Modal worker 의 호출 위치(deploy/modal/body_image_worker.py):
-- production(CPU memory snapshot): snap=True 에서 1, snap=False 에서 2·3 을 start_gpu() 로.
-- staging(GPU snapshot):           snap=True 에서 1·2 를 prepare_gpu_snapshot() 으로,
-                                   snap=False 에서 3 을 start_restored_runtime() 으로.
-create_app() 은 전신 이미지 검증 endpoint 와 /health 만 있는 FastAPI 앱이다.
-"""
-
 import importlib
 import logging
 import time
@@ -287,8 +266,8 @@ def warmup_image_bytes() -> bytes:
 
 
 def warm_up(models) -> dict[str, float]:
-    """요청과 같은 전처리·검출·rembg·PNG 단계를 한 번씩 돌린다. 모델만 쓰고 S3·service 는 쓰지 않는다."""
-    from app.body_image_validation.background import encode_png
+    """요청과 같은 전처리·검출·rembg·WebP 단계를 한 번씩 돌린다. 모델만 쓰고 S3·service 는 쓰지 않는다."""
+    from app.body_image_validation.background import encode_webp
     from app.body_image_validation.detectors import DetectionImage
     from app.body_image_validation.image_io import load_image, open_image
 
@@ -317,8 +296,8 @@ def warm_up(models) -> dict[str, float]:
         try:
             timings["rembg"] = (time.perf_counter() - start) * 1000
             start = time.perf_counter()
-            encode_png(result)
-            timings["png"] = (time.perf_counter() - start) * 1000
+            encode_webp(result)
+            timings["webp"] = (time.perf_counter() - start) * 1000
         finally:
             result.close()
     finally:
@@ -339,7 +318,7 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def request_deadline(request, call_next):
-        # AI Server 가 보낸 deadline 을 이 요청의 context 에 둔다. sync endpoint 의 threadpool 에도 전해진다.
+        # AI Server 가 보낸 deadline 을 이 요청의 context 에 둔다. router 의 run_in_threadpool 에도 전해진다.
         token = deadline.set_deadline(deadline.parse_header(request.headers.get(deadline.HEADER)))
         try:
             return await call_next(request)

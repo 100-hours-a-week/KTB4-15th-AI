@@ -1,22 +1,4 @@
-"""가상피팅 V2 비동기 작업의 상태 관리 (virtual_fitting_async_jobs).
-
-여러 Worker 가 같은 작업을 동시에 잡으려 해도 DB 가 다음을 보장하게 한다.
-- 실행 권한(lease)은 한 Worker 만 가진다. 토큰은 선점할 때마다 새로 만든다.
-- 예상한 상태·다음 작업일 때만 바꾼다. 종료(COMPLETED/FAILED)된 작업은 바꾸지 않는다.
-- 단계별 시도 횟수는 한도 안에서만 1 늘린다(확보한 횟수는 실패해도 되돌리지 않는다).
-- 이전 Worker(만료·교체된 토큰)는 상태·결과를 바꾸지 못한다.
-
-변경은 짧은 트랜잭션 하나로 한다(외부 호출 없음, 작업이 끝날 때까지 잠금을 들고 있지 않음).
-1. SELECT … FOR UPDATE 로 그 행을 잠근다. 다른 연결이 잠그고 있으면 여기서 기다린다.
-2. 잠금을 얻은 뒤의 조건부 UPDATE 로 바꾼다. 시각은 statement_timestamp()(이 UPDATE 문이 시작된 실제 시각)를
-   쓴다. now() 는 트랜잭션 시작(잠금 대기 전) 시각에 고정돼 있어, 기다리는 동안 만료된 lease 를 유효하다고
-   보거나 이미 지난 시각으로 새 lease 를 계산하게 된다.
-3. 바뀐 줄이 없으면 같은 트랜잭션에서 다시 읽어 이유를 돌려준다. 이유는 참고용이고 바뀌었는지는 applied 만 믿는다.
-
-Worker 경로는 토큰이 필요하다. 외부 이벤트(Runware Webhook) 경로는 토큰 대신 등록된 task_uuid·호출 시작 기록·
-예상 상태를 조건으로 쓴다. 이 모듈은 외부 호출·SQS·반복문을 하지 않는다(이후 단계가 연결한다).
-"""
-
+import math
 import re
 import uuid
 from collections.abc import Callable, Mapping
@@ -31,6 +13,7 @@ from app.clients.s3 import S3ObjectState, validate_s3_key
 from app.virtual_fitting.exceptions import FittingDatabaseError
 from app.virtual_fitting.repositories.async_job_repository import (
     _SELECT_LIST,
+    ATTEMPTS,
     TABLE,
     AsyncFittingJob,
     AsyncJobStatus,
@@ -38,6 +21,7 @@ from app.virtual_fitting.repositories.async_job_repository import (
     ResultMessageStatus,
     _check_job_id,
     _row_to_job,
+    check_runware_image_url,
 )
 
 # 최초 포함 최대 시도 횟수. S3 는 HEAD 한 번이 아니라 0·2·7초 확인 한 묶음이 1회다.
@@ -47,6 +31,13 @@ LLM_COMMENT_ATTEMPT_LIMIT = 2
 LLM_TITLE_ATTEMPT_LIMIT = 2
 LLM_GENERATION_LIMIT = LLM_COMMENT_ATTEMPT_LIMIT + LLM_TITLE_ATTEMPT_LIMIT
 FALLBACK_LIMIT = 1
+# 비동기 Pruna 전송: 같은 fitting_job_id 전체에서 최초 1회 + 확실한 미접수 뒤 재요청 3회.
+PRUNA_SUBMIT_LIMIT = 4
+# 확실한 미접수 뒤 다음 전송까지 기다릴 시간(초). 서버 대기 안내가 없거나 무효일 때만 쓴다(1→2, 2→3, 3→4번째 시도).
+PRUNA_RETRY_BACKOFF_SECONDS = (10.0, 20.0, 40.0)
+# 최대 횟수 모두 확실한 미접수일 때 BE 로 보낼 최종 실패(BE 는 이 코드로 사용 횟수를 차감하지 않는다고 판단한다).
+SUBMISSION_REJECTED_CODE = "FITTING_SUBMISSION_REJECTED"
+SUBMISSION_REJECTED_MESSAGE = "이미지 생성 요청이 접수되지 않았습니다."
 RESULT_MESSAGE_LIMIT = 3
 MAX_LEASE_SECONDS = 3600
 # 행 잠금 대기 제한(초). Pruna limiter 와 같은 5초. 트랜잭션 범위로만 건다(set_config(..., true) — 트랜잭션이 끝나면
@@ -88,6 +79,49 @@ class StateChange:
     reason: ChangeReason
     # 변경 후(applied) 또는 현재(applied 아님) 작업. NOT_FOUND 면 None.
     job: AsyncFittingJob | None
+
+
+class NotAcceptedSource(str, Enum):
+    """확실한 미접수를 확인한 경로. 셋 다 같은 기록 경로(record_not_accepted)를 쓴다."""
+
+    SUBMIT_RESPONSE = "submit_response"
+    WEBHOOK = "webhook"
+    STATUS_QUERY = "status_query"
+
+
+class NotAcceptedOutcome(str, Enum):
+    SCHEDULED = "scheduled"  # 미접수 기록·자리 정리·다음 시각 예약
+    EXHAUSTED = "exhausted"  # 마지막(4번째) 시도도 미접수: 실패 결과 저장·발행 대기
+    HELD = "held"  # 미접수 기록·자리 정리는 했지만 대기 시각을 정할 수 없다(자동 재요청 보류, 운영 확인)
+    ALREADY_RECORDED = "already_recorded"  # 같은 시도의 미접수가 이미 기록돼 있다(횟수·예약 그대로)
+    PAST_ATTEMPT = "past_attempt"  # 이전 시도의 늦은 알림. 현재 시도에 적용하지 않는다
+    CONTRADICTED = (
+        "contradicted"  # 이 시도에 이미 접수·생성 진행 근거가 있다(바꾸지 않고 운영 확인)
+    )
+    STATE_MISMATCH = "state_mismatch"  # 이미 다른 경로(결과·인증 보류 등)로 진행했다
+    NOT_FOUND = "not_found"
+
+
+@dataclass(frozen=True)
+class NotAcceptedChange:
+    outcome: NotAcceptedOutcome
+    job: AsyncFittingJob | None
+    attempt_no: int | None = None
+
+    @property
+    def applied(self) -> bool:
+        return self.outcome in (
+            NotAcceptedOutcome.SCHEDULED,
+            NotAcceptedOutcome.EXHAUSTED,
+            NotAcceptedOutcome.HELD,
+        )
+
+
+def retry_delay_seconds(attempt_no: int, retry_after: float | None) -> float:
+    """미접수로 끝난 attempt_no 번째 시도 뒤 다음 전송까지의 대기. 유효한 서버 안내가 있으면 그 값을, 없으면 10·20·40초."""
+    if retry_after is not None:
+        return float(retry_after)
+    return PRUNA_RETRY_BACKOFF_SECONDS[attempt_no - 1]
 
 
 @dataclass(frozen=True)
@@ -230,12 +264,24 @@ class AsyncJobStateRepository:
     # --- Pruna 요청(RECEIVED / SUBMIT_PRUNA) ---
 
     def prepare_pruna_submission(
-        self, fitting_job_id: int, token: str, task_uuid: str, async_image_key: str
+        self,
+        fitting_job_id: int,
+        token: str,
+        task_uuid: str,
+        async_image_key: str,
+        *,
+        ai_stores_result: bool = False,
     ) -> StateChange:
-        """Runware 호출 전에 task_uuid·async_image_key 를 저장한다. 이미 저장돼 있으면 바꾸지 않는다(재사용)."""
+        """Runware 호출 전에 task_uuid·async_image_key 를 저장한다. 이미 저장돼 있으면 바꾸지 않는다(재사용).
+
+        ai_stores_result(결과 저장 방식)도 같은 UPDATE 로 이때 한 번만 정한다(이미 준비된 작업은 바꾸지 않음).
+        기본 False 는 기존 uploadEndpoint 직접 업로드 방식이다.
+        """
+        if not isinstance(ai_stores_result, bool):
+            raise TypeError("ai_stores_result 는 bool 이어야 합니다.")
         return self._update(
             fitting_job_id,
-            "task_uuid = %(task_uuid)s, async_image_key = %(key)s",
+            "task_uuid = %(task_uuid)s, async_image_key = %(key)s, ai_stores_result = %(ai)s",
             """
             status = 'RECEIVED' AND next_action = 'SUBMIT_PRUNA'
             AND task_uuid IS NULL AND pruna_submit_started_at IS NULL
@@ -244,6 +290,7 @@ class AsyncJobStateRepository:
                 "token": token,
                 "task_uuid": _check_uuid(task_uuid, "task_uuid"),
                 "key": validate_s3_key(async_image_key),
+                "ai": ai_stores_result,
             },
             lambda job, now: (
                 ChangeReason.ALREADY_RECORDED
@@ -348,18 +395,83 @@ class AsyncJobStateRepository:
             return StateChange(False, ChangeReason.ALREADY_RECORDED, current)
         return change
 
-    def record_pruna_succeeded(self, task_uuid: str) -> StateChange:
+    def record_pruna_succeeded(
+        self, task_uuid: str, *, image_url: str | None = None, image_uuid: str | None = None
+    ) -> StateChange:
         """Pruna 성공 알림. 접수 대기 중(RECEIVED·WAITING_PRUNA)이고 결과가 아직 없는 작업만 POSTPROCESSING /
         POSTPROCESS 로 바꾼다. 실패 결과가 먼저 저장됐으면(PUBLISH_RESULT) 늦은 성공 알림이 그 다음 작업을 덮어쓰지 않는다.
+
+        image_url·image_uuid: 그 알림이 준 결과 참조(Runware imageURL·imageUUID). 상태 전환과 같은 UPDATE 로 저장하므로
+        전환이 일어날 때만, 한 번만 남는다. 전환되지 않은 알림(중복·늦은 알림)은 기존 값을 바꾸지 않는다. 없으면 NULL.
         """
         return self._event_update(
             task_uuid,
             """
             status = 'POSTPROCESSING', next_action = 'POSTPROCESS',
-            runware_accepted_at = COALESCE(runware_accepted_at, statement_timestamp())
+            runware_accepted_at = COALESCE(runware_accepted_at, statement_timestamp()),
+            runware_image_url = %(image_url)s, runware_image_uuid = %(image_uuid)s
             """,
             "status IN ('RECEIVED', 'WAITING_PRUNA') AND result_payload IS NULL",
-            {},
+            {
+                "image_url": check_runware_image_url(image_url) if image_url is not None else None,
+                "image_uuid": (
+                    _check_uuid(image_uuid, "image_uuid") if image_uuid is not None else None
+                ),
+            },
+        )
+
+    def fill_pruna_image_ref(
+        self,
+        task_uuid: str,
+        *,
+        image_url: str | None = None,
+        image_uuid: str | None = None,
+        confirmed_by_query: bool = False,
+    ) -> StateChange:
+        """성공 전환 뒤 늦게 온 같은 결과의 참조로 비어 있는 runware_image_url·runware_image_uuid 만 채운다.
+
+        잠금을 얻은 뒤의 UPDATE 조건으로만 판단한다(호출부가 읽은 상태는 믿지 않는다):
+        - 등록된 task_uuid·호출 시작 기록, 후처리 중(POSTPROCESSING / POSTPROCESS)이고 결과 없음. 완료·실패·fallback 은 제외.
+        - 충돌 없음: 이미 있는 값과 받은 값이 둘 다 있으면 같아야 한다(다르면 아무것도 쓰지 않아 참조를 섞지 않는다).
+        - 같은 결과 근거: 이미 있는 참조 중 하나가 받은 값과 일치한다(근거 없이 연결하지 않음). 예외: confirmed_by_query 는
+          호출부가 우리 인증으로 이 task 를 직접 조회(getResponse)해 결과 하나를 확인한 값이라는 뜻이다(외부 본문의 필드로
+          정하지 않음). AI 저장 작업(ai_stores_result)에서만 이 근거로 빈 참조(둘 다 NULL 포함)를 채운다. 충돌 검사는 그대로다.
+        - 채울 것이 있음: 비어 있는 컬럼에 받은 값이 있다.
+        참조 컬럼 외에는 상태·next_action·시각·lease·횟수·updated_at 을 바꾸지 않는다(Watchdog 지연 판단에 영향 없음).
+        """
+        if image_url is None and image_uuid is None:
+            raise ValueError("보완할 결과 참조가 없습니다.")
+        params = {
+            "task_uuid": _check_uuid(task_uuid, "task_uuid"),
+            "image_url": check_runware_image_url(image_url) if image_url is not None else None,
+            "image_uuid": _check_uuid(image_uuid, "image_uuid") if image_uuid is not None else None,
+            "confirmed": bool(confirmed_by_query),
+        }
+        return self._run(
+            f"SELECT fitting_job_id FROM {TABLE} WHERE task_uuid = %(task_uuid)s FOR UPDATE",
+            f"""
+            UPDATE {TABLE} SET
+                runware_image_url = COALESCE(runware_image_url, %(image_url)s::text),
+                runware_image_uuid = COALESCE(runware_image_uuid, %(image_uuid)s::uuid)
+            WHERE fitting_job_id = %(job_id)s AND task_uuid = %(task_uuid)s
+              AND pruna_submit_started_at IS NOT NULL
+              AND status = 'POSTPROCESSING' AND next_action = 'POSTPROCESS' AND result_payload IS NULL
+              AND (runware_image_url IS NULL OR %(image_url)s::text IS NULL
+                   OR runware_image_url = %(image_url)s::text)
+              AND (runware_image_uuid IS NULL OR %(image_uuid)s::uuid IS NULL
+                   OR runware_image_uuid = %(image_uuid)s::uuid)
+              AND (runware_image_url = %(image_url)s::text OR runware_image_uuid = %(image_uuid)s::uuid
+                   OR (%(confirmed)s AND ai_stores_result))
+              AND ((runware_image_url IS NULL AND %(image_url)s::text IS NOT NULL)
+                   OR (runware_image_uuid IS NULL AND %(image_uuid)s::uuid IS NOT NULL))
+            RETURNING {_SELECT_LIST}
+            """,
+            params,
+            lambda job, now: (
+                ChangeReason.TERMINAL
+                if job.status.value in _TERMINAL
+                else ChangeReason.STATE_MISMATCH
+            ),
         )
 
     def record_pruna_failed(
@@ -413,6 +525,213 @@ class AsyncJobStateRepository:
                 "fallback_limit": FALLBACK_LIMIT,
             },
         )
+
+    # --- 확실한 미접수(재요청) ---
+
+    def record_not_accepted(
+        self,
+        task_uuid: str,
+        code: str,
+        source: NotAcceptedSource,
+        *,
+        retry_after: float | None = None,
+        retry_after_unrepresentable: bool = False,
+    ) -> NotAcceptedChange:
+        """현재 전송 시도(task)의 확실한 미접수를 한 트랜잭션으로 기록한다. 제출 응답·Webhook·상태 조회가 같이 쓴다.
+
+        호출부 계약: 공통 분류(runware_errors)가 이 task 에 연결된 미접수 코드로 판단한 경우만 넘긴다(접수 불명확은 넘기지 않음).
+        같은 트랜잭션에서: 시도 줄 확보(기존 작업은 현재 task 를 1번 시도로) → 미접수 근거 기록 → 다음 시각 예약(또는 마지막
+        시도면 FITTING_SUBMISSION_REJECTED 결과·PUBLISH_RESULT 저장) → 그 시도의 진행 중 자리 반환. 하나라도 실패하면 모두
+        되돌린다(FittingDatabaseError). 같은 시도를 다시 기록하면 아무것도 바꾸지 않는다(다음 시각을 다시 계산하지 않음).
+        retry_after 는 Provider 가 고른 유효한 서버 대기 안내(초)다. 표현할 수 없으면 retry_after_unrepresentable=True(보류).
+        """
+        task = _check_uuid(task_uuid, "task_uuid")
+        if not isinstance(code, str) or not _SAFE_CODE.match(code):
+            raise ValueError("미접수 코드는 안전한 원인 코드여야 합니다.")
+        source = NotAcceptedSource(source)
+        if retry_after is not None and (
+            isinstance(retry_after, bool)
+            or not isinstance(retry_after, int | float)
+            or not math.isfinite(retry_after)
+            or retry_after < 0
+        ):
+            raise ValueError("retry_after 는 0 이상의 유한한 초여야 합니다.")
+        from app.virtual_fitting.repositories.pruna_limiter import IN_FLIGHT, OUT_OF_RANGE_ERRORS
+
+        def work(cursor) -> NotAcceptedChange:
+            cursor.execute(
+                f"SELECT fitting_job_id FROM {TABLE} WHERE task_uuid = %s FOR UPDATE", (task,)
+            )
+            locked = cursor.fetchone()
+            if locked is None:
+                cursor.execute(
+                    f"SELECT fitting_job_id FROM {ATTEMPTS} WHERE task_uuid = %s", (task,)
+                )
+                past = cursor.fetchone()
+                if past is None:
+                    return NotAcceptedChange(NotAcceptedOutcome.NOT_FOUND, None)
+                return NotAcceptedChange(
+                    NotAcceptedOutcome.PAST_ATTEMPT, self._job_in(cursor, past[0])
+                )
+            job_id = locked[0]
+            job = self._job_in(cursor, job_id)
+            if job.pruna_submit_started_at is None:
+                return NotAcceptedChange(NotAcceptedOutcome.STATE_MISMATCH, job)
+            cursor.execute("SELECT statement_timestamp()")
+            (now,) = cursor.fetchone()
+            # 시도 줄: 이 표 이전에 시작한 작업은 줄이 하나도 없다 → 현재 task 를 1번 시도로(호출 시작 기록 = 1회 전송).
+            # 이 표 이후의 시도는 전송 시작 트랜잭션이 줄을 이미 만들었다.
+            cursor.execute(
+                f"""
+                INSERT INTO {ATTEMPTS} (fitting_job_id, attempt_no, task_uuid, started_at)
+                SELECT %(job)s, 1, %(task)s, %(started)s
+                WHERE NOT EXISTS (SELECT 1 FROM {ATTEMPTS} WHERE fitting_job_id = %(job)s)
+                ON CONFLICT (task_uuid) DO NOTHING
+                """,
+                {"job": job_id, "task": task, "started": job.pruna_submit_started_at},
+            )
+            cursor.execute(
+                f"SELECT attempt_no, not_accepted_at FROM {ATTEMPTS} WHERE task_uuid = %s", (task,)
+            )
+            row = cursor.fetchone()
+            if row is None:  # 시도 기록이 현재 task 와 맞지 않는다(추측하지 않음)
+                return NotAcceptedChange(NotAcceptedOutcome.STATE_MISMATCH, job)
+            attempt_no, recorded_at = row
+            if recorded_at is not None:
+                return NotAcceptedChange(NotAcceptedOutcome.ALREADY_RECORDED, job, attempt_no)
+            if job.status.value in _TERMINAL:
+                return NotAcceptedChange(NotAcceptedOutcome.STATE_MISMATCH, job, attempt_no)
+            if (
+                job.runware_accepted_at is not None
+                or job.verified_image_key is not None
+                or job.status is not AsyncJobStatus.RECEIVED
+            ):
+                # 이 시도에 접수·생성 진행 근거가 이미 있다. 되돌리지 않고 모순만 남긴다(자동 재요청 없음, 운영 확인).
+                self._mark_conflict(cursor, task, "not_accepted_after_progress")
+                return NotAcceptedChange(NotAcceptedOutcome.CONTRADICTED, job, attempt_no)
+            if (
+                job.next_action is not NextAction.SUBMIT_PRUNA
+                or job.result_payload is not None
+                or job.auth_hold_task_uuid is not None
+            ):
+                return NotAcceptedChange(NotAcceptedOutcome.STATE_MISMATCH, job, attempt_no)
+            cursor.execute(
+                f"""
+                UPDATE {ATTEMPTS} SET not_accepted_code = %s, not_accepted_source = %s,
+                       not_accepted_at = %s
+                WHERE task_uuid = %s
+                """,
+                (code, source.value, now, task),
+            )
+            outcome, retry_at = NotAcceptedOutcome.HELD, None
+            if attempt_no >= PRUNA_SUBMIT_LIMIT:
+                outcome = NotAcceptedOutcome.EXHAUSTED
+                payload = {
+                    "fitting_job_id": job_id,
+                    "status": "FAILED",
+                    "error_code": SUBMISSION_REJECTED_CODE,
+                    "error_message": SUBMISSION_REJECTED_MESSAGE,
+                }
+                cursor.execute(
+                    f"""
+                    UPDATE {TABLE} SET result_payload = %s, next_action = 'PUBLISH_RESULT',
+                           pruna_not_accepted_at = %s, pruna_retry_at = NULL, updated_at = %s
+                    WHERE fitting_job_id = %s
+                    """,
+                    (Jsonb(_check_result_payload(payload)), now, now, job_id),
+                )
+            else:
+                if not retry_after_unrepresentable:
+                    delay = retry_delay_seconds(attempt_no, retry_after)
+                    try:
+                        with (
+                            cursor.connection.transaction()
+                        ):  # savepoint: 범위 오류면 이 UPDATE 만 되돌린다
+                            cursor.execute(
+                                f"""
+                                UPDATE {ATTEMPTS}
+                                SET next_attempt_at = %s::timestamptz + make_interval(secs => %s)
+                                WHERE task_uuid = %s RETURNING next_attempt_at
+                                """,
+                                (now, delay, task),
+                            )
+                            (retry_at,) = cursor.fetchone()
+                            outcome = NotAcceptedOutcome.SCHEDULED
+                    except OUT_OF_RANGE_ERRORS:
+                        retry_at = None  # 시각으로 표현할 수 없다: 줄이지 않고 보류
+                cursor.execute(
+                    f"""
+                    UPDATE {TABLE} SET pruna_not_accepted_at = %s, pruna_retry_at = %s, updated_at = %s
+                    WHERE fitting_job_id = %s
+                    """,
+                    (now, retry_at, now, job_id),
+                )
+            # 처리되지 않은 시도이므로 그 시도의 진행 중 자리만 반환한다(같은 트랜잭션).
+            cursor.execute(
+                f"DELETE FROM {IN_FLIGHT} WHERE fitting_job_id = %s AND task_uuid = %s",
+                (job_id, task),
+            )
+            return NotAcceptedChange(outcome, self._job_in(cursor, job_id), attempt_no)
+
+        return self._transaction(work, "확실한 미접수 기록")
+
+    def record_attempt_contradiction(self, task_uuid: str, reason: str) -> bool:
+        """미접수로 기록한 시도(현재·이전)에 접수·생성 결과 근거가 뒤늦게 왔다. 모순을 남기고, 아직 예약만 된 재요청이면
+        자동 재요청을 보류(pruna_retry_at = NULL → 운영 확인)한다. 결과·상태는 바꾸지 않는다. 기록했으면 True."""
+        task = _check_uuid(task_uuid, "task_uuid")
+        if not isinstance(reason, str) or not _SAFE_CODE.match(reason):
+            raise ValueError("모순 원인은 안전한 원인 코드여야 합니다.")
+
+        def work(cursor) -> bool:
+            cursor.execute(
+                f"SELECT fitting_job_id, not_accepted_at FROM {ATTEMPTS} WHERE task_uuid = %s",
+                (task,),
+            )
+            attempt = cursor.fetchone()
+            if attempt is None or attempt[1] is None:
+                return False
+            cursor.execute(
+                f"SELECT fitting_job_id FROM {TABLE} WHERE fitting_job_id = %s FOR UPDATE",
+                (attempt[0],),
+            )
+            self._mark_conflict(cursor, task, reason)
+            cursor.execute(
+                f"""
+                UPDATE {TABLE} SET pruna_retry_at = NULL, updated_at = statement_timestamp()
+                WHERE fitting_job_id = %s AND pruna_retry_at IS NOT NULL
+                  AND status = 'RECEIVED' AND next_action = 'SUBMIT_PRUNA' AND result_payload IS NULL
+                """,
+                (attempt[0],),
+            )
+            return True
+
+        return self._transaction(work, "미접수 시도의 모순 기록")
+
+    @staticmethod
+    def _mark_conflict(cursor, task: uuid.UUID, reason: str) -> None:
+        cursor.execute(
+            f"""
+            UPDATE {ATTEMPTS} SET conflict_reason = COALESCE(conflict_reason, %s),
+                   conflict_at = COALESCE(conflict_at, statement_timestamp())
+            WHERE task_uuid = %s
+            """,
+            (reason, task),
+        )
+
+    @staticmethod
+    def _job_in(cursor, job_id: int) -> AsyncFittingJob:
+        cursor.execute(f"SELECT {_SELECT_LIST} FROM {TABLE} WHERE fitting_job_id = %s", (job_id,))
+        return _row_to_job(cursor.fetchone())
+
+    def _transaction(self, work: Callable[[Any], Any], purpose: str) -> Any:
+        try:
+            with self._connection_pool.connection() as connection:
+                connection.autocommit = True
+                with connection.transaction(), connection.cursor() as cursor:
+                    cursor.execute(_SET_LOCK_TIMEOUT, {"lock_timeout": self._lock_timeout})
+                    return work(cursor)
+        except psycopg.Error as error:
+            raise FittingDatabaseError(f"AI PostgreSQL {purpose}에 실패했습니다.") from error
 
     # --- 후처리(POSTPROCESSING / POSTPROCESS) ---
 

@@ -1,9 +1,3 @@
-"""15단계 보완: Runware 인증 오류 보류를 Webhook·요청 Worker·Watchdog 이 같은 DB 기록으로 같은 단계(operator_review)로 판단.
-
-실제 Router(app.main.app)·요청 Worker(RequestProcessor + PrunaSubmitter)·Repository·FollowUpPaths 조립(follow_up_paths)을 쓴다.
-Runware·SQS·S3 는 가짜, DB 는 격리 PostgreSQL 이다.
-"""
-
 import pytest
 
 from app.config import settings
@@ -22,6 +16,7 @@ from app.virtual_fitting.repositories.async_job_state import (
 )
 from app.virtual_fitting.result_publisher import register_result_publisher
 from app.virtual_fitting.watchdog import follow_up_paths, register_watchdog
+from tests.runware_codes import register_generation_failed_code
 from tests.test_virtual_fitting_async_job_state import pg  # noqa: F401 (pytest fixture)
 from tests.test_virtual_fitting_pruna_submit import (  # noqa: F401 (pytest fixture)
     JOB,
@@ -274,10 +269,11 @@ def test_auth_error_after_fallback_started_records_no_hold(api):  # noqa: F811
     assert hold(db_) == (None, None) and job(db_).next_action is NextAction.RUN_FALLBACK
 
 
-def test_late_auth_error_after_publish_keeps_the_result_without_a_hold(api):  # noqa: F811
+def test_late_auth_error_after_publish_keeps_the_result_without_a_hold(api, monkeypatch):  # noqa: F811
     db_ = api["db"]
     task = submitted(db_)
-    post(api, error_body(task, code="someNewCode"))
+    # 확정 생성 실패로 최종 결과를 저장한다(알 수 없는 코드는 2-1 보완 뒤 결과를 저장하지 않음).
+    post(api, error_body(task, code=register_generation_failed_code(monkeypatch)))
     clear_lease(db_)
     assert publisher(db_, FakeSqs()).publish(JOB).value == "published"
     final = job(db_)

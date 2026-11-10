@@ -1,13 +1,3 @@
-"""무거운 전신 이미지 검증(모델 추론·rembg)의 프로세스 내 동시 실행 제한.
-
-실행 max_running 개 + 대기 max_waiting 개까지만 받고, 둘 다 차면 기다리게 하지 않고 즉시
-ServerBusyError(429)를 낸다. 무제한 대기열은 만들지 않는다. max_wait_seconds 를 주면 대기열에 들어간 요청도
-그 시간 안에 실행 슬롯을 얻지 못하면 SlotWaitTimeout(같은 429)으로 나간다.
-
-endpoint 가 def 라 요청마다 threadpool 의 별도 스레드에서 동기로 실행된다. 그래서 asyncio 가
-아니라 threading.Condition 으로 막는다.
-"""
-
 import threading
 import time
 from collections.abc import Callable, Iterator

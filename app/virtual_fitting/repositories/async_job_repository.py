@@ -1,14 +1,10 @@
-"""가상피팅 V2 비동기 작업 (scripts/db/virtual_fitting_async_jobs.sql 의 virtual_fitting_async_jobs).
-
-이번 단계는 저장과 조회만 한다. 상태 전환·실행 권한(lease)·횟수 증가는 5단계 이후에 추가한다.
-"""
-
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
+from urllib.parse import urlsplit
 
 import psycopg
 
@@ -16,6 +12,7 @@ from app.clients.s3 import validate_s3_key
 from app.virtual_fitting.exceptions import FittingDatabaseError
 
 TABLE = "virtual_fitting_async_jobs"
+ATTEMPTS = "virtual_fitting_pruna_attempts"
 _MAX_BIGINT = 2**63 - 1
 # 한 작업의 상품 수. 상의·하의 각 1개까지라 최대 2개다.
 MAX_PRODUCTS = 2
@@ -91,6 +88,30 @@ class AsyncFittingJob:
     auth_hold_task_uuid: str | None = None
     auth_hold_reason: str | None = None
     auth_hold_at: datetime | None = None
+    # Runware 가 이 비동기 task_uuid 의 성공 결과로 알려 준 결과 참조(scripts/db/virtual_fitting_runware_image_ref.sql).
+    # 추후 다운로드 복구용 내부 기록이다. 성공 전환과 같은 UPDATE 로 처음 한 번만 저장한다. URL 은 repr·로그에 남기지 않는다.
+    runware_image_url: str | None = field(default=None, repr=False)
+    runware_image_uuid: str | None = None
+    # 결과 저장 방식(scripts/db/virtual_fitting_ai_result_storage.sql). True: AI 가 결과 URL 에서 내려받아 저장.
+    # False(기존 행·현재 요청): Runware 가 uploadEndpoint 로 직접 업로드. 요청 준비 때 한 번 정하고 바꾸지 않는다.
+    ai_stores_result: bool = False
+    # 확실한 미접수 재요청(scripts/db/virtual_fitting_pruna_retry.sql). 현재 task 의 시도를 미접수로 기록한 시각과 다음 재요청
+    # 가능 시각. 미접수 기록이 있고 다음 시각이 없으면 자동 재요청 보류(운영 확인)다.
+    pruna_not_accepted_at: datetime | None = None
+    pruna_retry_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class PrunaAttempt:
+    """비동기 Pruna 전송 시도 한 줄(virtual_fitting_pruna_attempts). 이전 시도의 늦은 알림을 찾을 때 쓴다."""
+
+    fitting_job_id: int
+    attempt_no: int
+    task_uuid: str
+    started_at: datetime
+    not_accepted_code: str | None
+    not_accepted_at: datetime | None
+    conflict_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -123,6 +144,42 @@ def _check_job_id(fitting_job_id: int) -> int:
     ):
         raise ValueError("fitting_job_id 는 BIGINT 범위의 양의 정수여야 합니다.")
     return fitting_job_id
+
+
+MAX_RUNWARE_IMAGE_URL_LENGTH = 2048
+# Runware 결과 이미지 서버. 공식 문서의 이미지 출력 예제와 실제 실험(webp-ai-upload, HTTPS·리다이렉트 없음)에서 확인한
+# 호스트만 정확히 일치로 허용한다(하위 도메인·와일드카드 없음). 우리 업로드용 Presigned PUT(S3 버킷 호스트)은 여기 없다.
+RUNWARE_IMAGE_HOSTS = frozenset({"im.runware.ai"})
+
+
+def check_runware_image_url(url: str) -> str:
+    """저장할 수 있는 Runware 결과 URL 인지 확인하고 원본 문자열 그대로 돌려준다.
+
+    https://(DB CHECK 와 같은 소문자 접두사), 허용 호스트와 정확히 일치(포트는 없음 또는 443), 사용자 정보·공백·
+    제어문자 없음, 2048자 이하. 쿼리(token·서명·만료 등)는 신뢰 판단에 쓰지 않으며 지우거나 바꾸지 않는다.
+    오류 메시지에는 URL 을 넣지 않는다.
+    """
+    if not isinstance(url, str) or not 0 < len(url) <= MAX_RUNWARE_IMAGE_URL_LENGTH:
+        raise ValueError("runware_image_url 은 비어 있지 않은 2048자 이하 문자열이어야 합니다.")
+    if any(ch.isspace() or not ch.isprintable() for ch in url):
+        raise ValueError("runware_image_url 에 공백·제어문자가 있습니다.")
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError as error:
+        raise ValueError("runware_image_url 형식이 올바르지 않습니다.") from error
+    if not url.startswith("https://") or parts.username is not None or parts.password is not None:
+        raise ValueError("runware_image_url 은 사용자 정보 없는 https URL 이어야 합니다.")
+    if host not in RUNWARE_IMAGE_HOSTS or port not in (None, 443):
+        raise ValueError("runware_image_url 이 허용된 Runware 이미지 서버 주소가 아닙니다.")
+    return url
+
+
+def check_runware_image_uuid(value: str) -> str:
+    try:
+        return str(uuid.UUID(value))
+    except (TypeError, ValueError, AttributeError) as error:
+        raise ValueError("runware_image_uuid 는 UUID 문자열이어야 합니다.") from error
 
 
 def _check_new_job(job: NewAsyncFittingJob) -> tuple:
@@ -167,6 +224,8 @@ def _row_to_job(row: Sequence[Any]) -> AsyncFittingJob:
         "worker_lease_until",
         "fallback_started_at",
         "auth_hold_at",
+        "pruna_not_accepted_at",
+        "pruna_retry_at",
     ):
         data[name] = _utc(data[name])
     data["products"] = tuple(data["products"]) if data["products"] is not None else None
@@ -175,6 +234,8 @@ def _row_to_job(row: Sequence[Any]) -> AsyncFittingJob:
     data["fallback_task_uuid"] = str(fallback_task) if fallback_task is not None else None
     hold_task = data["auth_hold_task_uuid"]
     data["auth_hold_task_uuid"] = str(hold_task) if hold_task is not None else None
+    image_uuid = data["runware_image_uuid"]
+    data["runware_image_uuid"] = str(image_uuid) if image_uuid is not None else None
     data["status"] = AsyncJobStatus(data["status"])
     data["next_action"] = NextAction(data["next_action"]) if data["next_action"] else None
     data["result_message_status"] = ResultMessageStatus(data["result_message_status"])
@@ -223,6 +284,24 @@ class AsyncJobRepository:
             raise ValueError("task_uuid 는 UUID 문자열이어야 합니다.") from error
         row = self._fetch_one(SELECT_BY_TASK_UUID_SQL, (parsed,))
         return _row_to_job(row) if row is not None else None
+
+    def find_attempt(self, task_uuid: str) -> PrunaAttempt | None:
+        """이 taskUUID 의 전송 시도 기록. 현재 시도인지는 작업의 task_uuid 와 비교해 호출부가 정한다."""
+        try:
+            parsed = uuid.UUID(task_uuid)
+        except (TypeError, ValueError, AttributeError) as error:
+            raise ValueError("task_uuid 는 UUID 문자열이어야 합니다.") from error
+        row = self._fetch_one(
+            f"SELECT fitting_job_id, attempt_no, task_uuid, started_at, not_accepted_code, "
+            f"not_accepted_at, conflict_at FROM {ATTEMPTS} WHERE task_uuid = %s",
+            (parsed,),
+        )
+        if row is None:
+            return None
+        job_id, attempt_no, task, started, code, not_accepted, conflict = row
+        return PrunaAttempt(
+            job_id, attempt_no, str(task), _utc(started), code, _utc(not_accepted), _utc(conflict)
+        )
 
     def find_result_publish_due(self, limit: int) -> list[int]:
         """결과 발행(14단계)을 기다리는 작업 번호. 결과가 저장돼 있고(PUBLISH_RESULT·PENDING) 종료되지 않았으며 다른

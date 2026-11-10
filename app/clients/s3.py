@@ -7,7 +7,7 @@ boto3의 표준 credential provider chain을 사용한다. 운영에서는 EC2 I
 import logging
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
 from io import BytesIO
@@ -129,6 +129,39 @@ def _validate_expires(expires_in: int) -> int:
     ):
         raise ValueError(f"expires_in 은 1~{MAX_PRESIGNED_EXPIRES_SECONDS} 사이 정수여야 합니다.")
     return expires_in
+
+
+class ConditionalPutOutcome(str, Enum):
+    """조건부 PUT(IfNoneMatch="*", 같은 Key 가 없을 때만 생성) 한 번의 결과."""
+
+    CREATED = "created"
+    # 412 PreconditionFailed. 이미 객체가 있다(덮어쓰지 않았다).
+    EXISTS = "exists"
+    # 409 ConditionalRequestConflict. 같은 Key 에 다른 조건부 쓰기가 동시에 진행 중이었다.
+    CONFLICT = "conflict"
+    # 연결 오류·응답 timeout·5xx·throttling. 저장됐는지 알 수 없다(객체를 다시 확인해야 한다).
+    UNKNOWN = "unknown"
+    # 권한·잘못된 요청·자격증명 없음 등. 저장되지 않았다.
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class ConditionalPutResult:
+    outcome: ConditionalPutOutcome
+    key: str
+    http_status: int | None = None
+    error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class S3ObjectBody:
+    """GetObject 결과. body 는 max_bytes 까지만 읽는다(넘으면 truncated=True, 나머지는 읽지 않음)."""
+
+    body: bytes = field(repr=False)
+    content_type: str | None
+    content_length: int | None
+    metadata: dict[str, str]
+    truncated: bool
 
 
 @runtime_checkable
@@ -301,6 +334,92 @@ class S3ImageStorage:
                 check.error_code,
             )
         return check
+
+    def put_object_if_absent(
+        self, body: bytes, key: str, *, content_type: str, metadata: dict[str, str]
+    ) -> ConditionalPutResult:
+        """같은 Key 에 객체가 없을 때만 만든다(IfNoneMatch="*"). 덮어쓰지 않는다. 예외를 던지지 않는다(잘못된 key 제외).
+
+        upload_bytes(V1·fallback, 무조건 덮어씀)와 따로 둔다. 기존 버킷 기본 암호화 등 설정은 같다(추가 인자 없음).
+        """
+        from botocore.exceptions import BotoCoreError, ClientError, ConnectionError, HTTPClientError
+
+        key = validate_s3_key(key)
+        try:
+            response = self._client.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=body,
+                ContentType=content_type,
+                Metadata=metadata,
+                IfNoneMatch="*",
+            )
+        except ClientError as error:
+            response = getattr(error, "response", {}) or {}
+            code = str(response.get("Error", {}).get("Code", "")) or None
+            status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if status == 412 or code == "PreconditionFailed":
+                outcome = ConditionalPutOutcome.EXISTS
+            elif status == 409 or code == "ConditionalRequestConflict":
+                outcome = ConditionalPutOutcome.CONFLICT
+            elif (isinstance(status, int) and (status >= 500 or status == 429)) or (
+                code in _TRANSIENT_CODES
+            ):
+                outcome = ConditionalPutOutcome.UNKNOWN
+            else:
+                outcome = ConditionalPutOutcome.FAILED
+            return ConditionalPutResult(outcome, key, status, code)
+        except (ConnectionError, HTTPClientError) as error:
+            # 요청을 보낸 뒤 응답을 못 받았을 수 있다(저장됐을 수 있음).
+            return ConditionalPutResult(
+                ConditionalPutOutcome.UNKNOWN, key, error_code=type(error).__name__
+            )
+        except BotoCoreError as error:
+            # 자격증명 없음·파라미터 오류 등 보내기 전 실패.
+            return ConditionalPutResult(
+                ConditionalPutOutcome.FAILED, key, error_code=type(error).__name__
+            )
+        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        return ConditionalPutResult(ConditionalPutOutcome.CREATED, key, status)
+
+    def get_object_limited(
+        self, key: str, max_bytes: int
+    ) -> tuple[S3ObjectCheck, S3ObjectBody | None]:
+        """GetObject 한 번. 본문은 max_bytes 까지만 읽는다. 결과 분류는 head_object 와 같다(예외 없음, 잘못된 key 제외)."""
+        from botocore.exceptions import BotoCoreError, ClientError, ConnectionError, HTTPClientError
+
+        key = validate_s3_key(key)
+        try:
+            response = self._client.get_object(Bucket=self._bucket, Key=key)
+            stream = response["Body"]
+            try:
+                body = stream.read(max_bytes + 1)
+            finally:
+                stream.close()
+        except ClientError as error:
+            return _classify_client_error(key, error), None
+        except (ConnectionError, HTTPClientError) as error:
+            check = S3ObjectCheck(
+                S3ObjectState.TRANSIENT_ERROR, key, error_code=type(error).__name__
+            )
+            return check, None
+        except BotoCoreError as error:
+            return S3ObjectCheck(S3ObjectState.ERROR, key, error_code=type(error).__name__), None
+        check = S3ObjectCheck(
+            S3ObjectState.EXISTS,
+            key,
+            http_status=response.get("ResponseMetadata", {}).get("HTTPStatusCode"),
+            content_length=response.get("ContentLength"),
+            content_type=response.get("ContentType"),
+            last_modified=response.get("LastModified"),
+        )
+        return check, S3ObjectBody(
+            body=body[:max_bytes],
+            content_type=response.get("ContentType"),
+            content_length=response.get("ContentLength"),
+            metadata=dict(response.get("Metadata") or {}),
+            truncated=len(body) > max_bytes,
+        )
 
     def _presign(
         self, method: str, key: str, expires_in: int, extra: dict[str, str] | None = None

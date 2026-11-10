@@ -46,12 +46,51 @@ VALIDATION_HIT = """\
 2026-10-25 18:37:17+09:00 ta-01M5S6QKJGMY9TS6F0MW2B6X9R    POST /api/v1/validation/body-image -> 200 OK  (duration: 7.37 s, execution: 2.71 s)
 """.splitlines()
 
-# 4-A: 검증 요청이 새 snapshot 을 만든 경우(MISS)
+# 5단계 A0(2026-10-30 T4): 배포 뒤 첫 검증 요청이 snapshot 을 처음 만든 경우(MISS). 현재 lifecycle 로그 형식.
+# (4-A 의 옛 fixture 는 snap=True·runtime=ready 줄이 없어 이제 incomplete 로 판정된다.)
 VALIDATION_MISS = """\
-2026-10-25 18:11:46+09:00 ta-01M5S591CYFJ5A0FBE1RWKTEVR Creating GPU memory snapshot for Function.
-2026-10-25 18:11:48+09:00 ta-01M5S591CYFJ5A0FBE1RWKTEVR body image worker lifecycle: stage=staging gpu_snapshot=True gpu=T4
-2026-10-25 18:12:04+09:00 ta-01M5S591CYFJ5A0FBE1RWKTEVR    POST /api/v1/validation/body-image -> 200 OK  (duration: 23.6 s, execution: 2.29 s)
+2026-10-30 09:07:14+09:00 ta-01M6523JZA17Q90AJ6H2H6ZJWR Creating GPU memory snapshot for Function.
+2026-10-30 09:07:17+09:00 ta-01M6523JZA17Q90AJ6H2H6ZJWR body image worker lifecycle: stage=staging gpu_snapshot=True
+2026-10-30 09:07:28+09:00 ta-01M6523JZA17Q90AJ6H2H6ZJWR body image worker lifecycle: snap=True done start=1793318837.403 end=1793318848.776 gpu_snapshot=True gpu=Tesla T4 warmup_ms={'preprocess': 132.8, 'person_pose': 59.4, 'rembg': 1098.6, 'png': 73.5}
+2026-10-30 09:07:30+09:00 ta-01M6523JZA17Q90AJ6H2H6ZJWR body image worker lifecycle: stage=staging gpu_snapshot=True
+2026-10-30 09:07:30+09:00 ta-01M6523JZA17Q90AJ6H2H6ZJWR body image worker lifecycle: snap=False done start=1793318850.493 end=1793318850.796 runtime=ready warmup_ms={'preprocess': 132.8, 'person_pose': 59.4, 'rembg': 1098.6, 'png': 73.5}
+2026-10-30 09:07:33+09:00 ta-01M6523JZA17Q90AJ6H2H6ZJWR    POST /api/v1/validation/body-image -> 200 OK  (duration: 20.6 s, execution: 2.20 s)
 """.splitlines()
+
+# 5단계 A1: 컨테이너 0 뒤 검증 요청이 GPU snapshot 에서 복원(HIT).
+RESTORED_A1 = """\
+2026-10-30 09:08:58+09:00 ta-01M6526R9X0STAYGBHZM5KT38R Restoring Function from memory snapshot.
+2026-10-30 09:09:01+09:00 ta-01M6526R9X0STAYGBHZM5KT38R body image worker lifecycle: stage=staging gpu_snapshot=True
+2026-10-30 09:09:01+09:00 ta-01M6526R9X0STAYGBHZM5KT38R body image worker lifecycle: snap=False done start=1793318941.298 end=1793318941.665 runtime=ready warmup_ms={'preprocess': 132.8, 'person_pose': 59.4, 'rembg': 1098.6, 'png': 73.5}
+2026-10-30 09:09:05+09:00 ta-01M6526R9X0STAYGBHZM5KT38R    POST /api/v1/validation/body-image -> 200 OK  (duration: 8.74 s, execution: 2.75 s)
+""".splitlines()
+
+# 5단계 B1: A1~A3 에서 복원되던 snapshot 이 있는데도 /health 컨테이너가 snapshot 을 다시 만들었다(재생성 MISS).
+RECREATED_B1 = """\
+2026-10-30 09:10:51+09:00 ta-01M652A69TT0CATRSX2RY93P0R Creating GPU memory snapshot for Function.
+2026-10-30 09:10:54+09:00 ta-01M652A69TT0CATRSX2RY93P0R body image worker lifecycle: stage=staging gpu_snapshot=True
+2026-10-30 09:11:07+09:00 ta-01M652A69TT0CATRSX2RY93P0R body image worker lifecycle: snap=True done start=1793319054.808 end=1793319067.097 gpu_snapshot=True gpu=Tesla T4 warmup_ms={'preprocess': 125.4, 'person_pose': 101.3, 'rembg': 1233.7, 'png': 83.0}
+2026-10-30 09:11:09+09:00 ta-01M652A69TT0CATRSX2RY93P0R body image worker lifecycle: stage=staging gpu_snapshot=True
+2026-10-30 09:11:09+09:00 ta-01M652A69TT0CATRSX2RY93P0R body image worker lifecycle: snap=False done start=1793319069.245 end=1793319069.728 runtime=ready warmup_ms={'preprocess': 125.4, 'person_pose': 101.3, 'rembg': 1233.7, 'png': 83.0}
+2026-10-30 09:11:10+09:00 ta-01M652A69TT0CATRSX2RY93P0R     GET /health -> 200 OK  (duration: 51.6 s, execution: 269.5 ms)
+2026-10-30 09:11:14+09:00 ta-01M652A69TT0CATRSX2RY93P0R    POST /api/v1/validation/body-image -> 200 OK  (duration: 3.05 s, execution: 2.78 s)
+""".splitlines()
+
+# 5단계 SH: 복원 시도 → Transient snapshot error(exit 137) → 같은 컨테이너가 snapshot 없이 재초기화 → /health·검증 200.
+# 기존 판정은 'Restoring' 줄만 보고 HIT 로 잘못 분류했다.
+SH_RESTORE_FALLBACK = """\
+2026-10-30 09:23:02+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR Restoring Function from memory snapshot.
+2026-10-30 09:23:03+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR Transient snapshot error: failed to restore container from snapshot with exit code 137. Will retry with no snapshots.
+2026-10-30 09:23:05+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR body image worker lifecycle: stage=staging gpu_snapshot=True
+2026-10-30 09:23:12+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR WARNING: Logging before InitGoogle() is written to STDERR
+2026-10-30 09:23:13+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR body image worker lifecycle: snap=True done start=1793319785.772 end=1793319793.937 gpu_snapshot=True gpu=Tesla T4 warmup_ms={'preprocess': 77.3, 'person_pose': 55.4, 'rembg': 713.4, 'png': 72.6}
+2026-10-30 09:23:13+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR body image worker lifecycle: stage=staging gpu_snapshot=True
+2026-10-30 09:23:14+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR body image worker lifecycle: snap=False done start=1793319793.938 end=1793319794.210 runtime=ready warmup_ms={'preprocess': 77.3, 'person_pose': 55.4, 'rembg': 713.4, 'png': 72.6}
+2026-10-30 09:23:14+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR     GET /health -> 200 OK  (duration: 14.3 s, execution: 95.3 ms)
+2026-10-30 09:23:18+09:00 ta-01M6530G7TAJPWTWD0BQVRVCAR    POST /api/v1/validation/body-image -> 200 OK  (duration: 2.99 s, execution: 2.90 s)
+""".splitlines()
+SH_CONTAINER = "ta-01M6530G7TAJPWTWD0BQVRVCAR"
+SINCE_1030 = datetime(2026, 10, 30, 0, 0, tzinfo=UTC)  # 09:00 KST
 
 # 4-C v5: GPU snapshot 옵션 누락 → 1회차 실패, Modal 이 snapshot 없이 다시 띄워 /health 200
 SNAPSHOT_OPTION_MISSING = """\
@@ -318,7 +357,7 @@ def run_smoke(ops, http, tmp_path, s3=None):
     image = tmp_path / "body.jpg"
     image.write_bytes(b"jpeg")
     return dc.smoke(ops, "app", CREDENTIALS, image, FAST, http=http,
-                    s3_checker=s3 or (lambda secret, key: {"format": "PNG"}), secret_name="secret",
+                    s3_checker=s3 or (lambda secret, key: {"format": "PNG", "content_type": "image/png"}), secret_name="secret",
                     clock=lambda: SINCE.timestamp())
 
 
@@ -328,6 +367,79 @@ def test_smoke_passes_on_snapshot_creation_then_hit(tmp_path):
     assert report["result"] == "PASS"
     assert [a["snapshot"] for a in report["validation"]] == ["hit"]
     assert report["validation"][0]["cuda"] is True
+
+
+@pytest.mark.parametrize(
+    ("extension", "image_format", "content_type"),
+    [("webp", "WEBP", "image/webp"), ("png", "PNG", "image/png")],
+)
+def test_smoke_accepts_decoded_webp_and_legacy_png(tmp_path, extension, image_format, content_type):
+    from io import BytesIO
+
+    from PIL import Image
+
+    key = f"body-images/result.{extension}"
+
+    class OutputHttp(FakeHttp):
+        def post(self, *args, **kwargs):
+            self.ops.next_phase()
+            return FakeResponse(200, {"data": {"s3_key": key}})
+
+    output = BytesIO()
+    Image.new("RGBA", (8, 12), (30, 60, 90, 128)).save(output, format=image_format)
+
+    def check(_secret, actual_key):
+        assert actual_key == key
+        with Image.open(BytesIO(output.getvalue())) as decoded:
+            decoded.load()
+            return {"format": decoded.format, "content_type": content_type}
+
+    report = run_smoke(FakeOps([WARMUP_OK, VALIDATION_HIT]), OutputHttp, tmp_path, s3=check)
+
+    assert report["result"] == "PASS"
+    assert report["s3"] == {"key": key, "format": image_format, "content_type": content_type}
+
+
+@pytest.mark.parametrize(
+    ("extension", "metadata"),
+    [
+        ("webp", {"format": "JPEG", "content_type": "image/jpeg"}),
+        ("webp", {"format": "GIF", "content_type": "image/gif"}),
+        ("webp", {"format": "PNG", "content_type": "image/png"}),
+        ("png", {"format": "WEBP", "content_type": "image/webp"}),
+        ("jpg", {"format": "JPEG", "content_type": "image/jpeg"}),
+        ("webp", {"format": "WEBP", "content_type": "binary/octet-stream"}),
+        ("webp", {"format": "WEBP"}),
+        ("webp", {"content_type": "image/webp"}),
+        ("webp", {"format": "WEBP", "content_type": "image/webp", "refused": "not a dev bucket"}),
+    ],
+)
+def test_smoke_rejects_invalid_or_mismatched_body_output(tmp_path, extension, metadata):
+    class OutputHttp(FakeHttp):
+        def post(self, *args, **kwargs):
+            self.ops.next_phase()
+            return FakeResponse(200, {"data": {"s3_key": f"body-images/result.{extension}"}})
+
+    with pytest.raises(dc.SmokeFailure) as failure:
+        run_smoke(FakeOps([WARMUP_OK, VALIDATION_HIT]), OutputHttp, tmp_path, s3=lambda *_: metadata)
+
+    assert failure.value.stage == "s3"
+
+
+def test_smoke_keeps_explicitly_unconfigured_s3_check_skipped(tmp_path):
+    ops = FakeOps([WARMUP_OK, VALIDATION_HIT])
+    image = tmp_path / "body.jpg"
+    image.write_bytes(b"jpeg")
+
+    def unexpected_check(*args):
+        pytest.fail("S3 check must stay skipped without a secret")
+
+    report = dc.smoke(ops, "app", CREDENTIALS, image, FAST, http=FakeHttp(ops),
+                      s3_checker=unexpected_check, secret_name=None,
+                      clock=lambda: SINCE.timestamp())
+
+    assert report["result"] == "PASS"
+    assert report["s3"]["skipped"] is True
 
 
 def test_smoke_retries_a_transient_miss_and_then_passes(tmp_path):
@@ -478,6 +590,139 @@ def test_miss_retries_and_limits_are_unchanged():
     assert (limits.max_init_failures, limits.max_snapshot_failures) == (2, 1)
 
 
+# --- snapshot 상태 4분류 (5단계 Staging 실측 로그) ---
+
+
+def states(lines, since=SINCE_1030):
+    return {c: dc.snapshot_state(log)[0] for c, log in dc.summarize_logs(lines, since).items()}
+
+
+def without(lines, *markers):
+    return [line for line in lines if not any(marker in line for marker in markers)]
+
+
+def test_a_real_gpu_snapshot_restore_is_a_hit():
+    assert states(RESTORED_A1) == {"ta-01M6526R9X0STAYGBHZM5KT38R": "snapshot_hit"}
+    assert dc.judge_validation(dc.summarize_logs(RESTORED_A1, SINCE_1030))[0] == "hit"
+
+
+def test_the_first_snapshot_creation_is_a_miss():
+    assert states(VALIDATION_MISS) == {"ta-01M6523JZA17Q90AJ6H2H6ZJWR": "snapshot_miss"}
+
+
+def test_recreating_an_existing_snapshot_is_a_miss():
+    # A1 의 복원 컨테이너는 측정 구간(09:10 KST) 전에 로그를 남겼으므로 판정에서 빠진다.
+    containers = dc.summarize_logs(RESTORED_A1 + RECREATED_B1, datetime(2026, 10, 30, 0, 10, tzinfo=UTC))
+
+    assert {c: dc.snapshot_state(log)[0] for c, log in containers.items()} == {
+        "ta-01M652A69TT0CATRSX2RY93P0R": "snapshot_miss"}
+    assert dc.judge_warmup(containers)[0] == "ok"
+    assert dc.judge_validation(containers)[0] == "miss"
+
+
+def test_sh_restore_failure_then_reinit_is_a_fallback_not_a_hit():
+    # 회귀: 기존 로직은 'Restoring' 줄만 보고 hit 로 판정했다.
+    containers = dc.summarize_logs(SH_RESTORE_FALLBACK, SINCE_1030)
+
+    state, reason = dc.snapshot_state(containers[SH_CONTAINER])
+    assert state == "restore_failed_fallback" and "exit code 137" in reason
+    assert dc.judge_validation(containers)[0] == "restore_failed_fallback"
+    assert dc.judge_warmup(containers)[0] == "restore_failed_fallback"
+    assert dc.startup_failures(containers) == []  # Modal 이 스스로 복구했다(시작 실패가 아니다)
+
+
+def test_snapshot_creation_failure_is_its_own_state():
+    assert states(L4_SNAPSHOT_FAILURE, SINCE) == {"ta-01M5SK7F6GBYGG8XZJXK6AXZ9R": "snapshot_creation_failed"}
+    assert dc.judge_validation(dc.summarize_logs(LIST_L4_REQUEST, SINCE))[0] == "snapshot_failed"
+
+
+@pytest.mark.parametrize(
+    "failure_line",
+    [
+        f"2026-10-30 09:23:10+09:00 {SH_CONTAINER} Runner failed with exception: RuntimeError('model load failed')",
+        f"2026-10-30 09:23:10+09:00 {SH_CONTAINER} Runner killed (SIGKILL), exit code: 137.",
+    ],
+)
+def test_a_failed_reinit_after_a_restore_failure_is_not_a_fallback(failure_line):
+    lines = SH_RESTORE_FALLBACK[:3] + [failure_line]
+    containers = dc.summarize_logs(lines, SINCE_1030)
+
+    state, reason = dc.snapshot_state(containers[SH_CONTAINER])
+    assert state == "init_failure" and "복원 실패 뒤" in reason
+    [failure] = dc.startup_failures(containers)
+    assert "복원 실패 뒤" in failure["detail"]
+    # 재초기화가 실패했다면 뒤에 다른 컨테이너가 200 을 내도 정상으로 보지 않는다.
+    retried = [line.replace(SH_CONTAINER, "ta-01M6530RETRY0000000000000R") for line in SH_RESTORE_FALLBACK[2:]]
+    assert dc.judge_validation(dc.summarize_logs(lines + retried, SINCE_1030))[0] == "init_failure"
+
+
+def test_restore_error_and_readiness_from_different_containers_are_not_combined():
+    other = "ta-01M6530OTHER000000000000R"
+    # X 는 복원 실패만, Y 는 (복원 표시 없이) 준비 완료·200 만 남겼다. 합쳐서 fallback 으로 보지 않는다.
+    mixed = SH_RESTORE_FALLBACK[:2] + [line.replace(SH_CONTAINER, other) for line in SH_RESTORE_FALLBACK[2:]]
+    containers = dc.summarize_logs(mixed, SINCE_1030)
+
+    assert states(mixed) == {SH_CONTAINER: "incomplete", other: "snapshot_disabled"}
+    status, reason = dc.judge_validation(containers)
+    assert status == "snapshot_disabled" and SH_CONTAINER in reason  # 다른 컨테이너의 복원 실패도 이유에 남긴다
+
+
+def test_a_clean_restore_is_still_a_hit_next_to_another_containers_restore_failure():
+    lines = SH_RESTORE_FALLBACK[:2] + RESTORED_A1
+
+    status, reason = dc.judge_validation(dc.summarize_logs(lines, SINCE_1030))
+
+    assert status == "hit" and f"복원 실패: ['{SH_CONTAINER}']" in reason
+
+
+@pytest.mark.parametrize(
+    ("lines", "removed"),
+    [
+        (SH_RESTORE_FALLBACK, ("Transient snapshot error",)),  # 오류 줄이 빠지면 hit 로 추측하지 않는다
+        (SH_RESTORE_FALLBACK, ("runtime=ready",)),  # 재초기화 완료를 확인할 수 없다
+        (SH_RESTORE_FALLBACK, ("Restoring Function",)),  # 복원 시도를 확인할 수 없다
+        (RESTORED_A1, ("runtime=ready",)),  # 복원 뒤 준비 완료를 확인할 수 없다
+        (VALIDATION_MISS, ("snap=True done", "snap=False done")),  # 4-A 의 옛 형식처럼 lifecycle 줄이 없다
+        (VALIDATION_MISS, ("runtime=ready",)),
+    ],
+)
+def test_missing_lines_never_produce_a_normal_state(lines, removed):
+    partial = without(lines, *removed)
+
+    assert set(states(partial).values()) == {"incomplete"}
+    assert dc.judge_validation(dc.summarize_logs(partial, SINCE_1030))[0] == "incomplete"
+
+
+def test_readiness_logged_before_a_restore_error_does_not_count():
+    # 복원 오류 앞에 찍힌 준비 완료 줄은 재초기화 결과가 아니다.
+    ready = next(line for line in SH_RESTORE_FALLBACK if "runtime=ready" in line).replace("09:23:14", "09:23:02")
+    lines = [SH_RESTORE_FALLBACK[0], ready, SH_RESTORE_FALLBACK[1], SH_RESTORE_FALLBACK[-1]]
+
+    assert states(lines) == {SH_CONTAINER: "incomplete"}
+
+
+def test_smoke_retries_after_a_restore_fallback_and_then_passes(tmp_path):
+    report = run_smoke(FakeOps([WARMUP_OK, SH_RESTORE_FALLBACK, VALIDATION_HIT]), FakeHttp, tmp_path)
+
+    assert report["result"] == "PASS"
+    assert [a["snapshot"] for a in report["validation"]] == ["restore_failed_fallback", "hit"]
+
+
+def test_smoke_continues_when_the_health_container_fell_back(tmp_path):
+    # /health 가 fallback 이면 snapshot 은 있었다. 쓸 수 있는지는 검증 요청의 HIT 로 확인한다.
+    report = run_smoke(FakeOps([SH_RESTORE_FALLBACK, VALIDATION_HIT]), FakeHttp, tmp_path)
+
+    assert report["snapshot_creation"]["status"] == "restore_failed_fallback"
+    assert report["result"] == "PASS"
+
+
+def test_smoke_fails_when_every_attempt_falls_back(tmp_path):
+    with pytest.raises(dc.SmokeFailure) as failure:
+        run_smoke(FakeOps([WARMUP_OK, SH_RESTORE_FALLBACK]), FakeHttp, tmp_path)
+
+    assert failure.value.stage == "restore" and "restore_failed_fallback" in failure.value.reason
+
+
 # --- production preflight (읽기 전용. production 은 deploy 하지 않는다) ---
 
 
@@ -577,7 +822,8 @@ def test_deploy_refusal_prints_the_cap_in_the_manual_command(monkeypatch, capsys
     out = capsys.readouterr().out
     assert code == 2
     assert ("BODY_IMAGE_WORKER_STAGE=production BODY_IMAGE_WORKER_GPU_SNAPSHOT=true "
-            "BODY_IMAGE_WORKER_MAX_CONTAINERS=2 BODY_IMAGE_WORKER_DIAGNOSTICS=false modal deploy") in out
+            "BODY_IMAGE_WORKER_MAX_CONTAINERS=2 BODY_IMAGE_WORKER_DIAGNOSTICS=false "
+            "BODY_IMAGE_WORKER_MAX_INPUTS=1 modal deploy") in out
 
 
 # --- 검사한 설정 = 실제 배포 설정 ---
@@ -612,6 +858,7 @@ def test_deploy_env_states_every_deploy_variable():
     assert dc.deploy_env("production") == {
         "BODY_IMAGE_WORKER_STAGE": "production", "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "false",
         "BODY_IMAGE_WORKER_MAX_CONTAINERS": "", "BODY_IMAGE_WORKER_DIAGNOSTICS": "false",
+        "BODY_IMAGE_WORKER_MAX_INPUTS": "1",
     }
 
 
@@ -720,3 +967,308 @@ def test_cpu_manual_command_overrides_a_leftover_gpu_flag():
     assert "BODY_IMAGE_WORKER_GPU_SNAPSHOT=false" in command and "BODY_IMAGE_WORKER_MAX_CONTAINERS=''" in command
     assert resolved({"BODY_IMAGE_WORKER_STAGE": "production", "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "false",
                      "BODY_IMAGE_WORKER_MAX_CONTAINERS": "", "BODY_IMAGE_WORKER_DIAGNOSTICS": "false"})["gpu_snapshot"] is False
+
+
+# --- 컨테이너당 입력 ---
+
+
+def checks_by_name(checks):
+    return {check.name: check.ok for check in checks}
+
+
+@pytest.mark.parametrize("max_inputs", [1, 2])
+def test_concurrency_checks_pass_on_the_real_file(max_inputs):
+    module, calls = dc.load_worker("staging", max_inputs=max_inputs)
+
+    assert all(check.ok for check in dc.check_concurrency(module, calls, max_inputs))
+    assert all(check.ok for check in dc.check_deploy_config(module, calls, "staging"))
+
+
+def test_loading_the_worker_leaves_modal_as_it_was():
+    import modal
+
+    original = modal.concurrent
+
+    dc.load_worker("staging", max_inputs=2)
+
+    assert modal.concurrent is original
+
+
+def test_one_input_loads_without_the_decorator():
+    _, calls = dc.load_worker("staging")
+
+    assert [options for name, options in calls if name == "concurrent"] == []
+
+
+def test_a_deploy_file_that_skips_the_decorator_fails_the_check():
+    module, calls = dc.load_worker("staging", max_inputs=2)
+    without = [call for call in calls if call[0] != "concurrent"]
+
+    assert checks_by_name(dc.check_concurrency(module, without, 2))["modal concurrency"] is False
+
+
+def test_a_worker_limiter_that_differs_from_the_inputs_fails_the_check(monkeypatch):
+    module, calls = dc.load_worker("staging", max_inputs=2)
+    monkeypatch.setitem(module.STAGE_ENV["env"], "MAX_CONCURRENT_BODY_VALIDATIONS", "1")
+
+    assert checks_by_name(dc.check_concurrency(module, calls, 2))["worker limiter env"] is False
+
+
+def test_preflight_with_two_inputs_checks_the_two_values(monkeypatch):
+    lookddak_profile(monkeypatch)
+
+    _, checks = dc.preflight("staging", "lookddak", max_inputs=2)
+
+    assert all(check.ok for check in checks)
+    assert {"max inputs", "modal concurrency", "worker limiter env"} <= {check.name for check in checks}
+
+
+@pytest.mark.parametrize("max_inputs", [0, -1, 3])
+def test_preflight_refuses_values_outside_one_and_two(monkeypatch, max_inputs):
+    lookddak_profile(monkeypatch)
+
+    _, checks = dc.preflight("staging", "lookddak", max_inputs=max_inputs)
+
+    assert not all(check.ok for check in checks)
+    assert "load deploy file" in {check.name for check in checks if not check.ok}
+
+
+@pytest.mark.parametrize(
+    "snapshot", [{"gpu_snapshot": True, "max_containers": 3}, {}], ids=["gpu-snapshot", "cpu-snapshot"]
+)
+def test_production_preflight_accepts_two_inputs_when_set_explicitly(monkeypatch, snapshot):
+    seen = lookddak_profile(monkeypatch)
+
+    _, checks = dc.preflight("production", "lookddak", max_inputs=2, **snapshot)
+
+    assert all(check.ok for check in checks), [c for c in checks if not c.ok]
+    assert {"modal concurrency", "worker limiter env", "worker max inputs env"} <= {c.name for c in checks}
+    assert seen == ["lookddak-body-image-worker"]
+
+
+def test_production_preflight_keeps_one_input_by_default(monkeypatch, capsys):
+    lookddak_profile(monkeypatch)
+
+    assert dc.main(["preflight", "--stage", "production", "--workspace", "lookddak", "--gpu-snapshot",
+                    "--max-containers", "3"]) == 0
+
+    out = capsys.readouterr().out
+    assert "[PASS] max inputs: MAX_INPUTS=1" in out
+    assert "BODY_IMAGE_WORKER_MAX_INPUTS=1 modal deploy" in out
+
+
+def test_production_manual_command_carries_the_two_inputs(monkeypatch, capsys):
+    lookddak_profile(monkeypatch)
+    monkeypatch.setattr(dc.subprocess, "run", lambda *a, **k: pytest.fail("production 은 배포하지 않는다"))
+
+    assert dc.main(["preflight", "--stage", "production", "--workspace", "lookddak", "--gpu-snapshot",
+                    "--max-containers", "3", "--max-inputs", "2"]) == 0
+    assert dc.main(["deploy", "--stage", "production", "--workspace", "lookddak", "--gpu-snapshot",
+                    "--max-containers", "3", "--max-inputs", "2"]) == 2  # 이 도구로는 여전히 배포하지 않는다
+
+    command = capsys.readouterr().out.splitlines()[-1]
+    assigns = dict(word.split("=", 1) for word in command.split() if word.startswith("BODY_IMAGE_WORKER_"))
+    checked, _ = dc.load_worker("production", gpu_snapshot=True, max_containers=3, max_inputs=2)
+    assert assigns["BODY_IMAGE_WORKER_MAX_INPUTS"] == "2"
+    assert resolved(assigns) == config_of(checked)
+
+
+@pytest.mark.parametrize("missing", ["MAX_CONCURRENT_BODY_VALIDATIONS", "BODY_IMAGE_WORKER_MAX_INPUTS"])
+def test_two_inputs_without_either_container_value_fail_the_check(monkeypatch, missing):
+    # 컨테이너는 둘을 비교해 다르면 멈춘다. 하나라도 빠지면 그 비교가 되지 않는다.
+    module, calls = dc.load_worker("production", max_inputs=2)
+    monkeypatch.delitem(module.STAGE_ENV["env"], missing)
+
+    failed = [name for name, ok in checks_by_name(dc.check_concurrency(module, calls, 2)).items() if not ok]
+
+    assert len(failed) == 1
+
+
+def test_cpu_production_function_env_may_carry_only_the_concurrency_values(monkeypatch):
+    module, calls = dc.load_worker("production", max_inputs=2)
+    assert all(c.ok for c in dc.check_deploy_config(module, calls, "production"))
+
+    monkeypatch.setitem(module.STAGE_ENV["env"], "BODY_IMAGE_WORKER_STAGE", "production")
+    assert "no stage env" in [c.name for c in dc.check_deploy_config(module, calls, "production") if not c.ok]
+
+
+def test_deploy_passes_the_checked_inputs_to_modal(monkeypatch):
+    lookddak_profile(monkeypatch)
+    ran = {}
+    monkeypatch.setattr(dc.subprocess, "run",
+                        lambda cmd, env, check: ran.update(env=env) or type("R", (), {"returncode": 0}))
+
+    assert dc.main(["deploy", "--stage", "staging", "--workspace", "lookddak", "--max-inputs", "2"]) == 0
+
+    assert ran["env"]["BODY_IMAGE_WORKER_MAX_INPUTS"] == "2"
+
+
+def test_cli_value_reaches_preflight(monkeypatch):
+    lookddak_profile(monkeypatch)
+    monkeypatch.setattr(dc.subprocess, "run", lambda *a, **k: pytest.fail("배포하면 안 된다"))
+
+    assert dc.main(["deploy", "--stage", "staging", "--workspace", "lookddak", "--max-inputs", "3"]) == 1
+
+
+def test_a_shell_value_that_differs_from_the_checked_inputs_fails_preflight(monkeypatch):
+    lookddak_profile(monkeypatch)
+    monkeypatch.setenv("BODY_IMAGE_WORKER_MAX_INPUTS", "2")
+
+    _, checks = dc.preflight("staging", "lookddak")
+
+    assert [check.name for check in checks if not check.ok] == ["deploy env sources"]
+
+
+STAGING_URL = "https://leejein--lookddak-body-image-staging.modal.run"
+PRODUCTION_URL = "https://lookddak--lookddak-body-image.modal.run"
+
+
+def registered_info(url=STAGING_URL, unauthenticated=False, **overrides):
+    """`modal function info --json` 에서 검사에 쓰는 필드(staging 실측 형식)."""
+    return {"gpus": [["T4", 1]], "max_containers": 1, "min_containers": None, "concurrency_info": None,
+            "method_details": {"web": {"web_url": url, "method": None, "unauthenticated": unauthenticated}},
+            **overrides}
+
+
+def production_info(**overrides):
+    return registered_info(url=PRODUCTION_URL, **{"max_containers": 3, **overrides})
+
+
+def staging_check(info, max_inputs):
+    return dc.check_registered(info, max_inputs, max_containers=1, label=dc.LABELS["staging"])
+
+
+@pytest.mark.parametrize(
+    ("info", "max_inputs", "failed"),
+    [
+        (registered_info(), 1, []),
+        (registered_info(concurrency_info={"max_inputs": 2, "target_inputs": 2}), 2, []),
+        (registered_info(), 2, ["registered concurrency"]),
+        (registered_info(concurrency_info={"max_inputs": 2, "target_inputs": 1}), 2, ["registered concurrency"]),
+        (registered_info(concurrency_info={"max_inputs": 2, "target_inputs": 2}), 1, ["registered concurrency"]),
+        (registered_info(max_containers=2), 1, ["registered max containers"]),
+        (registered_info(gpus=[["L4", 1]]), 1, ["registered gpu"]),
+        (registered_info(min_containers=1), 1, ["registered min containers"]),
+        (registered_info(unauthenticated=True), 1, ["registered proxy auth"]),
+        (registered_info(url=PRODUCTION_URL), 1, ["registered label"]),
+        (registered_info(url="https://leejein-dev--lookddak-body-image-staging.modal.run"), 1, []),
+    ],
+    ids=["one", "two", "not-registered", "target-differs", "expected-one", "two-containers", "other-gpu",
+         "warm-container", "proxy-off", "production-url", "other-environment"],
+)
+def test_registered_function_is_compared_with_the_expected_values(info, max_inputs, failed):
+    assert [check.name for check in staging_check(info, max_inputs) if not check.ok] == failed
+
+
+@pytest.mark.parametrize(
+    ("info", "max_inputs", "max_containers", "failed"),
+    [
+        (production_info(), 1, 3, []),  # 지금 production(입력 1·상한 3)
+        (production_info(concurrency_info={"max_inputs": 2, "target_inputs": 2}), 2, 3, []),
+        (production_info(), 2, 3, ["registered concurrency"]),  # 입력 2 로 배포되지 않았다
+        (production_info(max_containers=1), 1, 3, ["registered max containers"]),  # staging 의 1 을 가정하지 않는다
+        (production_info(max_containers=5), 1, 5, []),
+        (registered_info(max_containers=3), 1, 3, ["registered label"]),  # staging 함수
+    ],
+    ids=["current", "two-inputs", "inputs-not-applied", "cap-differs", "cap-five", "staging-function"],
+)
+def test_production_registration_is_compared_with_explicit_values(info, max_inputs, max_containers, failed):
+    checks = dc.check_registered(info, max_inputs, max_containers=max_containers, label=dc.LABELS["production"])
+
+    assert [check.name for check in checks if not check.ok] == failed
+
+
+class RecordingOps:
+    """registered 가 부르는 읽기 전용 조회만 있다(배포·rollback·stop 은 없다)."""
+
+    def __init__(self, info=None, missing=False):
+        self.info, self.missing, self.calls = info or registered_info(), missing, []
+
+    def app_info(self, name):
+        self.calls.append(("app_info", name))
+        if self.missing:
+            raise RuntimeError("modal app info failed: App not found")
+        return {"functions": {"BodyImageWorker.*": {"id": "fu-1"}}}
+
+    def function_info(self, function_id):
+        self.calls.append(("function_info", function_id))
+        return self.info
+
+
+def test_production_registered_check_reads_the_production_app_with_the_expected_cap():
+    ops = RecordingOps(production_info(concurrency_info={"max_inputs": 2, "target_inputs": 2}))
+
+    checks = dc.registered_checks(ops, "production", "lookddak", max_inputs=2, max_containers=3)
+
+    assert all(check.ok for check in checks), [c for c in checks if not c.ok]
+    assert ops.calls == [("app_info", "lookddak-body-image-worker"), ("function_info", "fu-1")]
+
+
+@pytest.mark.parametrize(
+    ("workspace", "max_inputs", "max_containers", "failed"),
+    [
+        ("lookddak", 2, None, ["expected max containers"]),
+        ("leejein", 2, 3, ["production workspace"]),
+        ("lookddak", 3, 3, ["expected max inputs"]),
+    ],
+    ids=["no-cap", "personal-workspace", "three-inputs"],
+)
+def test_production_registered_check_needs_explicit_values_before_reading(workspace, max_inputs, max_containers, failed):
+    ops = RecordingOps(production_info())
+
+    checks = dc.registered_checks(ops, "production", workspace, max_inputs, max_containers)
+
+    assert [check.name for check in checks if not check.ok] == failed
+    assert ops.calls == []  # 기대값이 정해지지 않으면 조회하지 않는다
+
+
+def test_staging_registered_check_keeps_one_container():
+    assert [c.name for c in dc.registered_checks(RecordingOps(), "staging", "leejein", 1, 2) if not c.ok] == [
+        "expected max containers"]
+    assert all(c.ok for c in dc.registered_checks(RecordingOps(), "staging", "leejein", 1, None))
+
+
+def test_missing_app_is_a_failed_check_not_a_crash():
+    checks = dc.registered_checks(RecordingOps(missing=True), "production", "lookddak", 1, 3)
+
+    [failed] = [c for c in checks if not c.ok]
+    assert failed.name == "registered app" and "App not found" in failed.detail
+
+
+def test_registered_command_only_reads_the_app(monkeypatch):
+    profiles = [{"name": "leejein", "workspace": "leejein", "active": False}]
+    monkeypatch.setattr(dc, "modal_cli", lambda *args, **kwargs: json.dumps(profiles))
+    monkeypatch.setenv("MODAL_PROFILE", "leejein")
+    cli_calls = []
+
+    class Ops:
+        def __init__(self, profile):
+            self.profile = profile
+
+        def app_info(self, name):
+            cli_calls.append(("app_info", name))
+            return {"functions": {"BodyImageWorker.*": {"id": "fu-1"}}}
+
+        def function_info(self, function_id):
+            cli_calls.append(("function_info", function_id))
+            return registered_info()
+
+    monkeypatch.setattr(dc, "ModalOps", Ops)
+
+    assert dc.main(["registered", "--workspace", "leejein"]) == 0
+    assert dc.main(["registered", "--workspace", "leejein", "--max-inputs", "2"]) == 1
+    assert cli_calls == [("app_info", "lookddak-body-image-worker-staging"), ("function_info", "fu-1")] * 2
+
+
+def test_production_registered_command_needs_the_lookddak_profile(monkeypatch):
+    profiles = [{"name": "lookddak", "workspace": "lookddak", "active": True}]
+    monkeypatch.setattr(dc, "modal_cli", lambda *args, **kwargs: json.dumps(profiles))
+    monkeypatch.delenv("MODAL_PROFILE", raising=False)
+    ops = RecordingOps(production_info(concurrency_info={"max_inputs": 2, "target_inputs": 2}))
+    monkeypatch.setattr(dc, "ModalOps", lambda profile: ops)
+
+    assert dc.main(["registered", "--stage", "production", "--workspace", "lookddak",
+                    "--max-inputs", "2", "--max-containers", "3"]) == 0
+    assert dc.main(["registered", "--stage", "production", "--workspace", "leejein",
+                    "--max-inputs", "2", "--max-containers", "3"]) == 1  # profile 의 Workspace 와 다르다
+    assert [name for name, _ in ops.calls] == ["app_info", "function_info"]

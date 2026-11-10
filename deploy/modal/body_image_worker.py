@@ -39,7 +39,9 @@ STAGE_VAR = "BODY_IMAGE_WORKER_STAGE"
 GPU_SNAPSHOT_VAR = "BODY_IMAGE_WORKER_GPU_SNAPSHOT"
 MAX_CONTAINERS_VAR = "BODY_IMAGE_WORKER_MAX_CONTAINERS"
 DIAGNOSTICS_VAR = "BODY_IMAGE_WORKER_DIAGNOSTICS"
-DEPLOY_VARS = (STAGE_VAR, GPU_SNAPSHOT_VAR, MAX_CONTAINERS_VAR, DIAGNOSTICS_VAR)
+MAX_INPUTS_VAR = "BODY_IMAGE_WORKER_MAX_INPUTS"
+DEPLOY_VARS = (STAGE_VAR, GPU_SNAPSHOT_VAR, MAX_CONTAINERS_VAR, DIAGNOSTICS_VAR, MAX_INPUTS_VAR)
+WORKER_LIMITER_VAR = "MAX_CONCURRENT_BODY_VALIDATIONS"
 MAX_CONTAINERS_SANITY_LIMIT = 20
 IMAGE_STAGE_VAR = "BODY_IMAGE_WORKER_IMAGE_STAGE"
 IMAGE_GPU_SNAPSHOT_VAR = "BODY_IMAGE_WORKER_IMAGE_GPU_SNAPSHOT"
@@ -56,6 +58,7 @@ class DeployConfig:
     gpu_snapshot: bool
     max_containers: int | None
     diagnostics: bool
+    max_inputs: int
 
 
 def _flag(environ: Mapping[str, str], name: str) -> str:
@@ -63,6 +66,14 @@ def _flag(environ: Mapping[str, str], name: str) -> str:
     if value not in ("", "true", "false"):
         raise ValueError(f"{name} 는 true 또는 false 여야 합니다: {value!r}")
     return value
+
+
+def _max_inputs(environ: Mapping[str, str]) -> int:
+    """컨테이너당 입력 수. 비우면 1 이고, 2 는 명시했을 때만 쓴다(staging·production 같은 규칙)."""
+    raw = (environ.get(MAX_INPUTS_VAR) or "").strip()
+    if raw not in ("", "1", "2"):
+        raise ValueError(f"{MAX_INPUTS_VAR} 는 1 또는 2 여야 합니다: {raw!r}")
+    return int(raw or "1")
 
 
 def resolve_deploy_config(environ: Mapping[str, str], *, in_container: bool) -> DeployConfig:
@@ -81,6 +92,7 @@ def resolve_deploy_config(environ: Mapping[str, str], *, in_container: bool) -> 
     if stage not in DEPLOY_TARGETS:
         raise ValueError(f"{STAGE_VAR} 는 production 또는 staging 이어야 합니다: {stage!r}")
 
+    max_inputs = _max_inputs(environ)
     gpu_flag = _flag(environ, GPU_SNAPSHOT_VAR)
     if stage == "staging" and gpu_flag == "false":
         raise ValueError("staging 은 GPU snapshot 을 끌 수 없습니다(검증 환경).")
@@ -105,7 +117,7 @@ def resolve_deploy_config(environ: Mapping[str, str], *, in_container: bool) -> 
     if stage == "staging":
         max_containers = 1  # 비용·테스트 통제
     return DeployConfig(stage=stage, **DEPLOY_TARGETS[stage], gpu_snapshot=gpu_snapshot,
-                        max_containers=max_containers, diagnostics=diagnostics)
+                        max_containers=max_containers, diagnostics=diagnostics, max_inputs=max_inputs)
 
 
 CONFIG = resolve_deploy_config(os.environ, in_container=LOCAL_PROJECT_ROOT is None)
@@ -124,9 +136,7 @@ ONNXRUNTIME_GPU = "onnxruntime-gpu[cuda,cudnn]==1.30.0"
 TORCH = ("torch==2.14.1", "torchvision==0.29.1")
 TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu130"
 
-# 단일 요청 peak: CPU 2.92 core, RAM 6.46GiB, VRAM 1.37GiB. 컨테이너당 동시 요청은 기본값 1 이다
-# (동시 요청 데코레이터를 쓰지 않는다). 공통 자원은 CPU memory snapshot 까지다. GPU snapshot 은 아래
-# GPU_SNAPSHOT 일 때만 STAGE_SNAPSHOT 으로 켠다.
+# 공통 자원은 CPU memory snapshot 까지다. GPU snapshot 은 아래 GPU_SNAPSHOT 일 때만 STAGE_SNAPSHOT 으로 켠다.
 WORKER_RESOURCES = {
     "gpu": "T4",
     "cpu": 4,
@@ -148,13 +158,19 @@ WORKER_GPU = WORKER_RESOURCES["gpu"]
 GPU_SNAPSHOT = CONFIG.gpu_snapshot
 STAGE_SNAPSHOT = {"experimental_options": {"enable_gpu_snapshot": True}} if GPU_SNAPSHOT else {}
 # 컨테이너는 이 파일을 다시 import 해 lifecycle 을 고른다. 로컬 환경변수는 컨테이너에 없으므로 GPU snapshot 배포는
-# stage 와 GPU snapshot 여부를 컨테이너 환경변수로 넘긴다(CPU snapshot production 은 넘기지 않는다).
-# staging 검증용 진단(요청별 단계 시간 로그 + rembg ONNX Runtime profiling). 배포할 때
+# stage 와 GPU snapshot 여부를 컨테이너 환경변수로 넘긴다(CPU snapshot production 은 stage 를 넘기지 않는다).
+# staging 검증용 진단(요청별 단계 시간·Lock 대기/보유·메모리 로그 + rembg ONNX Runtime profiling). 배포할 때
 # BODY_IMAGE_WORKER_DIAGNOSTICS=true 로만 켠다. profiling 은 snapshot 전 warm-up(1번째)과 복원 뒤 첫
 # 요청(2번째)까지만 기록하고 끝낸다. production 에서는 켤 수 없다.
 DIAGNOSTICS = CONFIG.diagnostics
 DIAGNOSTIC_ENV = {"BODY_IMAGE_DIAGNOSTICS": "true", "BODY_IMAGE_REMBG_PROFILE_RUNS": "2"} if DIAGNOSTICS else {}
-STAGE_ENV = {"env": {STAGE_VAR: STAGE, GPU_SNAPSHOT_VAR: "true", **DIAGNOSTIC_ENV}} if GPU_SNAPSHOT else {}
+MAX_INPUTS = CONFIG.max_inputs
+# 입력 2 는 snapshot 방식과 상관없이 입력 수와 Worker Limiter 를 함께 넘긴다(컨테이너가 둘을 비교한다).
+# config 는 snap=True 에서 import 되므로 Secret 이 아니라 함수 env 로 넘긴다.
+CONCURRENCY_ENV = {MAX_INPUTS_VAR: str(MAX_INPUTS), WORKER_LIMITER_VAR: str(MAX_INPUTS)} if MAX_INPUTS > 1 else {}
+GPU_SNAPSHOT_ENV = {STAGE_VAR: STAGE, GPU_SNAPSHOT_VAR: "true", **DIAGNOSTIC_ENV} if GPU_SNAPSHOT else {}
+FUNCTION_ENV = {**GPU_SNAPSHOT_ENV, **CONCURRENCY_ENV}
+STAGE_ENV = {"env": FUNCTION_ENV} if FUNCTION_ENV else {}
 
 WORKER_ENV = {
     "PYTHONUNBUFFERED": "1",
@@ -254,6 +270,15 @@ def resolve_gpu_snapshot() -> bool:
     return gpu_snapshot
 
 
+def check_worker_concurrency(limiter_max_running: int) -> None:
+    if MAX_INPUTS > 1 and limiter_max_running != MAX_INPUTS:
+        raise StageConfigError(f"Modal 입력({MAX_INPUTS})과 Worker Limiter({limiter_max_running})가 다릅니다.")
+
+
+def worker_concurrency(cls):
+    return modal.concurrent(max_inputs=MAX_INPUTS, target_inputs=MAX_INPUTS)(cls) if MAX_INPUTS > 1 else cls
+
+
 def _cuda_device_name() -> str | None:
     """실제로 붙은 GPU 이름(torch 공개 API). torch·CUDA 가 없으면 None."""
     try:
@@ -272,6 +297,7 @@ def _cuda_device_name() -> str | None:
     **STAGE_SNAPSHOT,
     **STAGE_ENV,
 )
+@worker_concurrency
 class BodyImageWorker:
     @modal.enter(snap=True)
     def prepare_snapshot(self) -> None:
@@ -281,6 +307,7 @@ class BodyImageWorker:
         self.detectors = None
         self.models = self.warmup_ms = None
         self.gpu_snapshot = resolve_gpu_snapshot()
+        check_worker_concurrency(worker.config.MAX_CONCURRENT_BODY_VALIDATIONS)
         gpu = None
         if self.gpu_snapshot:
             self.models, self.warmup_ms = worker.prepare_gpu_snapshot(require_cuda=True)
@@ -304,6 +331,7 @@ class BodyImageWorker:
         if resolve_gpu_snapshot() != self.gpu_snapshot:
             # 복원된 컨테이너의 stage 가 snapshot 을 만들 때와 다르다. 다른 경로로 바꾸지 않고 멈춘다.
             raise StageConfigError(f"복원 뒤 stage({container_stage()!r})가 snapshot 구성과 다릅니다.")
+        check_worker_concurrency(worker.config.MAX_CONCURRENT_BODY_VALIDATIONS)
         if self.gpu_snapshot:
             if self.models is None:
                 raise SnapshotStateError("복원된 snapshot 에 GPU 모델이 없습니다.")
@@ -313,7 +341,8 @@ class BodyImageWorker:
             timings = worker.start_gpu(*self.detectors)
         print(
             f"body image worker lifecycle: snap=False done start={started:.3f} end={time.time():.3f} "
-            f"runtime={'ready' if timings is not None else 'unavailable'} warmup_ms={_rounded(timings)}",
+            f"runtime={'ready' if timings is not None else 'unavailable'} max_inputs={MAX_INPUTS} "
+            f"limiter={worker.config.MAX_CONCURRENT_BODY_VALIDATIONS} warmup_ms={_rounded(timings)}",
             flush=True,
         )
 

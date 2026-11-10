@@ -12,21 +12,21 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 WORKER_FILE = Path(__file__).resolve().parent / "body_image_worker.py"
-DOTENV_FILE = Path(__file__).resolve().parents[2] / ".env"  # modal deploy 는 읽지 않는다. 충돌 검사만 한다
-# 기대 이름. 배포 파일의 DEPLOY_TARGETS 와 따로 적어 두고 비교한다(같은 표를 읽으면 검사가 되지 않는다).
+DOTENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 APP_NAMES = {"production": "lookddak-body-image-worker", "staging": "lookddak-body-image-worker-staging"}
 LABELS = {"production": "lookddak-body-image", "staging": "lookddak-body-image-staging"}
 SECRET_NAMES = {"production": "lookddak-body-image-worker", "staging": "lookddak-body-image-worker-staging"}
-PRODUCTION_WORKSPACE = "lookddak"  # production 은 이 Workspace 에만 배포한다
+PRODUCTION_WORKSPACE = "lookddak" 
 EXPECTED_GPU = "T4"
-# 팀 Workspace. 여기서는 smoke 의 자동 rollback/stop 을 하지 않는다(사람이 판단한다).
 PROTECTED_WORKSPACES = frozenset({"lookddak"})
 REQUIRED_SECRET_KEYS = ("INTERNAL_API_KEY", "S3_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
 STAGING_BUCKET_PREFIX = "lookddak-dev-images"
 DEPLOY_VAR_PREFIX = "BODY_IMAGE_WORKER_"
 MODAL_TARGET_OVERRIDES = ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "MODAL_ENVIRONMENT")
+WORKER_LIMITER_VAR = "MAX_CONCURRENT_BODY_VALIDATIONS"
 _IMAGE_METHODS = ("env", "run_commands", "pip_install", "apt_install", "add_local_file", "add_local_dir")
 
 
@@ -41,16 +41,17 @@ class Check:
 
 
 def deploy_env(stage: str, diagnostics: bool = False, gpu_snapshot: bool = False,
-               max_containers: int | None = None) -> dict[str, str]:
+               max_containers: int | None = None, max_inputs: int = 1) -> dict[str, str]:
     """배포에 쓸 BODY_IMAGE_WORKER_* 전부. 검사(load_worker)·staging 배포·production 수동 명령이 이 값을 같이 쓴다.
 
-    네 값을 모두 명시한다. 셸에 같은 이름이 남아 있어도 이 값이 덮어쓴다(빈 상한은 "상한 없음").
+    값을 모두 명시한다. 셸에 같은 이름이 남아 있어도 이 값이 덮어쓴다(빈 상한은 "상한 없음").
     """
     return {
         "BODY_IMAGE_WORKER_STAGE": stage,
         "BODY_IMAGE_WORKER_GPU_SNAPSHOT": "true" if stage == "staging" or gpu_snapshot else "false",
         "BODY_IMAGE_WORKER_MAX_CONTAINERS": "" if max_containers is None else str(max_containers),
         "BODY_IMAGE_WORKER_DIAGNOSTICS": "true" if diagnostics else "false",
+        "BODY_IMAGE_WORKER_MAX_INPUTS": str(max_inputs),
     }
 
 
@@ -62,16 +63,22 @@ def deploy_process_env(wanted: dict[str, str], profile: str, environ=None) -> di
 
 
 def manual_deploy_command(wanted: dict[str, str]) -> str:
-    """production 수동 배포 명령. 검사한 네 값을 모두 명시한다(셸에 남은 값이 끼어들지 않게)."""
+    """production 수동 배포 명령. 검사한 값을 모두 명시한다(셸에 남은 값이 끼어들지 않게)."""
     assigns = " ".join(f"{name}={shlex.quote(value)}" for name, value in wanted.items())
     return f"MODAL_PROFILE=<{PRODUCTION_WORKSPACE} profile> {assigns} modal deploy deploy/modal/body_image_worker.py"
 
 
-def load_worker(stage: str, diagnostics: bool = False, gpu_snapshot: bool = False, max_containers: int | None = None):
+def load_worker(stage: str, diagnostics: bool = False, gpu_snapshot: bool = False, max_containers: int | None = None,
+                max_inputs: int = 1):
     import modal
 
     calls: list[tuple[str, object]] = []
     originals = {name: getattr(modal.Image, name) for name in _IMAGE_METHODS}
+    original_concurrent = modal.concurrent
+
+    def concurrent_spy(**options):
+        calls.append(("concurrent", options))
+        return original_concurrent(**options)
 
     def make_spy(name, original):
         def spy(self, *args, **kwargs):
@@ -80,8 +87,9 @@ def load_worker(stage: str, diagnostics: bool = False, gpu_snapshot: bool = Fals
         return spy
 
     saved = {name: os.environ.pop(name) for name in list(os.environ) if name.startswith(DEPLOY_VAR_PREFIX)}
-    os.environ.update(deploy_env(stage, diagnostics, gpu_snapshot, max_containers))
+    os.environ.update(deploy_env(stage, diagnostics, gpu_snapshot, max_containers, max_inputs))
     try:
+        modal.concurrent = concurrent_spy
         for name, original in originals.items():
             setattr(modal.Image, name, make_spy(name, original))
         spec = importlib.util.spec_from_file_location("body_image_worker_preflight", WORKER_FILE)
@@ -89,11 +97,87 @@ def load_worker(stage: str, diagnostics: bool = False, gpu_snapshot: bool = Fals
         spec.loader.exec_module(module)
         return module, calls
     finally:
+        modal.concurrent = original_concurrent
         for name, original in originals.items():
             setattr(modal.Image, name, original)
         for name in [name for name in os.environ if name.startswith(DEPLOY_VAR_PREFIX)]:
             del os.environ[name]
         os.environ.update(saved)
+
+
+def check_concurrency(module, calls, max_inputs: int) -> list[Check]:
+    """Modal 입력 동시성과 Worker Limiter 가 같은 값으로 등록되는지. 1 이면 둘 다 건드리지 않는다.
+
+    컨테이너는 함수 env 의 입력 수와 Limiter 를 비교해 다르면 멈춘다. 둘 중 하나라도 빠지면 그 비교가 되지 않는다.
+    """
+    registered = [options for name, options in calls if name == "concurrent"]
+    expected = [{"max_inputs": max_inputs, "target_inputs": max_inputs}] if max_inputs > 1 else []
+    function_env = module.STAGE_ENV.get("env", {})
+    wanted = str(max_inputs) if max_inputs > 1 else None
+    limiter = function_env.get(WORKER_LIMITER_VAR)
+    inputs = function_env.get(module.MAX_INPUTS_VAR)
+    return [
+        Check("max inputs", module.MAX_INPUTS == max_inputs, f"MAX_INPUTS={module.MAX_INPUTS!r}"),
+        Check("modal concurrency", registered == expected, f"registered={registered!r} expected={expected!r}"),
+        Check("worker limiter env", limiter == wanted, f"{WORKER_LIMITER_VAR}={limiter!r}"),
+        Check("worker max inputs env", inputs == wanted, f"{module.MAX_INPUTS_VAR}={inputs!r}"),
+    ]
+
+
+def check_registered(function_info: dict, max_inputs: int, *, max_containers: int, label: str) -> list[Check]:
+    """Modal 에 등록된 함수가 기대한 동시성·GPU·컨테이너 수·endpoint 인지. 읽기만 한다.
+
+    GPU snapshot 여부와 Worker Limiter 값은 등록 정보에 나오지 않는다. 배포 전에는 preflight 가 배포 파일로,
+    배포 뒤에는 컨테이너가 시작하며(check_worker_concurrency, lifecycle 로그의 max_inputs·limiter) 확인한다.
+    """
+    concurrency = function_info.get("concurrency_info") or {}
+    expected = {"max_inputs": max_inputs, "target_inputs": max_inputs} if max_inputs > 1 else {}
+    registered = {key: concurrency.get(key) for key in expected}
+    gpus = [gpu for gpu, _ in function_info.get("gpus") or []]
+    web = (function_info.get("method_details") or {}).get("web") or {}
+    host = urlsplit(web.get("web_url") or "").hostname or ""
+    return [
+        Check("registered gpu", gpus == [EXPECTED_GPU], f"gpus={function_info.get('gpus')!r}"),
+        Check("registered max containers", function_info.get("max_containers") == max_containers,
+              f"max_containers={function_info.get('max_containers')!r} expected={max_containers!r}"),
+        Check("registered min containers", function_info.get("min_containers") in (None, 0),
+              f"min_containers={function_info.get('min_containers')!r}"),
+        Check("registered concurrency", registered == expected and (max_inputs > 1 or not concurrency),
+              f"concurrency_info={function_info.get('concurrency_info')!r} expected={expected or None!r}"),
+        Check("registered proxy auth", web.get("unauthenticated") is False,
+              f"unauthenticated={web.get('unauthenticated')!r}"),
+        # URL 은 <workspace>[-<environment>]--<label>.modal.run 이다. label 만 본다.
+        Check("registered label", host.split(".")[0].endswith(f"--{label}"), f"host={host!r} label={label!r}"),
+    ]
+
+
+def registered_checks(ops, stage: str, workspace: str, max_inputs: int, max_containers: int | None) -> list[Check]:
+    """등록된 함수 설정을 기대값과 비교한다. app·function 정보만 읽고 배포·호출은 하지 않는다.
+
+    production 은 Workspace 가 PRODUCTION_WORKSPACE 여야 하고 max_containers 기대값을 명시해야 한다. staging 은 1 이다.
+    기대값이 정해지지 않으면 Modal 을 조회하지 않는다.
+    """
+    checks = [Check("expected max inputs", max_inputs in (1, 2), f"--max-inputs={max_inputs!r} (1 또는 2)")]
+    if stage == "production":
+        checks.append(Check("production workspace", workspace == PRODUCTION_WORKSPACE,
+                            f"--workspace={workspace!r} (production 은 {PRODUCTION_WORKSPACE!r})"))
+        checks.append(Check("expected max containers", max_containers is not None,
+                            f"--max-containers={max_containers!r} (production 은 필수)"))
+    else:
+        checks.append(Check("expected max containers", max_containers in (None, 1),
+                            f"--max-containers={max_containers!r} (staging 은 1 고정)"))
+        max_containers = 1
+    if not all(check.ok for check in checks):
+        return checks
+    app_name = APP_NAMES[stage]
+    try:
+        functions = ops.app_info(app_name)["functions"]
+        [function] = functions.values()
+        info = ops.function_info(function["id"])
+    except (RuntimeError, KeyError, ValueError) as error:  # 없는 App·함수 수가 다름·JSON 오류
+        return checks + [Check("registered app", False, f"{app_name}: {type(error).__name__}: {str(error)[:200]}")]
+    checks.append(Check("registered app", True, f"{app_name} (workspace={workspace})"))
+    return checks + check_registered(info, max_inputs, max_containers=max_containers, label=LABELS[stage])
 
 
 def check_deploy_config(module, calls, stage: str, gpu_snapshot: bool = False,
@@ -114,7 +198,7 @@ def check_deploy_config(module, calls, stage: str, gpu_snapshot: bool = False,
               f"min_containers={module.WORKER_RESOURCES.get('min_containers')!r}"),
         Check("gpu snapshot mode", module.GPU_SNAPSHOT is expect_gpu, f"GPU_SNAPSHOT={module.GPU_SNAPSHOT!r}"),
     ]
-    names = [name for name, _ in calls]
+    names = [name for name, _ in calls if name in _IMAGE_METHODS]
     checks.append(Check("code layer last", bool(names) and names[-1] == "add_local_dir" and names.count("add_local_dir") == 1,
                         f"image build order ends with {names[-3:]}"))
     baked = [env for name, env in calls if name == "env" and env and module.IMAGE_STAGE_VAR in env]
@@ -132,9 +216,11 @@ def check_deploy_config(module, calls, stage: str, gpu_snapshot: bool = False,
                   f"image env={baked!r}"),
         ]
     else:
+        # CPU snapshot 은 stage 를 넘기지 않는다. 입력 2 의 동시성 env 만 있을 수 있다(값은 check_concurrency 가 본다).
+        concurrency_vars = {module.MAX_INPUTS_VAR, WORKER_LIMITER_VAR}
         checks += [
             Check("gpu snapshot off", module.STAGE_SNAPSHOT == {}, f"STAGE_SNAPSHOT={module.STAGE_SNAPSHOT!r}"),
-            Check("no stage env", module.STAGE_ENV == {}, f"STAGE_ENV={module.STAGE_ENV!r}"),
+            Check("no stage env", set(function_env) <= concurrency_vars, f"function env={sorted(function_env)}"),
             Check("no image stage env", baked == [], f"image env={baked!r}"),
         ]
     if stage == "staging":
@@ -257,12 +343,12 @@ def modal_cli(*args: str, profile: str | None = None, timeout: float = 120) -> s
 
 
 def preflight(stage: str, workspace: str, diagnostics: bool = False, gpu_snapshot: bool = False,
-              max_containers: int | None = None) -> tuple[str | None, list[Check]]:
+              max_containers: int | None = None, max_inputs: int = 1) -> tuple[str | None, list[Check]]:
     """읽기 전용 배포 전 검사. production 은 Workspace 가 PRODUCTION_WORKSPACE 여야 한다.
 
     배포 대상(Workspace·셸/.env 값)이 확인되지 않으면 Secret 을 조회하지 않는다.
     """
-    wanted = deploy_env(stage, diagnostics, gpu_snapshot, max_containers)
+    wanted = deploy_env(stage, diagnostics, gpu_snapshot, max_containers, max_inputs)
     profiles = json.loads(modal_cli("profile", "list", "--json"))
     profile, workspace_check = resolve_profile(workspace, profiles, os.environ.get("MODAL_PROFILE"))
     checks = [workspace_check, check_modal_target_env(os.environ)]
@@ -272,10 +358,11 @@ def preflight(stage: str, workspace: str, diagnostics: bool = False, gpu_snapsho
     checks.append(check_env_sources(wanted, os.environ, read_dotenv_deploy_vars(DOTENV_FILE)))
     target_ok = all(check.ok for check in checks)
     try:
-        module, calls = load_worker(stage, diagnostics, gpu_snapshot, max_containers)
+        module, calls = load_worker(stage, diagnostics, gpu_snapshot, max_containers, max_inputs)
     except Exception as error:  # noqa: BLE001 - 배포 파일 자체의 설정 오류(staging 이름 충돌 등)도 검사 실패다
         return profile, checks + [Check("load deploy file", False, f"{type(error).__name__}: {error}")]
     checks += check_deploy_config(module, calls, stage, gpu_snapshot, max_containers)
+    checks += check_concurrency(module, calls, max_inputs)
     checks.append(check_lifecycle_decorators())
     checks.append(check_no_private_modal_api())
     if profile and target_ok:
@@ -296,6 +383,9 @@ LOG_LINE = re.compile(r"^(?P<ts>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d[+-]\d\d:\d\d) (?P
 INIT_FAILURE_MARKER = "Runner failed with exception"  # enter hook 등 사용자 코드 예외
 # Modal 이 snapshot 을 만들다 실패했다(2026-10-25 L4 실측). 이어서 Runner killed 가 오기도, 로그가 끊기기도 한다.
 SNAPSHOT_FAILURE_MARKER = "Failed creating Function memory snapshot"
+# Modal 이 snapshot 복원에 실패했다(2026-10-30 T4 실측: "Transient snapshot error: failed to restore container from
+# snapshot with exit code 137. Will retry with no snapshots."). 같은 컨테이너가 snapshot 없이 다시 초기화한다.
+_RESTORE_FAILURE = re.compile(r"Transient snapshot error|failed to restore container from snapshot")
 # 프로세스가 신호로 죽었다. 원인(메모리·snapshot·기타)은 이 줄만으로 알 수 없다.
 _RUNNER_KILLED = re.compile(r"Runner killed \((?P<signal>\w+)\), exit code: (?P<code>\d+)")
 _GPU_NAME = re.compile(r"snap=True done .* gpu=(?P<gpu>.+?) warmup_ms=")
@@ -312,11 +402,13 @@ class ContainerLog:
     creating_gpu: bool = False
     creating_cpu: bool = False
     restoring: bool = False
+    restore_error: str | None = None  # 복원 실패 줄(이 줄 뒤의 snap=True·runtime=ready 는 재초기화 결과다)
     init_failures: list[str] = field(default_factory=list)
     snapshot_failed: bool = False
     runner_killed: str | None = None  # 예: "SIGKILL exit 137"
     stage_ok: bool = False
     gpu_name: str | None = None
+    snap_true_done: bool = False
     runtime_ready: bool = False
     requests: list[tuple[str, str, int]] = field(default_factory=list)
     request_times: dict[str, dict[str, float]] = field(default_factory=dict)
@@ -343,6 +435,10 @@ def summarize_logs(lines: list[str], since: datetime) -> dict[str, ContainerLog]
             log.creating_cpu = True
         elif "Restoring Function from memory snapshot" in msg:
             log.restoring = True
+        if _RESTORE_FAILURE.search(msg):
+            log.restore_error = msg[:200]
+            # 실패 앞의 준비 완료 표시는 버린다. 재초기화가 끝났는지는 이 줄 뒤의 로그로만 본다.
+            log.snap_true_done = log.runtime_ready = False
         if INIT_FAILURE_MARKER in msg:
             log.init_failures.append(msg.split(INIT_FAILURE_MARKER, 1)[1].strip(": ")[:200])
         if SNAPSHOT_FAILURE_MARKER in msg:
@@ -351,6 +447,8 @@ def summarize_logs(lines: list[str], since: datetime) -> dict[str, ContainerLog]
             log.runner_killed = f"{killed['signal']} exit {killed['code']}"
         if "lifecycle: stage=staging gpu_snapshot=True" in msg:
             log.stage_ok = True
+        if "snap=True done" in msg:
+            log.snap_true_done = True
         if (gpu := _GPU_NAME.search(msg)) and gpu["gpu"] != "None":
             log.gpu_name = gpu["gpu"]
         if "snap=False done" in msg and "runtime=ready" in msg:
@@ -390,6 +488,8 @@ def startup_failures(containers: dict[str, ContainerLog]) -> list[dict]:
             kind, detail = "runner_killed", f"runner killed ({c.runner_killed}), cause not confirmed by other logs"
         else:
             continue
+        if c.restore_error:
+            detail += " (snapshot 복원 실패 뒤 재초기화 중)"
         failures.append({"kind": kind, "container": c.container, "detail": detail})
     return failures
 
@@ -415,10 +515,58 @@ def _served(containers, method: str, path: str) -> ContainerLog | None:
     return None
 
 
+def snapshot_state(log: ContainerLog) -> tuple[str, str]:
+    """한 컨테이너의 snapshot 상태와 이유. 그 컨테이너의 줄만 본다(다른 컨테이너 줄은 summarize_logs 가 나눈다).
+
+    - snapshot_creation_failed: `Failed creating Function memory snapshot` 이 있다.
+    - restore_failed_fallback: 복원 시도 → 복원 오류(Transient snapshot error) → 그 뒤 runtime=ready.
+      Modal 이 snapshot 없이 다시 초기화해 성공한 경우다. 복원 오류가 있으면 HIT 보다 이 판정이 먼저다.
+    - snapshot_hit: 복원 시도, 복원 오류 없음, snap=True 재실행 없음, runtime=ready.
+    - snapshot_miss: GPU snapshot 을 새로 만들고(처음이든 다시든) snap=True(GPU 이름)·runtime=ready 까지 끝났다.
+    그 밖에 init_failure(Runner failed/killed), snapshot_disabled(복원·GPU snapshot 생성 표시 없음),
+    incomplete(판정에 필요한 줄이 없음). 줄이 모자라면 정상 상태로 추측하지 않는다.
+    """
+    name = f"container={log.container}"
+    if log.snapshot_failed:
+        return "snapshot_creation_failed", f"{name} Failed creating Function memory snapshot (gpu={log.gpu_name})"
+    if log.init_failures or log.runner_killed:
+        cause = log.init_failures[0] if log.init_failures else f"runner killed ({log.runner_killed})"
+        after = " (snapshot 복원 실패 뒤 재초기화 중)" if log.restore_error else ""
+        return "init_failure", f"{name} {cause}{after}"
+    if log.restore_error:
+        if not log.restoring:
+            return "incomplete", f"{name} 복원 오류가 있지만 'Restoring Function from memory snapshot' 이 없습니다"
+        if not log.runtime_ready:
+            return "incomplete", f"{name} 복원 실패 뒤 재초기화 완료(runtime=ready) 로그가 없습니다"
+        return "restore_failed_fallback", f"{name} snapshot 복원 실패 후 snapshot 없이 재초기화: {log.restore_error}"
+    if log.restoring:
+        if log.snap_true_done:
+            return "incomplete", f"{name} 복원 표시 뒤 snap=True 가 다시 실행됐지만 복원 오류 로그가 없습니다"
+        if not log.runtime_ready:
+            return "incomplete", f"{name} 복원 뒤 runtime=ready 로그가 없습니다"
+        return "snapshot_hit", name
+    if log.creating_cpu or not log.creating_gpu:
+        return "snapshot_disabled", f"{name} 에 Restoring/Creating GPU snapshot 이 없습니다"
+    missing = [n for n, ok in (("gpu name", log.gpu_name), ("runtime ready", log.runtime_ready)) if not ok]
+    if missing:
+        return "incomplete", f"{name} snapshot 생성 lifecycle 로그 누락: {missing}"
+    return "snapshot_miss", f"{name} gpu={log.gpu_name} (새 snapshot 을 만들었다)"
+
+
+# judge_* 가 돌려주던 이름은 그대로 둔다(smoke 보고서·호출처 호환).
+_JUDGE_STATUS = {"snapshot_hit": "hit", "snapshot_miss": "miss", "snapshot_creation_failed": "snapshot_failed"}
+
+
+def _note_other_restore_failures(containers, served: ContainerLog, reason: str) -> str:
+    """응답한 컨테이너만 판정하되, 같은 구간의 다른 컨테이너 복원 실패는 이유에 남긴다(숨기지 않는다)."""
+    others = [c.container for c in containers.values() if c is not served and c.restore_error]
+    return f"{reason}; 다른 컨테이너의 snapshot 복원 실패: {others}" if others else reason
+
+
 def judge_warmup(containers: dict[str, ContainerLog]) -> tuple[str, str]:
     """/health 로 snapshot 이 만들어졌는지.
 
-    ("ok"|"snapshot_failed"|"init_failure"|"snapshot_disabled"|"incomplete", 이유).
+    ("ok"|"restore_failed_fallback"|"snapshot_failed"|"init_failure"|"snapshot_disabled"|"incomplete", 이유).
     """
     if failed := _failure_status(containers):
         # 실패 뒤 다른 컨테이너가 snapshot 없이 200 을 내도(Modal 재시도) 성공으로 보지 않는다.
@@ -426,34 +574,30 @@ def judge_warmup(containers: dict[str, ContainerLog]) -> tuple[str, str]:
     served = _served(containers, "GET", "/health")
     if served is None:
         return "incomplete", "GET /health 200 로그가 없습니다"
-    if served.restoring and served.stage_ok and served.runtime_ready:
+    state, reason = snapshot_state(served)
+    if state in ("snapshot_hit", "snapshot_miss", "restore_failed_fallback") and not served.stage_ok:
+        return "incomplete", f"container={served.container} lifecycle 로그 누락: ['stage']"
+    if state == "snapshot_hit":
         # 이미 이 배포의 snapshot 이 있어 복원됐다(다시 실행한 경우). snap=True 로그(GPU 이름)는 없다.
-        return "ok", f"container={served.container} snapshot already prepared (restored)"
-    if served.creating_cpu or not served.creating_gpu:
-        return "snapshot_disabled", "health 컨테이너에 'Creating GPU memory snapshot' 이 없습니다"
-    missing = [name for name, ok in (("stage", served.stage_ok), ("gpu name", served.gpu_name),
-                                      ("runtime ready", served.runtime_ready)) if not ok]
-    if missing:
-        return "incomplete", f"lifecycle 로그 누락: {missing}"
-    return "ok", f"container={served.container} gpu={served.gpu_name}"
+        reason, state = f"container={served.container} snapshot already prepared (restored)", "ok"
+    elif state == "snapshot_miss":
+        reason, state = f"container={served.container} gpu={served.gpu_name}", "ok"
+    return _JUDGE_STATUS.get(state, state), _note_other_restore_failures(containers, served, reason)
 
 
 def judge_validation(containers: dict[str, ContainerLog]) -> tuple[str, str]:
-    """검증 요청을 처리한 컨테이너가 snapshot 에서 복원됐는지.
+    """검증 요청을 처리한 컨테이너가 snapshot 에서 복원됐는지(snapshot_state 를 기존 이름으로 돌려준다).
 
-    ("hit"|"miss"|"snapshot_failed"|"init_failure"|"snapshot_disabled"|"incomplete", 이유). miss 는 snapshot 을 새로
-    만들었지만 실패하지 않은 경우다(정상 MISS).
+    ("hit"|"miss"|"restore_failed_fallback"|"snapshot_failed"|"init_failure"|"snapshot_disabled"|"incomplete", 이유).
+    miss 는 snapshot 을 새로 만들었지만 실패하지 않은 경우다(정상 MISS). restore_failed_fallback 은 HIT 가 아니다.
     """
     if failed := _failure_status(containers):
         return failed
     served = _served(containers, "POST", "/api/v1/validation/body-image")
     if served is None:
         return "incomplete", "POST 200 로그가 없습니다"
-    if served.restoring:
-        return "hit", f"container={served.container}"
-    if served.creating_gpu:
-        return "miss", f"container={served.container} (새 snapshot 을 만들었다)"
-    return "snapshot_disabled", f"container={served.container} 에 Restoring/Creating GPU snapshot 이 없습니다"
+    state, reason = snapshot_state(served)
+    return _JUDGE_STATUS.get(state, state), _note_other_restore_failures(containers, served, reason)
 
 
 def cuda_check(containers: dict[str, ContainerLog]) -> tuple[bool | None, str]:
@@ -530,7 +674,7 @@ class SmokeLimits:
     max_snapshot_failures: int = 1  # snapshot 생성 실패는 치명적이라 이만큼(기본 1번) 보이면 바로 멈춘다
     scaledown_timeout_s: float = 180
     validation_timeout_s: float = 120
-    max_miss_retries: int = 2  # 일시적 MISS 로 보고 다시 확인할 횟수(이후에도 HIT 가 없으면 실패)
+    max_miss_retries: int = 2  # 일시적 MISS·복원 실패 fallback 으로 보고 다시 확인할 횟수(이후에도 HIT 가 없으면 실패)
     poll_interval_s: float = 5
     log_settle_s: float = 6  # 응답 직후 로그가 모일 때까지 기다리는 시간
 
@@ -653,7 +797,8 @@ def smoke(ops, app_name: str, credentials: dict, image_path: Path, limits: Smoke
     report["snapshot_creation"] = {"status": status, "reason": reason}
     if status == "snapshot_failed":
         raise SmokeFailure("snapshot", reason)
-    if response.status_code != 200 or status != "ok":
+    # restore_failed_fallback: 복원할 snapshot 은 있었다. 쓸 수 있는지는 아래 검증 요청의 HIT 로 확인한다.
+    if response.status_code != 200 or status not in ("ok", "restore_failed_fallback"):
         raise SmokeFailure("warmup", f"health={response.status_code} snapshot={status}: {reason}")
 
     body = image_path.read_bytes()
@@ -688,15 +833,24 @@ def smoke(ops, app_name: str, credentials: dict, image_path: Path, limits: Smoke
             raise SmokeFailure("cuda", cuda_detail)
         if status == "hit":
             break
+        # miss·restore_failed_fallback 은 일시적일 수 있어 다시 확인한다.
     report["validation"] = attempts
     if attempts[-1]["snapshot"] != "hit":
-        raise SmokeFailure("restore", f"{len(attempts)}번 모두 MISS 입니다(장기 HIT 율 문제인지 확인 필요)")
+        statuses = [a["snapshot"] for a in attempts]
+        raise SmokeFailure("restore", f"{len(attempts)}번 모두 HIT 가 아닙니다 {statuses}(장기 HIT 율 문제인지 확인 필요)")
 
     key = (response.json().get("data") or {}).get("s3_key")
     if not key:
         raise SmokeFailure("validation", "응답에 s3_key 가 없습니다")
     report["s3"] = {"key": key, **(s3_checker(secret_name, key) if secret_name else {"skipped": True})}
-    if "refused" in report["s3"] or report["s3"].get("format") not in (None, "PNG"):
+    # 새 WebP 출력과 기존 PNG 출력의 Key·실제 형식·MIME 이 일치해야 한다.
+    # secret_name 이 없으면 기존처럼 S3 검사를 생략한다.
+    expected = {".webp": ("WEBP", "image/webp"), ".png": ("PNG", "image/png")}
+    actual = (report["s3"].get("format"), report["s3"].get("content_type"))
+    if "refused" in report["s3"] or (
+        secret_name and (Path(key).suffix.lower() not in expected
+                         or actual != expected[Path(key).suffix.lower()])
+    ):
         raise SmokeFailure("s3", json.dumps(report["s3"]))
     report["result"] = "PASS"
     return report
@@ -730,6 +884,13 @@ def main(argv: list[str] | None = None) -> int:
                              help="production 을 GPU snapshot 으로 검사(배포 시 BODY_IMAGE_WORKER_GPU_SNAPSHOT=true)")
         command.add_argument("--max-containers", type=int,
                              help="production max_containers(배포 시 BODY_IMAGE_WORKER_MAX_CONTAINERS). GPU snapshot 에 필수")
+        command.add_argument("--max-inputs", type=int, default=1,
+                             help="컨테이너당 입력·Worker Limiter(배포 시 BODY_IMAGE_WORKER_MAX_INPUTS). 1 또는 2")
+    registered_cmd = sub.add_parser("registered", help="등록된 함수 설정을 읽기만 해서 기대값과 비교한다")
+    registered_cmd.add_argument("--stage", choices=sorted(APP_NAMES), default="staging")
+    registered_cmd.add_argument("--workspace", required=True)
+    registered_cmd.add_argument("--max-inputs", type=int, default=1)
+    registered_cmd.add_argument("--max-containers", type=int, help="기대하는 max_containers. production 은 필수")
     smoke_cmd = sub.add_parser("smoke")
     smoke_cmd.add_argument("--workspace", required=True)
     smoke_cmd.add_argument("--image", required=True, type=Path, help="정상 전신사진(JPEG)")
@@ -740,14 +901,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command in ("preflight", "deploy"):
-        wanted = deploy_env(args.stage, args.diagnostics, args.gpu_snapshot, args.max_containers)
+        wanted = deploy_env(args.stage, args.diagnostics, args.gpu_snapshot, args.max_containers, args.max_inputs)
         if args.command == "deploy" and args.stage == "production":
             # 공유 production App 은 이 도구로 배포하지 않는다(자동 배포·중단·롤백 없음). 검사만 한다.
             print("production 은 이 도구로 배포하지 않습니다. preflight 로 검사한 뒤 승인을 받아 직접 실행하세요:\n"
                   f"  {manual_deploy_command(wanted)}")
             return 2
         profile, checks = preflight(args.stage, args.workspace, args.diagnostics, args.gpu_snapshot,
-                                    args.max_containers)
+                                    args.max_containers, args.max_inputs)
         if not print_checks(checks):
             print("preflight FAILED: 배포하지 않습니다.")
             return 1
@@ -767,6 +928,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     os.environ["MODAL_PROFILE"] = profile
     ops = ModalOps(profile)
+    if args.command == "registered":
+        checks = registered_checks(ops, args.stage, args.workspace, args.max_inputs, args.max_containers)
+        return 0 if print_checks(checks) else 1
     module, _ = load_worker("staging")
     app_name = module.APP_NAME
     report: dict = {"workspace": args.workspace, "profile": profile}

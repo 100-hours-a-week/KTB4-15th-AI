@@ -1,9 +1,3 @@
-"""AI Server 진입점.
-
-컨테이너는 `uvicorn app.main:app` 으로 이 파일을 부른다 (Dockerfile CMD).
-로컬에서는 `python -m app.main` 으로도 뜬다.
-"""
-
 import asyncio
 import logging
 from contextlib import asynccontextmanager
@@ -13,6 +7,8 @@ from fastapi import FastAPI
 
 from app import health as health_router
 from app.body_image_validation import router as body_image_validation_router
+from app.body_image_validation import warmup_router as body_image_warmup_router
+from app.body_image_validation.deadline_middleware import BodyImageDeadlineMiddleware
 from app.body_image_validation.runtime import runtime_manager
 from app.chat import router as chat_router
 from app.chat.graph import build_graph
@@ -29,6 +25,7 @@ from app.virtual_fitting.concurrency import create_fitting_limiters
 from app.virtual_fitting.postprocess_worker import (
     connected_postprocess_handlers,
     create_postprocess_worker,
+    register_postprocess_worker,
 )
 from app.virtual_fitting.providers.runware import (
     get_runware_llm_api_key,
@@ -55,6 +52,9 @@ async def lifespan(app: FastAPI):
     # 가상피팅 VTON / LLM 동시 실행 제한. 앱마다 새로 만들어 요청이 앱 상태로 꺼내 쓴다.
     app.state.fitting_limiters = create_fitting_limiters()
     runtime_manager.start()
+    # 전신 이미지 warm-up manager(remote 모드에서만). 아래 try 안에서 만들어, 예상 밖 오류로 시작이 멈춰도
+    # finally 의 정리(runtime·DB pool)가 돈다. 없으면 warm-up API 만 503 이다.
+    app.state.body_image_warmup = None
     # V2 요청 Worker 는 켰을 때만 이 프로세스와 함께 돈다(기본 꺼짐: SQS·AWS 를 보지 않는다).
     app.state.request_worker = None
     # V2 후처리 Worker 도 켰을 때만 돈다. 핸들러(11·13단계)가 없으면 시작하지 않고 이유를 status 에 남긴다.
@@ -73,6 +73,9 @@ async def lifespan(app: FastAPI):
     }
     vf_diag.app_start(flags)
     try:
+        # 이 event loop 에서 만들고 쓰고 닫는다.
+        await runtime_manager.aopen()
+        body_image_warmup_router.start_warmup(app, runtime_manager.runtime)
         await open_async_pool()
         if settings.VIRTUAL_FITTING_RESULT_PUBLISHER_ENABLED:
             app.state.result_publisher = await to_thread.run_sync(create_result_publisher)
@@ -113,6 +116,7 @@ async def lifespan(app: FastAPI):
                     create_postprocess_worker, handlers
                 )
                 app.state.postprocess_worker.start()
+                register_postprocess_worker(app.state.postprocess_worker)
                 app.state.postprocess_worker_status = "running"
         if any(flags.values()):
             # 켜진 루프가 쓰는 DB pool 의 실제 연결로 한 번만 확인한다(모두 꺼져 있으면 새 연결을 만들지 않는다).
@@ -122,10 +126,18 @@ async def lifespan(app: FastAPI):
             app.state.graph = build_graph(checkpointer)
             yield
     finally:
+        # warm-up 접수를 먼저 막고 진행 중인 Modal /health 호출을 취소한다(runtime 종료보다 먼저, 예외를 내지 않는다).
+        # 이 대기 중에 lifespan 이 취소돼도 아래 기존 자원 정리는 이어서 하고, 취소는 마지막에 다시 낸다.
+        shutdown_cancelled = None
+        try:
+            await body_image_warmup_router.close_warmup(app)
+        except asyncio.CancelledError as error:
+            shutdown_cancelled = error
         # Worker 들과 결과 전송 루프가 함께 쓰는 DB pool 을 닫기 전에 모두 멈춘다(동시에 기다린다). 어느 쪽도
         # 공유 자원(DB pool·boto3 client)을 스스로 닫지 않는다. 결과 전송 등록을 먼저 풀어 새 준비 판단에 쓰지 않게 한다.
         register_result_publisher(None)
         register_watchdog(None)
+        register_postprocess_worker(None)
         stops = [
             worker.stop(timeout)
             for worker, timeout in (
@@ -149,9 +161,17 @@ async def lifespan(app: FastAPI):
             for result in await asyncio.gather(*stops, return_exceptions=True):
                 if isinstance(result, BaseException):
                     logger.error("worker stop failed", exc_info=result)
-        runtime_manager.close()
+        # warm-up 다음에 닫는다. 실패하거나 취소돼도 DB pool 정리는 이어서 한다.
+        try:
+            await runtime_manager.aclose()
+        except asyncio.CancelledError as error:
+            shutdown_cancelled = error
+        except Exception as error:  # noqa: BLE001 — 종료 정리 실패가 다른 자원 정리를 막지 않게
+            logger.error("body image runtime close failed: error=%s", type(error).__name__)
         close_connection_pool()
         await close_async_pool()
+        if shutdown_cancelled is not None:
+            raise shutdown_cancelled
 
 
 def _log_fitting_db_target() -> None:
@@ -167,6 +187,9 @@ def _log_fitting_db_target() -> None:
 
 
 app = FastAPI(title="KTB4-15th AI Server", lifespan=lifespan)
+# metrics 보다 먼저 등록해 안쪽에 둔다. 여기서 낸 504 가 metrics 에도 504 로 집계되고, 취소가 BaseHTTPMiddleware 의
+# task group 을 거치지 않는다.
+app.add_middleware(BodyImageDeadlineMiddleware)
 setup_metrics(app)
 
 register_error_handlers(app)
@@ -176,6 +199,8 @@ app.include_router(virtual_fitting_router.router)
 # Runware Webhook 은 내부 API 키가 아니라 URL token 으로 인증한다(별도 Router).
 app.include_router(virtual_fitting_webhook_router.router)
 app.include_router(body_image_validation_router.router)
+# warm-up 은 AI Server 에만 둔다(Modal worker 는 위 전신 이미지 router 만 공유한다).
+app.include_router(body_image_warmup_router.router)
 # 도메인이 늘어나면 여기에 한 줄씩 추가한다
 
 

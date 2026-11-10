@@ -33,6 +33,7 @@ from app.virtual_fitting.runware_webhook import (
     parse_webhook,
     webhook_url_matches_token,
 )
+from tests.runware_codes import register_generation_failed_code
 from tests.test_virtual_fitting_async_job_state import (  # noqa: F401 (pytest fixture)
     lock_waiters,
     pg,
@@ -49,14 +50,16 @@ TOKEN = "test-webhook-token-123"
 REGION = "ap-northeast-2"
 QUEUE_URL = f"https://sqs.{REGION}.amazonaws.com/123456789012/ai-fitting-response"
 OTHER_TASK = "a770f077-f413-47de-9dac-999999999999"
+THIRD_TASK = "a770f077-f413-47de-9dac-888888888888"
 IMAGE_URL = "https://im.runware.ai/image/os/a14d18/ws/2/ii/SECRET-IMAGE.jpg"
+IMAGE_UUID = "550e8400-e29b-41d4-a716-446655440000"
 
 
 def success_body(task, cost=0.023, **extra):
     body = {
         "taskType": "imageInference",
         "taskUUID": task,
-        "imageUUID": "550e8400-e29b-41d4-a716-446655440000",
+        "imageUUID": IMAGE_UUID,
         "imageURL": IMAGE_URL,
         **extra,
     }
@@ -177,7 +180,9 @@ def test_errors_array_and_data_array_are_supported():
                 json.loads(success_body(OTHER_TASK)),
                 {"taskType": "imageInference", "taskUUID": OTHER_TASK, "status": "processing"},
             ],
-            "errors": [{"taskUUID": OTHER_TASK, "code": "invalidModel"}],
+            # 2-1 보완: 같은 task 의 성공과 실패가 함께 오면 어느 쪽도 고르지 않는다(tests/test_virtual_fitting_error_policy.py).
+            # 두 배열을 함께 읽는지만 보려고 실패 항목은 다른 task 로 둔다.
+            "errors": [{"taskUUID": THIRD_TASK, "code": "invalidModel"}],
         }
     ).encode()
     kinds = [event.kind for event in parse_webhook(body)]
@@ -255,9 +260,10 @@ def test_success_moves_to_postprocess_records_cost_releases_slot_and_publishes(d
         AsyncJobStatus.POSTPROCESSING,
         NextAction.POSTPROCESS,
     )
-    # imageURL 은 저장하지 않는다. 이미지 확인은 async_image_key 로 후처리 Worker 가 한다.
+    # imageURL·imageUUID 는 결과 참조로만 보존한다. 이미지 확인은 그대로 async_image_key 로 후처리 Worker 가 한다.
     assert current.async_image_key == f"virtual-fitting/results/{JOB}/pruna-async.jpg"
     assert current.verified_image_key is None and current.result_image_key is None
+    assert (current.runware_image_url, current.runware_image_uuid) == (IMAGE_URL, IMAGE_UUID)
     assert queue.sent == [
         (
             FittingQueue.AI_FITTING_RESPONSE,
@@ -286,9 +292,48 @@ def test_confirmed_recoverable_failure_queues_fallback(db, queue_settings):  # n
 
 
 @pytest.mark.parametrize(
-    "code", ["invalidReferenceImage", "providerRateLimitExceeded", "unknownNewCode"]
+    "code",
+    [
+        "invalidReferenceImage",
+        "providerRateLimitExceeded",
+        "unknownNewCode",
+        "serviceOverloaded",
+        "inferenceRateLimitExceeded",
+    ],
 )
-def test_other_failures_save_a_v2_failure_result_without_fallback(db, queue_settings, code):  # noqa: F811
+def test_errors_without_generation_failure_evidence_keep_the_state(db, queue_settings, code):  # noqa: F811
+    """2-1 보완: 예전에는 fallback 목록 밖의 모든 코드를 FITTING_MODEL_FAILED 로 저장했다. 이제 확실한 미접수
+    (serviceOverloaded·inferenceRateLimitExceeded)·근거 부족 코드는 상태·결과·자리를 그대로 둔다.
+    2-2 보완: 이 작업은 접수 응답이 이미 기록돼 있다. 미접수 코드는 접수 근거와 모순이라 기록만 남기고 아무것도 바꾸지 않는다
+    (IGNORED, 재요청 없음). 접수 전 미접수의 기록·재요청은 tests/test_virtual_fitting_pruna_retry.py."""
+    task = submitted(db)
+    queue = FakeQueue()
+    before = job(db)
+    (result,) = service(db, queue).handle(parse_webhook(error_body(task, code=code, cost=0.01)))
+    expected = (
+        EventOutcome.IGNORED
+        if code in ("serviceOverloaded", "inferenceRateLimitExceeded")
+        else EventOutcome.UNRESOLVED
+    )
+    assert result.outcome is expected and result.published is None
+    current = job(db)
+    assert (current.status, current.next_action, current.result_payload) == (
+        AsyncJobStatus.WAITING_PRUNA,
+        None,
+        None,
+    )
+    assert current.pruna_submit_started_at == before.pruna_submit_started_at  # 호출 기록 유지
+    assert current.fallback_attempt_count == 0 and queue.sent == []
+    assert in_flight(db) == [(JOB, task)]  # 진행 중 자리도 그대로(Watchdog 조회가 잇는다)
+    assert task_costs(db) == [(task, Decimal("0.01"), START_DAY)]  # 보고된 비용은 기록
+
+
+def test_confirmed_generation_failure_saves_a_v2_failure_result_without_fallback(
+    db,  # noqa: F811
+    queue_settings,
+    monkeypatch,
+):
+    code = register_generation_failed_code(monkeypatch)
     task = submitted(db)
     queue = FakeQueue()
     # 결과는 저장하지만 결과 발행 경로(14단계)가 없어 완료로 응답하지 않는다(503).
@@ -364,10 +409,15 @@ def test_webhook_before_the_accept_response_and_the_late_accept_does_not_revert(
     assert late.job.runware_accepted_at is not None
 
 
-def test_failure_before_the_accept_response_keeps_the_failure_result(db, queue_settings):  # noqa: F811
+def test_failure_before_the_accept_response_keeps_the_failure_result(
+    db,  # noqa: F811
+    queue_settings,
+    monkeypatch,
+):
+    code = register_generation_failed_code(monkeypatch)  # 확정 생성 실패(최종 결과가 저장되는 경우)
     task = submitted(db, accepted=False)
     with pytest.raises(WebhookFollowUpNotReadyError):
-        service(db).handle(parse_webhook(error_body(task, code="invalidReferenceImage")))
+        service(db).handle(parse_webhook(error_body(task, code=code)))
     late = db["state"].record_submission_accepted(task)
     # 수정 전에는 RECEIVED 라는 이유로 WAITING_PRUNA / next_action=NULL 이 되어 PUBLISH_RESULT 가 지워졌다.
     assert (late.job.status, late.job.next_action) == (

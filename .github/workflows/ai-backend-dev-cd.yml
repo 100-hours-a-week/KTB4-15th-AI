@@ -1,7 +1,8 @@
-# AI 레포 dev CD (develop 브랜치 → dev 서버 dev.lookddak.com)
+# AI 레포 dev CD (develop 브랜치 → V2 ECS·V3 EKS 개발 환경)
 # - 트리거: develop, hotfix/** push (hotfix는 운영 반영 전 dev 검증용)
-# - prod CD(ai-backend-cd.yml)와 같은 흐름이고 다른 점만 바꿨다.
-#   · 대상: dev ECR(lookddak-dev-fastapi), dev EC2
+# - 이미지는 한 번만 빌드해 V2 ECS와 V3 EKS에서 동일한 digest를 사용한다.
+#   · V2: ECS Task Definition 갱신
+#   · V3: GitOps 저장소에 digest 갱신 요청 → Argo CD Auto Sync
 #   · AWS Role: dev 전용 Role (develop Environment로 실행된 워크플로만 사용 가능)
 #   · GitHub Environment: production 대신 develop
 #     (변수 이름은 prod와 같고, 값은 develop Environment에 dev 값으로 등록한다)
@@ -15,8 +16,7 @@ run-name: >-
 
 on:
   # develop: 평소 dev 배포 / hotfix/**: 운영 반영 전 dev 서버에서 hotfix 검증
-  # paths 필터를 두지 않는다. 이 워크플로의 dev-deploy job이 main merge의 필수 체크라서
-  # 문서만 바뀐 커밋에서 실행되지 않으면 main PR이 체크를 계속 기다리게 된다.
+  # 개발 배포 누락을 막기 위해 paths 필터를 두지 않는다.
   push:
     branches: ["develop", "hotfix/**"]
 
@@ -34,7 +34,7 @@ on:
 
 permissions: {}
 
-# 같은 AI 레포의 배포끼리만 직렬화. BE/FE와의 충돌은 EC2 flock이 막는다.
+# 같은 AI 레포의 개발 배포끼리 직렬화한다.
 concurrency:
   group: lookddak-ai-dev
   cancel-in-progress: false
@@ -42,9 +42,6 @@ concurrency:
 env:
   AWS_REGION: ap-northeast-2
   ECR_REPOSITORY: lookddak-dev-fastapi
-  SERVICE_KEY: ai
-  SSM_EXEC_TIMEOUT: "780"   # 13분
-  POLL_TIMEOUT: "900"       # 15분 (실측 후 조정)
 
 jobs:
   build-and-push:
@@ -58,6 +55,7 @@ jobs:
       contents: read
     outputs:
       tag: ${{ steps.vars.outputs.tag }}
+      digest: ${{ steps.image.outputs.digest }}
     steps:
       - name: Guard - develop / hotfix 브랜치 확인
         if: ${{ github.ref != 'refs/heads/develop' && !startsWith(github.ref, 'refs/heads/hotfix/') }}
@@ -89,6 +87,7 @@ jobs:
       # runtime 단계가 test 단계의 통과 표시 파일을 COPY하므로
       # ruff/pytest가 실패하면 이미지가 만들어지지 않는다.
       - name: 빌드 및 ECR push
+        id: image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -97,145 +96,45 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  deploy:
-    # main 브랜치 Ruleset의 필수 체크 이름 (prod CD의 deploy job과 구분)
-    name: dev-deploy
-    needs: build-and-push
-    # V1 dev(EC2)는 종료됐다. 변수 V1_DEV_DEPLOY_ENABLED를 두지 않으므로 실행되지 않는다 (skipped).
-    # main Ruleset 필수 체크(dev-deploy)가 dev-v2-deploy로 바뀌면 job을 삭제한다.
-    if: ${{ vars.V1_DEV_DEPLOY_ENABLED == 'true' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    environment: develop
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - name: Guard - develop / hotfix 브랜치 확인
-        if: ${{ github.ref != 'refs/heads/develop' && !startsWith(github.ref, 'refs/heads/hotfix/') }}
-        run: |
-          echo "develop, hotfix/* 브랜치의 워크플로만 dev 서버에 배포할 수 있습니다. 현재 ref: ${GITHUB_REF}"
-          exit 1
-
-      - name: 배포 태그와 사유 확정
-        id: meta
+      # Prod에서는 이미지를 다시 빌드하지 않고 이 증빙의 동일 Digest를 승격한다.
+      - name: Dev 이미지 승격 증빙 생성
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_TAG: ${{ inputs.image_tag }}
-          INPUT_REASON: ${{ inputs.reason }}
-          BUILT_TAG: ${{ needs.build-and-push.outputs.tag }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          if [[ "$EVENT_NAME" == "push" ]]; then
-            TAG="$BUILT_TAG"
-            REASON="${GITHUB_REF_NAME} push by ${GITHUB_ACTOR}"
-          else
-            TAG="$INPUT_TAG"
-            REASON="$INPUT_REASON"
-          fi
-          if [[ ! "$TAG" =~ ^[0-9a-f]{7}$ ]]; then
-            echo "태그 형식이 잘못되었습니다: '$TAG'"
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::빌드 digest 형식이 잘못되었습니다: '$DIGEST'"
             exit 1
           fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          {
-            echo "reason<<__EOF__"
-            echo "$REASON"
-            echo "__EOF__"
-          } >> "$GITHUB_OUTPUT"
+          jq -n \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg digest "$DIGEST" \
+            --arg source_run_url "$SOURCE_RUN_URL" \
+            '{source_sha: $source_sha, digest: $digest, source_run_url: $source_run_url}' \
+            > "$RUNNER_TEMP/ai-dev-image.json"
 
-      - name: AWS 인증 - deploy role
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Dev 이미지 승격 증빙 보관
+        uses: actions/upload-artifact@v4
         with:
-          role-to-assume: ${{ vars.AI_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          name: ai-dev-image-${{ github.sha }}
+          path: ${{ runner.temp }}/ai-dev-image.json
+          if-no-files-found: error
+          retention-days: 30
 
-      - name: ECR 이미지 존재 확인
-        env:
-          TAG: ${{ steps.meta.outputs.tag }}
-        run: |
-          aws ecr describe-images \
-            --repository-name "$ECR_REPOSITORY" \
-            --image-ids imageTag="$TAG" > /dev/null \
-          || { echo "ECR에 ${ECR_REPOSITORY}:${TAG} 이미지가 없습니다."; exit 1; }
-
-      - name: SSM으로 배포 요청
-        id: send
-        env:
-          TAG: ${{ steps.meta.outputs.tag }}
-          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
-        run: |
-          PARAMS=$(jq -nc \
-            --arg cmd "/opt/lookddak/scripts/deploy.sh ${SERVICE_KEY} ${TAG} ${GITHUB_RUN_ID}" \
-            --arg timeout "$SSM_EXEC_TIMEOUT" \
-            '{commands: [$cmd], executionTimeout: [$timeout]}')
-
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --comment "${SERVICE_KEY}-cd ${TAG} run ${GITHUB_RUN_ID}" \
-            --timeout-seconds 60 \
-            --parameters "$PARAMS" \
-            --cloud-watch-output-config "CloudWatchOutputEnabled=true,CloudWatchLogGroupName=/lookddak/dev/deploy" \
-            --query "Command.CommandId" --output text)
-
-          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
-
-      - name: 배포 결과 폴링
-        env:
-          COMMAND_ID: ${{ steps.send.outputs.command_id }}
-          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
-          TAG: ${{ steps.meta.outputs.tag }}
-          REASON: ${{ steps.meta.outputs.reason }}
-        run: |
-          DEADLINE=$(( $(date +%s) + POLL_TIMEOUT ))
-          STATUS="Pending"
-          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-              --query "Status" --output text 2>/dev/null || echo "NotYet")
-            echo "$(date '+%T') status=$STATUS"
-            case "$STATUS" in
-              Success|Failed|Cancelled|TimedOut) break ;;
-              *) sleep 10 ;;
-            esac
-          done
-
-          RESULT=$(aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-            --output json 2>/dev/null || echo '{}')
-          CODE=$(echo "$RESULT" | jq -r '.ResponseCode // "unknown"')
-
-          echo "----- EC2 스크립트 출력(끝부분) -----"
-          echo "$RESULT" | jq -r '.StandardOutputContent // ""' | tail -n 60
-          echo "$RESULT" | jq -r '.StandardErrorContent // ""' | tail -n 30
-
-          {
-            echo "### AI dev 배포 결과"
-            echo "- 이벤트: ${GITHUB_EVENT_NAME}"
-            echo "- 태그: \`${TAG}\`"
-            echo "- 사유: ${REASON}"
-            echo "- SSM 상태: ${STATUS} / 종료 코드: ${CODE}"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          case "$STATUS:$CODE" in
-            Success:0) echo "배포 성공"; exit 0 ;;
-            *:1)  echo "::error::새 버전 배포 실패 (서비스 미변경 또는 이전 버전 복구됨)"; exit 1 ;;
-            *:2)  echo "::error::이전 버전 복구까지 실패! 즉시 수동 확인"; exit 1 ;;
-            *:64) echo "::error::EC2 배포 설정 오류 (.env, compose, 명령 설치 상태 확인)"; exit 1 ;;
-            *:75) echo "::error::다른 배포가 진행 중이라 시작하지 못함. 끝난 뒤 재실행"; exit 1 ;;
-            *)    echo "::error::결과 확인 불가(status=$STATUS). CloudWatch /lookddak/dev/deploy 확인"; exit 1 ;;
-          esac
-
-  # V2 dev(ECS) 배포. V1 dev(EC2)는 종료돼 V2에만 배포한다.
+  # V2 dev(ECS) 배포.
   # - Task Definition 설정은 CLOUD 레포 Terraform이 S3 템플릿으로 관리한다.
   #   이 job은 템플릿의 __DIGEST__만 이번 이미지 digest로 바꿔 revision을 등록한다.
   # - 실패하면 dev CD 전체 실패로 본다 (main merge 필수 체크).
+  # V2 dev(ECS) 배포 중지 (2026-11-08): V3(EKS) 전환으로 V2 배포를 멈춘다.
+  # 저장소 변수 V2_DEV_DEPLOY_ENABLED를 두지 않으므로 skipped. 긴급 배포·롤백이 필요하면 변수를 'true'로 만들면 PR 없이 다시 켜진다.
   deploy-v2:
     name: dev-v2-deploy
     needs: build-and-push
     if: >-
       ${{
         always() &&
+        vars.V2_DEV_DEPLOY_ENABLED == 'true' &&
         (
           (github.event_name == 'push' && needs.build-and-push.result == 'success') ||
           github.event_name == 'workflow_dispatch'
@@ -443,3 +342,73 @@ jobs:
             exit 1
           fi
           echo "V2 배포 성공: ${ACTUAL}"
+
+  # V3 dev(EKS) 배포는 GitOps 저장소에 동일한 digest의 갱신을 요청한다.
+  # 수동 rollback은 V2 전용이므로 push에서 새 이미지를 빌드한 경우에만 실행한다.
+  publish-v3-dev:
+    name: publish-v3-dev
+    needs: build-and-push
+    if: ${{ github.event_name == 'push' && needs.build-and-push.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: develop
+    permissions:
+      contents: read
+    steps:
+      - name: GitOps GitHub App Token 발급
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.DEV_IMAGE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.DEV_IMAGE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: KTB4-15th-GITOPS
+          permission-contents: write
+
+      - name: GitOps dev 이미지 갱신 요청
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::빌드 digest 형식이 잘못되었습니다: '$DIGEST'"
+            exit 1
+          fi
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::원본 commit SHA 형식이 잘못되었습니다: '$SOURCE_SHA'"
+            exit 1
+          fi
+
+          jq -n \
+            --arg event_type "dev-image-published" \
+            --arg environment "dev" \
+            --arg image_key "ai" \
+            --arg digest "$DIGEST" \
+            --arg source_repository "$SOURCE_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_run_url "$SOURCE_RUN_URL" \
+            '{
+              event_type: $event_type,
+              client_payload: {
+                environment: $environment,
+                image_key: $image_key,
+                digest: $digest,
+                source_repository: $source_repository,
+                source_sha: $source_sha,
+                source_run_url: $source_run_url
+              }
+            }' \
+          | gh api --method POST \
+              "repos/100-hours-a-week/KTB4-15th-GITOPS/dispatches" \
+              --input -
+
+          {
+            echo "### AI dev V3(EKS) GitOps 갱신 요청"
+            echo "- digest: \`$DIGEST\`"
+            echo "- 영향 워크로드: \`chat-ai\`, \`body-image-validator\`, \`vton-orchestrator\`"
+            echo "- GitOps 이벤트: \`dev-image-published\`"
+            echo "- 원본 실행: $SOURCE_RUN_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
