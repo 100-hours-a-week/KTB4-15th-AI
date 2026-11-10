@@ -1,10 +1,9 @@
-# AI 레포: .github/workflows/ai-cd.yml
 name: AI CD
 
 run-name: >-
   ${{ github.event_name == 'push'
-      && format('AI auto deploy (V2) - {0}', github.sha)
-      || format('AI rollback - {0} ({1})', inputs.image_tag, inputs.target) }}
+      && format('AI prod V3 image promotion - {0}', github.sha)
+      || format('AI V2 rollback - {0}', inputs.image_tag) }}
 
 on:
   # main이 갱신되면 자동 배포 (develop→main 머지, hotfix→main 머지 모두 포함)
@@ -28,21 +27,10 @@ on:
         description: "롤백 사유"
         required: true
         type: string
-      # v2: ECS만 (기본) / v1: 기존 EC2만 / all: 둘 다
-      # V1은 DNS 전환 전 롤백용으로만 남겨 둔다. main push는 V2에만 배포한다.
-      target:
-        description: "배포 대상 (v2: ECS만, v1: EC2만, all: V1+V2)"
-        required: true
-        default: v2
-        type: choice
-        options:
-          - v2
-          - v1
-          - all
 
 permissions: {}
 
-# 같은 AI 레포의 배포끼리만 직렬화. BE/FE와의 충돌은 EC2 flock이 막는다.
+# 같은 AI 레포의 운영 승격끼리만 직렬화한다.
 concurrency:
   group: lookddak-ai-production
   cancel-in-progress: false
@@ -50,13 +38,11 @@ concurrency:
 env:
   AWS_REGION: ap-northeast-2
   ECR_REPOSITORY: lookddak-fastapi
-  SERVICE_KEY: ai
-  SSM_EXEC_TIMEOUT: "780"   # 13분
-  POLL_TIMEOUT: "900"       # 15분 (실측 후 조정)
 
 jobs:
+  # V2가 다시 활성화될 때만 Prod 전용 이미지를 빌드한다. 평상시 V3 승격은 Dev 이미지를 재사용한다.
   build-and-push:
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ github.event_name == 'push' && vars.V2_PROD_DEPLOY_ENABLED == 'true' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 25
     environment: production
@@ -104,140 +90,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # V1(EC2) 배포. V2 전환 기간에는 main push로 실행하지 않는다.
-  # 수동 실행(target: v1, all)으로 V1 롤백할 때만 사용한다. DNS 전환 후 삭제한다.
-  deploy:
-    needs: build-and-push
-    if: >-
-      ${{
-        always() &&
-        (
-          github.event_name == 'workflow_dispatch' && inputs.target != 'v2'
-        )
-      }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    environment: production
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - name: Guard - main 브랜치 확인
-        if: ${{ github.ref != 'refs/heads/main' }}
-        run: |
-          echo "main 브랜치의 워크플로만 운영에 배포할 수 있습니다. 현재 ref: ${GITHUB_REF}"
-          exit 1
-
-      - name: 배포 태그와 사유 확정
-        id: meta
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_TAG: ${{ inputs.image_tag }}
-          INPUT_REASON: ${{ inputs.reason }}
-          BUILT_TAG: ${{ needs.build-and-push.outputs.tag }}
-        run: |
-          if [[ "$EVENT_NAME" == "push" ]]; then
-            TAG="$BUILT_TAG"
-            REASON="main push by ${GITHUB_ACTOR}"
-          else
-            TAG="$INPUT_TAG"
-            REASON="$INPUT_REASON"
-          fi
-          if [[ ! "$TAG" =~ ^[0-9a-f]{7}$ ]]; then
-            echo "태그 형식이 잘못되었습니다: '$TAG'"
-            exit 1
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          {
-            echo "reason<<__EOF__"
-            echo "$REASON"
-            echo "__EOF__"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: AWS 인증 - deploy role
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AI_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: ECR 이미지 존재 확인
-        env:
-          TAG: ${{ steps.meta.outputs.tag }}
-        run: |
-          aws ecr describe-images \
-            --repository-name "$ECR_REPOSITORY" \
-            --image-ids imageTag="$TAG" > /dev/null \
-          || { echo "ECR에 ${ECR_REPOSITORY}:${TAG} 이미지가 없습니다."; exit 1; }
-
-      - name: SSM으로 배포 요청
-        id: send
-        env:
-          TAG: ${{ steps.meta.outputs.tag }}
-          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
-        run: |
-          PARAMS=$(jq -nc \
-            --arg cmd "/opt/lookddak/scripts/deploy.sh ${SERVICE_KEY} ${TAG} ${GITHUB_RUN_ID}" \
-            --arg timeout "$SSM_EXEC_TIMEOUT" \
-            '{commands: [$cmd], executionTimeout: [$timeout]}')
-
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --comment "${SERVICE_KEY}-cd ${TAG} run ${GITHUB_RUN_ID}" \
-            --timeout-seconds 60 \
-            --parameters "$PARAMS" \
-            --cloud-watch-output-config "CloudWatchOutputEnabled=true,CloudWatchLogGroupName=/lookddak/deploy" \
-            --query "Command.CommandId" --output text)
-
-          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
-
-      - name: 배포 결과 폴링
-        env:
-          COMMAND_ID: ${{ steps.send.outputs.command_id }}
-          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
-          TAG: ${{ steps.meta.outputs.tag }}
-          REASON: ${{ steps.meta.outputs.reason }}
-        run: |
-          DEADLINE=$(( $(date +%s) + POLL_TIMEOUT ))
-          STATUS="Pending"
-          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-              --query "Status" --output text 2>/dev/null || echo "NotYet")
-            echo "$(date '+%T') status=$STATUS"
-            case "$STATUS" in
-              Success|Failed|Cancelled|TimedOut) break ;;
-              *) sleep 10 ;;
-            esac
-          done
-
-          RESULT=$(aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-            --output json 2>/dev/null || echo '{}')
-          CODE=$(echo "$RESULT" | jq -r '.ResponseCode // "unknown"')
-
-          echo "----- EC2 스크립트 출력(끝부분) -----"
-          echo "$RESULT" | jq -r '.StandardOutputContent // ""' | tail -n 60
-          echo "$RESULT" | jq -r '.StandardErrorContent // ""' | tail -n 30
-
-          {
-            echo "### AI 배포 결과"
-            echo "- 이벤트: ${GITHUB_EVENT_NAME}"
-            echo "- 태그: \`${TAG}\`"
-            echo "- 사유: ${REASON}"
-            echo "- SSM 상태: ${STATUS} / 종료 코드: ${CODE}"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          case "$STATUS:$CODE" in
-            Success:0) echo "배포 성공"; exit 0 ;;
-            *:1)  echo "::error::새 버전 배포 실패 (서비스 미변경 또는 이전 버전 복구됨)"; exit 1 ;;
-            *:2)  echo "::error::이전 버전 복구까지 실패! 즉시 수동 확인"; exit 1 ;;
-            *:64) echo "::error::EC2 배포 설정 오류 (.env, compose, 명령 설치 상태 확인)"; exit 1 ;;
-            *:75) echo "::error::다른 배포가 진행 중이라 시작하지 못함. 끝난 뒤 재실행"; exit 1 ;;
-            *)    echo "::error::결과 확인 불가(status=$STATUS). CloudWatch /lookddak/deploy 확인"; exit 1 ;;
-          esac
-
-  # V2 prod(ECS) 배포. main push와 수동 실행(target: v2, all)에서 실행한다.
+  # V2 prod(ECS) 배포 코드는 긴급 재활성화를 위해 유지하지만 기본적으로 skip한다.
   # - Task Definition 설정은 CLOUD 레포 Terraform이 S3 템플릿으로 관리한다.
   #   이 job은 템플릿의 __DIGEST__만 이번 이미지 digest로 바꿔 revision을 등록한다.
   # V2 prod(ECS) 배포 동결 (2026-11-08): V3(EKS) 전환 준비 중 V2 prod 배포를 멈춘다 (서비스 중인 Task는 유지).
@@ -251,7 +104,7 @@ jobs:
         vars.V2_PROD_DEPLOY_ENABLED == 'true' &&
         (
           (github.event_name == 'push' && needs.build-and-push.result == 'success') ||
-          (github.event_name == 'workflow_dispatch' && inputs.target != 'v1')
+          github.event_name == 'workflow_dispatch'
         )
       }}
     runs-on: ubuntu-24.04
@@ -450,9 +303,123 @@ jobs:
             echo "- 요청 revision: \`${REQUESTED:-등록 안 됨}\` (마지막 상태: ${REQUESTED_STATE:-확인 안 됨})"
             echo "- 현재 PRIMARY revision: \`${ACTUAL}\` (${ROLLOUT} ${ROLLOUT_REASON})"
           } >> "$GITHUB_STEP_SUMMARY"
-
           if [[ "$RESULT" != "success" ]]; then
             echo "::error::V2 배포 ${SUMMARY}"
             exit 1
           fi
           echo "V2 배포 성공: ${ACTUAL}"
+
+  # V3 Prod(EKS)는 main에서 재빌드하지 않고 해당 Release에 포함된 Dev 검증 Digest를 승격한다.
+  # V2가 재활성화돼도 이 Job은 build-and-push와 의존성이 없어 병렬로 실행된다.
+  publish-v3-prod:
+    name: publish-v3-prod
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: production
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    steps:
+      - name: 승격 대상 Dev Commit 확인
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAIN_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          DEV_SHA=$(gh api "repos/$REPOSITORY/commits/$MAIN_SHA/pulls" \
+            --jq '[.[] | select(.base.ref == "main")][0].head.sha // empty')
+          if [[ -z "$DEV_SHA" ]]; then DEV_SHA="$MAIN_SHA"; fi
+          if [[ ! "$DEV_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::승격 대상 Dev commit SHA를 확인할 수 없습니다: '$DEV_SHA'"
+            exit 1
+          fi
+          echo "dev_sha=$DEV_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: 성공한 Dev CD 실행 확인
+        id: dev-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEV_SHA: ${{ steps.source.outputs.dev_sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          RUN_ID=$(gh api --method GET \
+            "repos/$REPOSITORY/actions/workflows/ai-backend-dev-cd.yml/runs" \
+            -f head_sha="$DEV_SHA" -f status="success" -f event="push" -f per_page="10" \
+            --jq '.workflow_runs[0].id // empty')
+          if [[ -z "$RUN_ID" ]]; then
+            echo "::error::$DEV_SHA 이미지가 성공한 AI dev CD에서 검증된 기록이 없습니다."
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "run_url=https://github.com/$REPOSITORY/actions/runs/$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Dev 이미지 승격 증빙 다운로드
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.dev-run.outputs.run_id }}
+          DEV_SHA: ${{ steps.source.outputs.dev_sha }}
+        run: |
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "ai-dev-image-$DEV_SHA" --dir "$RUNNER_TEMP/dev-image"
+
+      - name: Dev 이미지 승격 증빙 검증
+        id: image
+        env:
+          DEV_SHA: ${{ steps.source.outputs.dev_sha }}
+        run: |
+          PROVENANCE="$RUNNER_TEMP/dev-image/ai-dev-image.json"
+          test -s "$PROVENANCE" || { echo "::error::Dev 이미지 증빙 파일이 없습니다."; exit 1; }
+          RECORDED_SHA=$(jq -er '.source_sha' "$PROVENANCE")
+          DIGEST=$(jq -er '.digest' "$PROVENANCE")
+          if [[ "$RECORDED_SHA" != "$DEV_SHA" ]]; then
+            echo "::error::증빙 Commit이 승격 대상과 다릅니다: expected=$DEV_SHA actual=$RECORDED_SHA"
+            exit 1
+          fi
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::증빙 digest 형식이 잘못되었습니다: '$DIGEST'"
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: GitOps GitHub App Token 발급
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.DEV_IMAGE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.DEV_IMAGE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: KTB4-15th-GITOPS
+          permission-contents: write
+
+      - name: GitOps Prod 이미지 승격 요청
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+          DEV_SHA: ${{ steps.source.outputs.dev_sha }}
+          DEV_RUN_URL: ${{ steps.dev-run.outputs.run_url }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          jq -n \
+            --arg event_type "prod-image-published" \
+            --arg environment "prod" \
+            --arg image_key "ai" \
+            --arg digest "$DIGEST" \
+            --arg source_repository "$SOURCE_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_run_url "$SOURCE_RUN_URL" \
+            '{event_type: $event_type, client_payload: {environment: $environment, image_key: $image_key, digest: $digest, source_repository: $source_repository, source_sha: $source_sha, source_run_url: $source_run_url}}' \
+          | gh api --method POST "repos/100-hours-a-week/KTB4-15th-GITOPS/dispatches" --input -
+
+          {
+            echo "### AI V3 Prod 이미지 승격 요청"
+            echo "- Dev 검증 Commit: \`$DEV_SHA\`"
+            echo "- Dev 검증 실행: $DEV_RUN_URL"
+            echo "- 승격 Digest: \`$DIGEST\`"
+            echo "- 영향 워크로드: \`chat-ai\`, \`body-image-validator\`, \`vton-orchestrator\`"
+            echo "- GitOps 이벤트: \`prod-image-published\`"
+          } >> "$GITHUB_STEP_SUMMARY"
