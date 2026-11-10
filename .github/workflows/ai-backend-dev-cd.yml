@@ -96,6 +96,32 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Prod에서는 이미지를 다시 빌드하지 않고 이 증빙의 동일 Digest를 승격한다.
+      - name: Dev 이미지 승격 증빙 생성
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::빌드 digest 형식이 잘못되었습니다: '$DIGEST'"
+            exit 1
+          fi
+          jq -n \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg digest "$DIGEST" \
+            --arg source_run_url "$SOURCE_RUN_URL" \
+            '{source_sha: $source_sha, digest: $digest, source_run_url: $source_run_url}' \
+            > "$RUNNER_TEMP/ai-dev-image.json"
+
+      - name: Dev 이미지 승격 증빙 보관
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-dev-image-${{ github.sha }}
+          path: ${{ runner.temp }}/ai-dev-image.json
+          if-no-files-found: error
+          retention-days: 30
+
   # V2 dev(ECS) 배포.
   # - Task Definition 설정은 CLOUD 레포 Terraform이 S3 템플릿으로 관리한다.
   #   이 job은 템플릿의 __DIGEST__만 이번 이미지 digest로 바꿔 revision을 등록한다.
