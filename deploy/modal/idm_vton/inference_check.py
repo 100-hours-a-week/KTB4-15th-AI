@@ -37,6 +37,8 @@ PREPROCESS_SIZE = (384, 512)
 MASK_MODEL_TYPE = "hd"
 MASK_CATEGORY = "upper_body"
 DENOISE_STEPS = 30
+# --inference-steps 로 고를 수 있는 값. 생략하면 DENOISE_STEPS(공식 기본값 30)를 쓴다.
+ALLOWED_INFERENCE_STEPS = (30, 40)
 SEED = 42
 GUIDANCE_SCALE = 2.0
 STRENGTH = 1.0
@@ -54,7 +56,11 @@ MIN_IMAGE_STDDEV = 2.0
 JPEG_QUALITY = 95
 RESULT_FILE = "result.jpg"
 MASK_FILE = "mask.jpg"
-COMPARISON_FILE = "comparison.jpg"
+# 합성 실험용 손실 없는 PNG. 이름은 restore_composite.py 와 같아야 한다.
+INPAINT_MASK_FILE = "inpaint_mask.png"
+PERSON_INPUT_FILE = "person_input.png"
+# pipe 의 mask_processor(diffusers 0.25.0 VaeImageProcessor, do_binarize=True)는 255 로 나눈 값이 0.5 이상이면 1 로 본다.
+INPAINT_MASK_THRESHOLD = 128
 OUTPUT_DIR_NAME = "test_outputs"
 # --case-id 를 생략했을 때 공식 예제 결과를 둘 디렉터리. 사용자 입력은 실행 시각으로 이름을 만든다.
 OFFICIAL_CASE_ID = "official-example"
@@ -69,7 +75,15 @@ EXIF_ORIENTATION_TAG = 0x0112
 # 768×1024(3:4) 와 비율이 이만큼 넘게 다르면 공식 방식(자동 크롭 없이 리사이즈)대로 늘어난다는 경고만 남긴다.
 TARGET_ASPECT_RATIO = IMAGE_SIZE[0] / IMAGE_SIZE[1]
 ASPECT_RATIO_TOLERANCE = 0.05
-COMPARISON_LABEL_HEIGHT = 48
+# 사람·상품 이미지에 따로 고른다. stretch 는 기존(공식) 강제 리사이즈, pad 는 비율을 유지해 축소한 뒤 가운데 두고 여백을 채운다.
+RESIZE_MODES = ("stretch", "pad")
+PERSON_RESIZE_MODES = RESIZE_MODES
+DEFAULT_PERSON_RESIZE_MODE = "stretch"
+GARMENT_RESIZE_MODES = RESIZE_MODES
+DEFAULT_GARMENT_RESIZE_MODE = "stretch"
+# pad 여백 색은 축소한 이미지 네 모서리(짧은 변의 5%, 최소 4px 정사각형) 픽셀의 채널별 중앙값으로 정한다.
+PAD_CORNER_RATIO = 0.05
+PAD_CORNER_MIN_PX = 4
 
 image = (
     model_loading_image
@@ -82,6 +96,19 @@ app = modal.App(APP_NAME)
 
 class InferenceCheckError(RuntimeError):
     """입력 이미지, 전처리 결과, 추론 결과 중 하나 이상이 기대와 다르다."""
+
+
+def require_inference_steps(steps) -> int:
+    # bool 은 int 의 하위 형이라 따로 막는다.
+    if (
+        isinstance(steps, bool)
+        or not isinstance(steps, int)
+        or steps not in ALLOWED_INFERENCE_STEPS
+    ):
+        raise InferenceCheckError(
+            f"inference-steps 는 {list(ALLOWED_INFERENCE_STEPS)} 중 하나여야 한다: {steps!r}"
+        )
+    return steps
 
 
 def require_keypoints(keypoints: dict) -> dict[str, list[float]]:
@@ -125,6 +152,14 @@ def encode_jpeg(pil_image) -> bytes:
 
     buffer = io.BytesIO()
     pil_image.convert("RGB").save(buffer, format="JPEG", quality=JPEG_QUALITY)
+    return buffer.getvalue()
+
+
+def encode_png(pil_image) -> bytes:
+    import io
+
+    buffer = io.BytesIO()
+    pil_image.save(buffer, format="PNG")
     return buffer.getvalue()
 
 
@@ -181,6 +216,96 @@ def decode_input_image(data: bytes, role: str):
     return rgb, info
 
 
+def corner_background_color(rgb) -> tuple[int, int, int]:
+    """네 모서리 픽셀의 채널별 중앙값. 한 모서리에 사람·물체가 걸쳐도 나머지 배경색을 따른다."""
+    from PIL import Image, ImageStat
+
+    width, height = rgb.size
+    patch = max(PAD_CORNER_MIN_PX, round(min(width, height) * PAD_CORNER_RATIO))
+    patch = min(patch, width, height)
+    corners = [
+        (0, 0),
+        (width - patch, 0),
+        (0, height - patch),
+        (width - patch, height - patch),
+    ]
+    strip = Image.new("RGB", (patch * len(corners), patch))
+    for index, (left, top) in enumerate(corners):
+        strip.paste(rgb.crop((left, top, left + patch, top + patch)), (index * patch, 0))
+    red, green, blue = (int(value) for value in ImageStat.Stat(strip).median)
+    return red, green, blue
+
+
+def fit_model_input(rgb, mode: str, option: str):
+    """EXIF 보정·RGB 변환을 마친 이미지를 768×1024 모델 입력으로 만든다. 사람·상품이 같은 규칙을 쓴다.
+
+    사람: OpenPose·Parsing·DensePose·마스크·추론·person_input.png·복원 합성이 모두 이 결과 하나만 쓴다.
+    상품: cloth Tensor·ip_adapter_image 가 모두 이 결과 하나만 쓴다.
+    """
+    from PIL import Image
+
+    if mode not in RESIZE_MODES:
+        raise InferenceCheckError(f"{option} 는 {list(RESIZE_MODES)} 중 하나여야 한다: {mode!r}")
+    width, height = rgb.size
+    target_width, target_height = IMAGE_SIZE
+    info = {
+        "mode": mode,
+        "original_size": [width, height],
+        "original_aspect": round(width / height, 4),
+    }
+    if mode == "stretch":
+        # 기존 방식 그대로. 비율이 3:4 가 아니면 사람·상품이 늘어나거나 눌린다.
+        fitted = rgb.resize(IMAGE_SIZE)
+        padding = {"left": 0, "right": 0, "top": 0, "bottom": 0}
+        resized_size = list(IMAGE_SIZE)
+    else:
+        scale = min(target_width / width, target_height / height)
+        resized_width = min(target_width, max(1, round(width * scale)))
+        resized_height = min(target_height, max(1, round(height * scale)))
+        resized = rgb.resize((resized_width, resized_height))
+        left = (target_width - resized_width) // 2
+        top = (target_height - resized_height) // 2
+        padding = {
+            "left": left,
+            "right": target_width - resized_width - left,
+            "top": top,
+            "bottom": target_height - resized_height - top,
+        }
+        color = corner_background_color(resized)
+        fitted = Image.new("RGB", IMAGE_SIZE, color)
+        fitted.paste(resized, (left, top))
+        resized_size = [resized_width, resized_height]
+        info["pad_color"] = list(color)
+    info.update(
+        {
+            "resized_size": resized_size,
+            "resized_aspect": round(resized_size[0] / resized_size[1], 4),
+            "padding": padding,
+            # 768×1024 좌표계에서 실제 이미지가 놓인 영역 [left, top, right, bottom]. 나머지는 여백이다.
+            "content_box": [
+                padding["left"],
+                padding["top"],
+                target_width - padding["right"],
+                target_height - padding["bottom"],
+            ],
+            "output_size": list(fitted.size),
+        }
+    )
+    if fitted.size != IMAGE_SIZE or fitted.mode != "RGB":
+        raise InferenceCheckError(
+            f"모델 입력이 RGB {IMAGE_SIZE} 가 아니다: {fitted.mode} {fitted.size}"
+        )
+    return fitted, info
+
+
+def fit_person_image(rgb, mode: str):
+    return fit_model_input(rgb, mode, "person-resize-mode")
+
+
+def fit_garment_image(rgb, mode: str):
+    return fit_model_input(rgb, mode, "garment-resize-mode")
+
+
 def read_local_image(path: str, role: str) -> tuple[bytes, dict]:
     """Mac 의 이미지 파일을 확인한 뒤 bytes 로 읽는다. Modal 컨테이너는 이 경로를 볼 수 없어 bytes 로 넘긴다."""
     from pathlib import Path
@@ -213,25 +338,6 @@ def case_output_dir(output_root, case_id: str):
     return target
 
 
-def make_comparison(panels: list[tuple[str, bytes]]) -> bytes:
-    """768×1024 JPEG 들을 이름표와 함께 가로로 붙인다. 로컬에서만 부른다."""
-    import io
-
-    from PIL import Image, ImageDraw, ImageFont
-
-    width, height = IMAGE_SIZE
-    canvas = Image.new("RGB", (width * len(panels), height + COMPARISON_LABEL_HEIGHT), "white")
-    draw = ImageDraw.Draw(canvas)
-    font = ImageFont.load_default(size=28)
-    for index, (label, data) in enumerate(panels):
-        with Image.open(io.BytesIO(data)) as panel:
-            canvas.paste(
-                panel.convert("RGB").resize(IMAGE_SIZE), (index * width, COMPARISON_LABEL_HEIGHT)
-            )
-        draw.text((index * width + 16, 10), label, fill="black", font=font)
-    return encode_jpeg(canvas)
-
-
 @app.function(
     image=image,
     gpu=GPU,
@@ -248,6 +354,9 @@ def run_tryon(
     garment_description: str = DEFAULT_GARMENT_DESCRIPTION,
     person_image: bytes | None = None,
     garment_image: bytes | None = None,
+    person_resize_mode: str = DEFAULT_PERSON_RESIZE_MODE,
+    garment_resize_mode: str = DEFAULT_GARMENT_RESIZE_MODE,
+    inference_steps: int = DENOISE_STEPS,
 ) -> dict:
     # 두 이미지를 모두 생략하면 이미지에 든 공식 예제를, 모두 넘기면 그 bytes 를 쓴다. 사용자 이미지는 이미지 빌드에 넣지 않는다.
     import os
@@ -298,8 +407,21 @@ def run_tryon(
         raise InferenceCheckError("garment description 이 비어 있다")
     if (person_image is None) != (garment_image is None):
         raise InferenceCheckError("사람 이미지와 상품 이미지는 함께 넘기거나 둘 다 생략해야 한다")
+    if person_resize_mode not in PERSON_RESIZE_MODES:
+        raise InferenceCheckError(
+            f"person-resize-mode 는 {list(PERSON_RESIZE_MODES)} 중 하나여야 한다: {person_resize_mode!r}"
+        )
+    if garment_resize_mode not in GARMENT_RESIZE_MODES:
+        raise InferenceCheckError(
+            f"garment-resize-mode 는 {list(GARMENT_RESIZE_MODES)} 중 하나여야 한다: {garment_resize_mode!r}"
+        )
+    inference_steps = require_inference_steps(inference_steps)
     mode = "official" if person_image is None else "custom"
-    print(f"[INFO] 입력 모드: {mode}", flush=True)
+    print(
+        f"[INFO] 입력 모드: {mode}, person-resize-mode: {person_resize_mode}, "
+        f"garment-resize-mode: {garment_resize_mode}, inference-steps: {inference_steps}",
+        flush=True,
+    )
     if not torch.cuda.is_available() or GPU not in torch.cuda.get_device_name(0):
         raise InferenceCheckError(f"{GPU} GPU 가 아니다: {torch.cuda.is_available()}")
 
@@ -338,7 +460,9 @@ def run_tryon(
         inputs[role] = {"source": source, **info, "image": rgb}
         # 원본 바이트·픽셀·URL 은 출력하지 않는다. 형식·크기·방향만 남긴다.
         print(f"[INFO] {role}: {source} {info}", flush=True)
-        if "aspect_warning" in info:
+        # pad 모드는 비율을 유지하므로 늘어난다는 경고가 해당하지 않는다.
+        role_mode = person_resize_mode if role == "human" else garment_resize_mode
+        if "aspect_warning" in info and role_mode == "stretch":
             print(
                 f"[WARN] {role}: {info['aspect_warning']} (비율 {info['aspect_ratio']})", flush=True
             )
@@ -422,16 +546,52 @@ def run_tryon(
         [transforms.ToTensor(), transforms.Normalize([0.5], [0.5])]
     )
     preprocess_report: dict = {}
-    with measured("preprocess"):
-        # 2. 768×1024 리사이즈. 예제는 이미 3:4 라 공식 기본값(자동 크롭 끔)과 결과가 같다.
-        garm_img = inputs["cloth"]["image"].resize(IMAGE_SIZE)
-        human_img = inputs["human"]["image"].resize(IMAGE_SIZE)
+    person_fit: dict = {}
+    garment_fit: dict = {}
+
+    @contextlib.contextmanager
+    def explain_failure():
+        # 검증 기준은 그대로 두고, 어느 모드·어느 단계에서 왜 멈췄는지와 그때까지의 결과를 남긴다.
+        try:
+            yield
+        except InferenceCheckError as error:
+            print(
+                f"[FAIL] person-resize-mode={person_resize_mode}, "
+                f"garment-resize-mode={garment_resize_mode}: {error}",
+                flush=True,
+            )
+            print(f"[FAIL] 사람 입력 맞춤: {person_fit}", flush=True)
+            print(f"[FAIL] 상품 입력 맞춤: {garment_fit}", flush=True)
+            print(f"[FAIL] 실패 전까지의 전처리 결과: {preprocess_report}", flush=True)
+            raise
+
+    with measured("preprocess"), explain_failure():
+        # 2. 768×1024 맞춤. 사람·상품 각각 stretch(기존)·pad 중 고른 방식으로 한 번만 만든다.
+        # 상품: 아래 cloth Tensor·ip_adapter_image 가 모두 이 garm_img 에서 나온다.
+        garm_img, garment_fit_info = fit_garment_image(
+            inputs["cloth"]["image"], garment_resize_mode
+        )
+        garment_fit.update(garment_fit_info)
+        print(f"[INFO] 상품 입력 맞춤: {garment_fit}", flush=True)
+        # 사람: 아래 OpenPose·Parsing·DensePose·마스크·추론·person_input.png 는 모두 이 human_img 에서 나온다.
+        human_img, fit_info = fit_person_image(inputs["human"]["image"], person_resize_mode)
+        person_fit.update(fit_info)
+        print(f"[INFO] 사람 입력 맞춤: {person_fit}", flush=True)
 
         # 3. OpenPose (384×512). 사람을 못 찾으면 공식 코드는 IndexError 로 끝난다.
         try:
             keypoints = openpose_model(human_img.resize(PREPROCESS_SIZE))
         except IndexError as error:
             raise InferenceCheckError("OpenPose 가 사람을 찾지 못했다") from error
+        points = keypoints.get("pose_keypoints_2d")
+        if isinstance(points, list):
+            # 384×512 좌표. 못 찾은 관절은 (0, 0) 이다. 검증 전에 남겨 실패해도 볼 수 있게 한다.
+            preprocess_report["pose_keypoints"] = [
+                [round(float(value), 1) for value in point[:2]] for point in points
+            ]
+            preprocess_report["pose_keypoints_found"] = sum(
+                1 for x, y in preprocess_report["pose_keypoints"] if x > 1.0 or y > 1.0
+            )
         preprocess_report["keypoints"] = require_keypoints(keypoints)
 
         # 4. Human Parsing (384×512)
@@ -448,6 +608,22 @@ def run_tryon(
         mask = mask.resize(IMAGE_SIZE)
         mask_ratio = float((np.array(mask) > 0).mean())
         preprocess_report["mask_ratio"] = round(require_mask_ratio(mask_ratio), 4)
+        # pipe 가 실제로 인페인팅하는 영역. 리사이즈로 경계에 생긴 중간값을 pipe 와 같은 기준으로 나눈다.
+        # pipe 에는 기존대로 mask 를 넘기고, 이 이진 마스크는 로컬 합성 실험에만 쓴다.
+        inpaint_mask = Image.fromarray(
+            np.where(np.array(mask) >= INPAINT_MASK_THRESHOLD, 255, 0).astype(np.uint8)
+        )
+        preprocess_report["inpaint_mask_ratio"] = round(
+            float((np.array(inpaint_mask) == 255).mean()), 4
+        )
+        # 마스크 흰색 중 여백에 걸친 비율. pad 모드에서 마스크가 사진 영역과 맞는지 보는 진단값이다(stretch 는 0).
+        left, top, right, bottom = person_fit["content_box"]
+        in_padding = np.ones((IMAGE_SIZE[1], IMAGE_SIZE[0]), dtype=bool)
+        in_padding[top:bottom, left:right] = False
+        white = np.array(inpaint_mask) == 255
+        preprocess_report["inpaint_mask_padding_ratio"] = round(
+            float((white & in_padding).sum() / max(int(white.sum()), 1)), 4
+        )
         mask_gray = (1 - transforms.ToTensor()(mask)) * tensor_transfrom(human_img)
         mask_gray = to_pil_image((mask_gray + 1.0) / 2.0)
 
@@ -508,7 +684,7 @@ def run_tryon(
             negative_prompt_embeds=negative_prompt_embeds.to(DEVICE, torch.float16),
             pooled_prompt_embeds=pooled_prompt_embeds.to(DEVICE, torch.float16),
             negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(DEVICE, torch.float16),
-            num_inference_steps=DENOISE_STEPS,
+            num_inference_steps=inference_steps,
             generator=generator,
             strength=STRENGTH,
             pose_img=pose_tensor,
@@ -532,15 +708,21 @@ def run_tryon(
         # Modal 반환값은 bytes 만 넘긴다. PIL·NumPy·Tensor 는 컨테이너 밖으로 보내지 않는다.
         outputs = {RESULT_FILE: encode_jpeg(result_img), MASK_FILE: encode_jpeg(mask_gray)}
         output_info = {name: inspect_jpeg(data) for name, data in outputs.items()}
-        # 비교 이미지용. 모델이 실제로 받은 사람 이미지(EXIF 보정·768×1024 리사이즈 뒤)다. 파일로 따로 저장하지 않는다.
-        person_input = encode_jpeg(human_img)
+        # 합성 실험용. 모델이 실제로 받은 사람 이미지(EXIF 보정·RGB·768×1024 리사이즈 뒤)와 이진 마스크를
+        # 같은 좌표계 그대로 손실 없이 넘긴다.
+        if inpaint_mask.size != human_img.size:
+            raise InferenceCheckError(
+                f"이진 마스크 {inpaint_mask.size} 와 사람 이미지 {human_img.size} 의 크기가 다르다"
+            )
+        outputs[INPAINT_MASK_FILE] = encode_png(inpaint_mask)
+        outputs[PERSON_INPUT_FILE] = encode_png(human_img)
 
     total_seconds = round(time.perf_counter() - run_started, 2)
     peak_allocated = max(stats["max_allocated_mib"] for stats in vram.values())
     peak_reserved = max(stats["max_reserved_mib"] for stats in vram.values())
     print(
         f"[INFO] 전처리 {timings['preprocess']}s, 전처리 모델 로딩 {timings['preprocess_model_loading']}s, "
-        f"IDM-VTON 모델 로딩 {timings['idm_vton_model_loading']}s, 추론 {timings['inference']}s, "
+        f"IDM-VTON 모델 로딩 {timings['idm_vton_model_loading']}s, 추론({inference_steps} steps) {timings['inference']}s, "
         f"전체 {total_seconds}s, 최대 VRAM allocated {peak_allocated} MiB / reserved {peak_reserved} MiB",
         flush=True,
     )
@@ -553,16 +735,20 @@ def run_tryon(
         "garment_description": str(garment_description),
         "settings": {
             "size": list(IMAGE_SIZE),
-            "steps": DENOISE_STEPS,
+            "steps": inference_steps,
             "seed": SEED,
             "guidance_scale": GUIDANCE_SCALE,
             "strength": STRENGTH,
             "dtype": "float16",
+            "person_resize_mode": person_resize_mode,
+            "garment_resize_mode": garment_resize_mode,
         },
         "inputs": {
             role: {key: value for key, value in info.items() if key != "image"}
             for role, info in inputs.items()
         },
+        "person_fit": person_fit,
+        "garment_fit": garment_fit,
         "preprocess": preprocess_report,
         "result_stddev": round(result_stddev, 2),
         "timings": {**timings, "total": total_seconds},
@@ -572,7 +758,6 @@ def run_tryon(
         "gpu_name": str(torch.cuda.get_device_name(0)),
         "images": outputs,
         "image_info": output_info,
-        "person_input": person_input,
     }
 
 
@@ -582,15 +767,33 @@ def main(
     garment_image: str = "",
     garment_description: str = "",
     case_id: str = "",
+    person_resize_mode: str = DEFAULT_PERSON_RESIZE_MODE,
+    garment_resize_mode: str = DEFAULT_GARMENT_RESIZE_MODE,
+    inference_steps: int = DENOISE_STEPS,
 ) -> None:
     # 두 이미지를 모두 생략하면 공식 예제, 모두 주면 사용자 입력으로 실행한다. 실패하면 이미지는 저장하지 않는다.
     import time
     from pathlib import Path
 
+    # 로컬 후처리 모듈. Modal 컨테이너에는 올리지 않으므로 여기서만 import 한다.
+    import restore_composite
+
     if bool(person_image) != bool(garment_image):
         raise SystemExit(
             "--person-image 와 --garment-image 는 함께 지정해야 한다. 둘 다 생략하면 공식 예제로 실행한다."
         )
+    if person_resize_mode not in PERSON_RESIZE_MODES:
+        raise SystemExit(
+            f"--person-resize-mode 는 {list(PERSON_RESIZE_MODES)} 중 하나여야 한다: {person_resize_mode!r}"
+        )
+    if garment_resize_mode not in GARMENT_RESIZE_MODES:
+        raise SystemExit(
+            f"--garment-resize-mode 는 {list(GARMENT_RESIZE_MODES)} 중 하나여야 한다: {garment_resize_mode!r}"
+        )
+    try:
+        require_inference_steps(inference_steps)
+    except InferenceCheckError as error:
+        raise SystemExit(f"--{error}") from error
     custom = bool(person_image)
     description = garment_description.strip()
     if custom and not description:
@@ -603,59 +806,114 @@ def main(
     # GPU 를 띄우기 전에 로컬에서 끝낼 수 있는 검증을 먼저 한다.
     try:
         output_dir = case_output_dir(Path(__file__).resolve().parent / OUTPUT_DIR_NAME, case_id)
+        # 이전 결과(예: real-01)를 덮어쓰지 않는다. 합성만 다시 할 때는 restore_composite.py 를 쓴다.
+        if output_dir.exists() and any(output_dir.iterdir()):
+            raise InferenceCheckError(
+                f"{output_dir} 에 이전 결과가 있다. 덮어쓰지 않도록 다른 --case-id 를 지정한다."
+            )
         payload = {}
         if custom:
             for role, path in (("person", person_image), ("garment", garment_image)):
                 data, info = read_local_image(path, role)
                 payload[role] = data
+                role_mode = person_resize_mode if role == "person" else garment_resize_mode
+                if role_mode == "pad":
+                    info.pop("aspect_warning", None)
                 print(f"input {role}: {Path(path).expanduser().resolve()} {info}")
+            # 원격과 같은 함수로 여백을 미리 계산해 보여준다. 모델 입력은 원격에서 다시 만든다.
+            _, planned = fit_person_image(
+                decode_input_image(payload["person"], "person")[0], person_resize_mode
+            )
+            print(f"person fit (planned): {planned}")
+            _, planned = fit_garment_image(
+                decode_input_image(payload["garment"], "garment")[0], garment_resize_mode
+            )
+            print(f"garment fit (planned): {planned}")
     except InferenceCheckError as error:
         raise SystemExit(str(error)) from error
     print(
-        f"case: {case_id} ({'custom' if custom else 'official example'}), garment: {description!r}"
+        f"case: {case_id} ({'custom' if custom else 'official example'}), "
+        f"person-resize-mode: {person_resize_mode}, garment-resize-mode: {garment_resize_mode}, "
+        f"inference-steps: {inference_steps}, garment: {description!r}"
     )
 
     started = time.perf_counter()
     try:
-        result = run_tryon.remote(description, payload.get("person"), payload.get("garment"))
+        result = run_tryon.remote(
+            description,
+            payload.get("person"),
+            payload.get("garment"),
+            person_resize_mode,
+            garment_resize_mode,
+            inference_steps,
+        )
+    except InferenceCheckError as error:
+        # 전처리 검증 실패. 기준은 완화하지 않는다. 단계별 값은 원격 로그의 [FAIL] 줄에 있다.
+        raise SystemExit(
+            f"원격 검증 실패 (person-resize-mode={person_resize_mode}, "
+            f"garment-resize-mode={garment_resize_mode}): {error}"
+        ) from error
     finally:
         # 컨테이너 시작·이미지 준비까지 포함한 호출 전체 시간.
         print(f"IDM-VTON inference check wall time: {time.perf_counter() - started:.1f}s")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     images = result.pop("images")
-    # 비교 이미지는 로컬에서 만든다: 모델 입력 사람 사진 | 마스크 | 결과.
-    images[COMPARISON_FILE] = make_comparison(
-        [
-            ("input (person)", result.pop("person_input")),
-            ("mask", images[MASK_FILE]),
-            ("result", images[RESULT_FILE]),
-        ]
-    )
-    comparison_size = (IMAGE_SIZE[0] * 3, IMAGE_SIZE[1] + COMPARISON_LABEL_HEIGHT)
+    expected = {
+        RESULT_FILE: ("JPEG", "RGB"),
+        MASK_FILE: ("JPEG", "RGB"),
+        INPAINT_MASK_FILE: ("PNG", "L"),
+        PERSON_INPUT_FILE: ("PNG", "RGB"),
+    }
+    if set(images) != set(expected):
+        raise SystemExit(f"반환된 이미지가 기대와 다르다: {sorted(images)}")
     for name, data in images.items():
         path = output_dir / name
         path.write_bytes(data)
         # 저장된 파일을 다시 읽어 확인한다. 파일이 정상이라는 뜻이지 가상피팅 품질이 좋다는 뜻은 아니다.
-        expected = comparison_size if name == COMPARISON_FILE else IMAGE_SIZE
-        info = inspect_jpeg(path.read_bytes(), expected)
+        info = restore_composite.inspect_file(path, *expected[name])
         print(
-            f"saved {path} {info['format']} {info['size'][0]}x{info['size'][1]} {info['bytes']:,} bytes"
+            f"saved {path} {info['format']} {info['mode']} {info['size'][0]}x{info['size'][1]} "
+            f"{info['bytes']:,} bytes"
         )
+    # 저장한 파일만으로 합성한다. 블렌딩 값을 바꿔 다시 합성할 때(restore_composite.py)와 같은 경로다.
+    try:
+        restore_report = restore_composite.restore_case_dir(output_dir)
+    except restore_composite.RestoreError as error:
+        raise SystemExit(f"추론 결과는 저장했지만 합성에 실패했다: {error}") from error
+    restore_composite.print_report(restore_report)
 
     for role, info in result["inputs"].items():
         summary = {
             key: info[key] for key in ("format", "original_size", "exif_orientation", "size")
         }
+        role_mode = person_resize_mode if role == "human" else garment_resize_mode
+        warn = "aspect_warning" in info and role_mode == "stretch"
+        print(f"input {role}: {summary}" + (f" WARN {info['aspect_warning']}" if warn else ""))
+    for label, key in (("person", "person_fit"), ("garment", "garment_fit")):
+        fit = result[key]
         print(
-            f"input {role}: {summary}"
-            + (f" WARN {info['aspect_warning']}" if "aspect_warning" in info else "")
+            f"{label} fit: mode {fit['mode']}, original {fit['original_size']} (aspect {fit['original_aspect']}), "
+            f"resized {fit['resized_size']} (aspect {fit['resized_aspect']}), padding {fit['padding']}, "
+            f"pad color {fit.get('pad_color')}, model input {fit['output_size']}"
         )
     preprocess = result["preprocess"]
-    print(f"mask ratio: {preprocess['mask_ratio']}")
+    print(
+        f"mask ratio: {preprocess['mask_ratio']}, inpaint mask ratio: {preprocess['inpaint_mask_ratio']}, "
+        f"inpaint mask in padding: {preprocess['inpaint_mask_padding_ratio']}"
+    )
+    print(
+        f"openpose (384x512): found {preprocess.get('pose_keypoints_found')}/18, "
+        f"shoulders {preprocess['keypoints']}, all {preprocess.get('pose_keypoints')}"
+    )
     print(
         f"densepose: instances {preprocess['densepose_instances']}, "
         f"scores {preprocess['densepose_scores']}, boxes {preprocess['densepose_boxes']}"
+    )
+    settings = result["settings"]
+    print(
+        f"settings: steps {settings['steps']}, seed {settings['seed']}, "
+        f"guidance {settings['guidance_scale']}, strength {settings['strength']}"
     )
     timings = result["timings"]
     print(
@@ -669,5 +927,5 @@ def main(
         f"reserved {result['peak_vram_reserved_mib']} MiB on {result['gpu_name']}"
     )
     print(
-        "파일 형식·해상도 검증만 통과했다. 가상피팅 품질은 result.jpg·mask.jpg·comparison.jpg 를 직접 열어 확인한다."
+        "파일 형식·해상도·합성 영역 검증만 통과했다. 품질은 result.jpg·restored_result.jpg·comparison.jpg 를 직접 열어 확인한다."
     )

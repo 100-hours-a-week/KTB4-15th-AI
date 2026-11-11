@@ -254,7 +254,7 @@ def test_async_result_key_requires_positive_int(job_id):
 
 
 def test_async_result_key_format():
-    assert async_storage.async_result_key(3) == RESULT_KEY
+    assert async_storage.async_result_key(3) == RESULT_KEY.replace(".jpg", ".webp")
 
 
 # --- 6~9. HEAD ---
@@ -434,3 +434,8 @@ def test_missing_bucket_still_fails_fast(monkeypatch):
     monkeypatch.setattr(settings, "S3_BUCKET", "")
     with pytest.raises(s3_module.S3ConfigError):
         S3ImageStorage(NoCallS3Client())
+
+
+@pytest.mark.parametrize(("extension", "expected"), [("webp", "WEBP"), ("jpg", "JPG"), ("jpeg", "JPG")])
+def test_async_output_contract_comes_from_saved_key(extension, expected):
+    assert async_storage.async_output_format(f"results/existing.{extension}") == expected

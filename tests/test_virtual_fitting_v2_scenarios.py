@@ -27,6 +27,7 @@ from app.virtual_fitting.repositories.async_job_repository import (
     ResultMessageStatus,
 )
 from app.virtual_fitting.repositories.async_job_state import AsyncJobStateRepository
+from tests.runware_codes import GENERATION_FAILED_TEST_CODE, register_generation_failed_code
 from tests.v2_integration_harness import (
     COMMENT,
     TITLE,
@@ -34,10 +35,11 @@ from tests.v2_integration_harness import (
     close_env,
     make_env,
     post_webhook,
+    prepared_by_previous_version,
 )
 
 JOB = 9101
-ASYNC_KEY = f"virtual-fitting/results/{JOB}/pruna-async.jpg"
+ASYNC_KEY = f"virtual-fitting/results/{JOB}/pruna-async.webp"
 SYNC_KEY = f"virtual-fitting/results/{JOB}/pruna-sync.jpg"
 
 
@@ -52,6 +54,7 @@ def env(monkeypatch):
         pytest.skip(f"테스트 DB 에 연결할 수 없다: {error}")
     schema = f"vf_v2scn_{uuid.uuid4().hex[:12]}"
     admin.execute(f"CREATE SCHEMA {schema}")
+    register_generation_failed_code(monkeypatch)  # 최종 실패(FITTING_MODEL_FAILED) 시나리오용 코드
     e = make_env(monkeypatch, url, schema)
     try:
         yield e
@@ -87,6 +90,12 @@ def clocked_handlers(clock):
         postprocess=PostprocessHandler(clock=clock, sleep=clock.sleep),
         run_fallback=RunFallbackHandler(clock=clock, sleep=clock.sleep),
     )
+
+
+def pruna_sync_handlers():
+    """보존된 Pruna V1 동기 RunFallbackHandler 를 명시해 조립한다. 실제 연결(connected_postprocess_handlers)은
+    IdmVtonFallbackHandler 다. 아래 Pruna 동기 시나리오는 보존 코드의 회귀 검증으로 이 조립을 쓴다."""
+    return PostprocessHandlers(postprocess=PostprocessHandler(), run_fallback=RunFallbackHandler())
 
 
 def client():
@@ -166,11 +175,17 @@ def finish(env, stack):
 # --- B. fallback 진입점 ---
 
 
-def test_fallback_from_a_retryable_submit_rejection(env):
+def test_fallback_from_a_task_linked_generation_timeout_in_the_submit_response(env):
+    # 2-1 보완: 예전에는 providerRateLimitExceeded(연결 task 없음)를 retryable 거절로 보고 fallback 했다. 이제 fallback 은
+    # 이 task 에 연결된 생성 종료 실패 근거(timeoutProvider)일 때만이다(Webhook·getResponse 와 같은 기준).
+    # 보존된 Pruna 동기 핸들러 회귀(명시 조립): 실제 RUN_FALLBACK 연결은 IdmVtonFallbackHandler 다.
     env.runware.async_modes.append(
-        ("errors", [{"code": "providerRateLimitExceeded", "message": "x"}])
+        lambda submission: (
+            "errors",
+            [{"code": "timeoutProvider", "message": "x", "taskUUID": submission.task_uuid}],
+        )
     )
-    stack = Stack(env).mark_running()
+    stack = Stack(env, pruna_sync_handlers()).mark_running()
     env.send_request(JOB)
     (outcome,) = stack.request_once()
     assert outcome.delete is True  # RUN_FALLBACK 발행 확인 뒤에만 지운다
@@ -184,6 +199,8 @@ def test_fallback_from_a_retryable_submit_rejection(env):
 
 
 def test_fallback_after_both_s3_check_bundles_find_nothing(env):
+    # 이전 계약 검증: 전환 전 코드가 준비한 기존 직접 업로드 작업(ai_stores_result=False)
+    prepared_by_previous_version(env.monkeypatch, JOB)
     clock = Clock()
     stack = Stack(env, clocked_handlers(clock)).mark_running()
     task = submitted(env, stack)
@@ -201,6 +218,8 @@ def test_fallback_after_both_s3_check_bundles_find_nothing(env):
 
 
 def test_object_appearing_after_the_webhook_succeeds_inside_the_check_window(env):
+    # 이전 계약 검증: 전환 전 코드가 준비한 기존 직접 업로드 작업(ai_stores_result=False)
+    prepared_by_previous_version(env.monkeypatch, JOB)
     clock = Clock()
     stack = Stack(env, clocked_handlers(clock)).mark_running()
     task = submitted(env, stack)
@@ -217,7 +236,7 @@ def test_object_appearing_after_the_webhook_succeeds_inside_the_check_window(env
 # --- D. 접수 응답보다 Webhook 이 먼저 ---
 
 
-@pytest.mark.parametrize("code", [None, "timeoutProvider", "someNewCode"])
+@pytest.mark.parametrize("code", [None, "timeoutProvider", GENERATION_FAILED_TEST_CODE])
 def test_webhook_before_the_accept_response(env, code):
     stack = Stack(env).mark_running()
     seen = {}
@@ -240,11 +259,11 @@ def test_webhook_before_the_accept_response(env, code):
     expected = {
         None: (AsyncJobStatus.POSTPROCESSING, NextAction.POSTPROCESS),
         "timeoutProvider": (AsyncJobStatus.FALLBACK_RUNNING, NextAction.RUN_FALLBACK),
-        "someNewCode": (AsyncJobStatus.RECEIVED, NextAction.PUBLISH_RESULT),
+        GENERATION_FAILED_TEST_CODE: (AsyncJobStatus.RECEIVED, NextAction.PUBLISH_RESULT),
     }[code]
     assert (current.status, current.next_action) == expected  # 늦은 접수 응답이 되돌리지 않음
     assert current.runware_accepted_at is not None
-    if code == "someNewCode":
+    if code == GENERATION_FAILED_TEST_CODE:
         assert current.result_payload["error_code"] == "FITTING_MODEL_FAILED"
     finish(env, stack)
     assert row(env).result_message_status is ResultMessageStatus.PUBLISHED
@@ -348,7 +367,7 @@ def test_submit_auth_rejection_is_held_across_redelivery_and_restart(env, status
 
 def saved_failure(env, stack):
     task = submitted(env, stack)
-    post_webhook(client(), env.runware.failure(task, "someNewCode"))
+    post_webhook(client(), env.runware.failure(task, GENERATION_FAILED_TEST_CODE))
     expire_lease(env)
     return task
 
@@ -497,7 +516,7 @@ def test_internal_publish_unknown_creates_a_duplicate_that_runs_once(env):
 
 def test_fallback_started_without_a_result_is_kept_for_operators(env):
     env.runware.sync_modes.append("timeout")
-    stack = Stack(env).mark_running()
+    stack = Stack(env, pruna_sync_handlers()).mark_running()
     task = submitted(env, stack)
     post_webhook(client(), env.runware.failure(task, "timeoutProvider"))
     stack.postprocess_once()
@@ -505,7 +524,7 @@ def test_fallback_started_without_a_result_is_kept_for_operators(env):
     assert started.fallback_started_at is not None and started.fallback_image_key is None
     fb = started.fallback_task_uuid
     assert in_flight(env) == [(JOB, fb)]  # 결과 불명확: 자리 유지
-    stack = restart(env)
+    stack = restart(env, pruna_sync_handlers())
     env.sqs.expire_visibility("ai-fitting-response")
     expire_lease(env)
     stack.postprocess_once()
@@ -527,7 +546,7 @@ def test_fallback_started_without_a_result_is_kept_for_operators(env):
 
 
 def test_s3_saved_before_the_db_image_record_is_recovered_without_regeneration(env, monkeypatch):
-    stack = Stack(env).mark_running()
+    stack = Stack(env, pruna_sync_handlers()).mark_running()
     task = submitted(env, stack)
     post_webhook(client(), env.runware.failure(task, "timeoutProvider"))
     real = AsyncJobStateRepository.record_fallback_image
@@ -542,7 +561,7 @@ def test_s3_saved_before_the_db_image_record_is_recovered_without_regeneration(e
     monkeypatch.setattr(AsyncJobStateRepository, "record_fallback_image", fail_once)
     stack.postprocess_once()
     assert SYNC_KEY in env.s3.objects and row(env).fallback_image_key is None
-    stack = restart(env)
+    stack = restart(env, pruna_sync_handlers())
     age(env, "updated_at", 700)
     expire_lease(env)
     stack.watchdog_once()  # 고정 Key HEAD(이 시도 뒤 저장) → 기록 → RUN_FALLBACK 재발행
@@ -671,10 +690,40 @@ def test_bad_result_queue_keeps_the_webhook_503_and_the_postprocess_message(env,
         "BE_FITTING_RESPONSE_QUEUE_URL",
         "https://sqs.us-east-1.amazonaws.com/1/be-fitting-response",
     )
-    response = post_webhook(client(), env.runware.failure(task, "someNewCode"))
+    response = post_webhook(client(), env.runware.failure(task, GENERATION_FAILED_TEST_CODE))
     assert response.status_code == 503
     assert response.json()["data"]["pending"][0]["next_step"] == "publish_result"
     assert row(env).result_payload["status"] == "FAILED"
     stack.publish_once()
     assert env.sqs.bodies("be-fitting-response") == []
     assert row(env).result_message_attempt_count == 0  # 설정 오류는 전송 횟수를 쓰지 않음
+
+
+def test_webp_octet_stream_completes_without_extra_permissions_or_rewrite(env):
+    # 이전 계약 검증: 전환 전 코드가 준비한 기존 직접 업로드 작업(ai_stores_result=False)
+    prepared_by_previous_version(env.monkeypatch, JOB)
+    stack = Stack(env).mark_running()
+    task = submitted(env, stack)
+    body = env.runware.complete(task)
+    original_object = env.s3.objects[ASYNC_KEY]
+    original_keys = set(env.s3.objects)
+    assert original_object[1] == "binary/octet-stream"
+    assert post_webhook(client(), body).status_code == 200
+
+    finish(env, stack)
+    final = row(env)
+    assert final.result_payload["status"] == "COMPLETED"
+    assert final.result_image_key == final.async_image_key == final.verified_image_key == ASYNC_KEY
+    assert final.s3_check_attempt_count == 1 and final.llm_generation_attempt_count == 2
+    assert final.fallback_attempt_count == 0
+    assert env.s3.objects[ASYNC_KEY] == original_object  # bytes/MIME/LastModified 모두 유지
+    assert set(env.s3.objects) == original_keys  # 별도 최종 객체 없음
+    assert env.runware.count("async_submit") == 1 and env.runware.count("sync_generate") == 0
+    assert costs(env) == [(task, Decimal("0.023"))]
+    # 완료 Webhook 재수신도 생성·LLM·S3 저장을 반복하지 않는다.
+    assert post_webhook(client(), body).status_code == 200
+    env.sqs.expire_visibility("ai-fitting-response")
+    finish(env, stack)
+    assert row(env).llm_generation_attempt_count == 2
+    assert env.s3.objects[ASYNC_KEY] == original_object and set(env.s3.objects) == original_keys
+    assert env.runware.count("async_submit") == 1 and env.runware.count("sync_generate") == 0

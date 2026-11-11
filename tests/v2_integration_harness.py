@@ -1,15 +1,3 @@
-"""16단계 로컬 통합 검증용 외부 경계 대체(테스트 전용, pytest 가 수집하지 않는 파일).
-
-실제 구현(app.main.app·lifespan·Router·요청/후처리 Worker·Submitter·Provider·Webhook·결과 전송 루프·Watchdog·
-Repository·SqsQueueClient·S3ImageStorage)은 그대로 쓰고, 그 바깥 경계만 바꾼다.
-
-- SQS: boto3.client("sqs") 자리에 FakeSqsBackend 의 client. 수신·발행·삭제·Visibility·재전달(receive count)·고장 주입만.
-- S3: boto3.client("s3") 자리에 FakeS3Backend 의 client(put/head/presign). Presigned URL 은 로컬 문자열.
-- Runware(생성 비동기·동기, 잔액, 사용량, getResponse, LLM)·결과 이미지 다운로드: 각 모듈의 urlopen 자리에 FakeRunware.
-  실제 Provider 가 요청 JSON 을 만들고 응답 JSON 을 해석한다(Provider·Service 전체를 성공 Mock 으로 바꾸지 않음).
-- 네트워크: AF_INET·AF_INET6 소켓 연결을 막는다(실수로 실제 AWS·Runware 로 나가지 않게). DB 는 Unix socket.
-"""
-
 import io
 import json
 import socket
@@ -50,6 +38,15 @@ COMMENT = (
     "네이비 티셔츠와 중청 데님이 어우러진 캐주얼한 코디입니다.\n편안한 데일리룩으로 잘 어울립니다."
 )
 TITLE = "편안한 데일리 캐주얼"
+
+
+def webp_bytes() -> bytes:
+    """AI 저장 작업의 Runware 결과(정지 WebP 원본 bytes)."""
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 12), (30, 60, 90)).save(buffer, format="WEBP", quality=90)
+    return buffer.getvalue()
 
 
 def jpeg_bytes() -> bytes:
@@ -259,6 +256,10 @@ class FakeSqsClient:
 class FakeS3Backend:
     def __init__(self) -> None:
         self.objects: dict[str, tuple[bytes, str, datetime]] = {}
+        # 일반 Metadata(x-amz-meta-*): 조건부 PUT 으로 만든 객체, IDM-VTON 결과처럼 Presigned PUT 헤더로 올린 객체
+        self.metadata: dict[str, dict] = {}
+        self.puts: list[dict] = []  # PutObject 요청(Body 제외)
+        self.gets: list[str] = []
         self.heads: list[str] = []
         self.presigned: list[tuple[str, str]] = []  # (method, key)
         self.head_faults: deque = deque()  # "forbidden" / "server_error"
@@ -266,7 +267,15 @@ class FakeS3Backend:
 
     def store(self, key: str, body: bytes | None = None, content_type: str = "image/jpeg") -> None:
         with self._lock:
-            self.objects[key] = (body or jpeg_bytes(), content_type, datetime.now(UTC))
+            if body is None:
+                body = jpeg_bytes()
+                if key.endswith(".webp"):
+                    from PIL import Image
+
+                    output = io.BytesIO()
+                    Image.new("RGB", (4, 4), (20, 40, 80)).save(output, format="WEBP", quality=90)
+                    body = output.getvalue()
+            self.objects[key] = (body, content_type, datetime.now(UTC))
 
     def client(self) -> "FakeS3Client":
         return FakeS3Client(self)
@@ -276,10 +285,48 @@ class FakeS3Client:
     def __init__(self, backend: FakeS3Backend) -> None:
         self._b = backend
 
-    def put_object(self, Bucket, Key, Body, ContentType=None, **kwargs):
+    def put_object(
+        self, Bucket, Key, Body, ContentType=None, Metadata=None, IfNoneMatch=None, **kwargs
+    ):
         assert Bucket == BUCKET
-        self._b.store(Key, Body, ContentType or "application/octet-stream")
-        return {"ETag": '"fake"'}
+        b = self._b
+        b.puts.append(
+            {
+                "Key": Key,
+                "ContentType": ContentType,
+                "Metadata": Metadata,
+                "IfNoneMatch": IfNoneMatch,
+                **kwargs,
+            }
+        )
+        with b._lock:
+            if IfNoneMatch == "*" and Key in b.objects:  # S3 조건부 쓰기: 이미 있으면 412
+                raise _client_error("PreconditionFailed", 412, "PutObject")
+        b.store(Key, Body, ContentType or "application/octet-stream")
+        if Metadata is not None:
+            b.metadata[Key] = dict(Metadata)
+        return {"ETag": '"fake"', "ResponseMetadata": {"HTTPStatusCode": 200}}
+
+    def get_object(self, Bucket, Key):
+        from botocore.response import StreamingBody
+
+        assert Bucket == BUCKET
+        b = self._b
+        b.gets.append(Key)
+        with b._lock:
+            item = b.objects.get(Key)
+            metadata = dict(b.metadata.get(Key, {}))
+        if item is None:
+            raise _client_error("NoSuchKey", 404, "GetObject")
+        body, content_type, modified = item
+        return {
+            "ResponseMetadata": {"HTTPStatusCode": 200},
+            "Body": StreamingBody(io.BytesIO(body), len(body)),
+            "ContentLength": len(body),
+            "ContentType": content_type,
+            "LastModified": modified,
+            "Metadata": metadata,
+        }
 
     def head_object(self, Bucket, Key):
         assert Bucket == BUCKET
@@ -297,12 +344,22 @@ class FakeS3Client:
         if item is None:
             raise _client_error("404", 404, "HeadObject")
         body, content_type, modified = item
-        return {
+        response = {
             "ResponseMetadata": {"HTTPStatusCode": 200},
             "ContentLength": len(body),
             "ContentType": content_type,
             "LastModified": modified,
         }
+        if Key in b.metadata:
+            response["Metadata"] = dict(b.metadata[Key])
+        return response
+
+    def __getattr__(self, name):
+        # 기존 Get/Put/HEAD 외의 메타데이터 보정 권한은 제공하지 않는다.
+        if name in {"copy_object", "get_object_tagging", "get_object_acl",
+                    "get_object_retention", "get_object_legal_hold"}:
+            raise AssertionError(f"unexpected metadata permission dependency: {name}")
+        raise AttributeError(name)
 
     def generate_presigned_url(self, ClientMethod, Params, ExpiresIn):
         self._b.presigned.append((ClientMethod, Params["Key"]))
@@ -344,9 +401,15 @@ def _http_error(url: str, code: int, body: Any = None, headers: dict | None = No
 class Submission:
     task_uuid: str
     payload: dict
-    upload_key: str
+    upload_key: str | None  # None: uploadEndpoint 없이 요청한 AI 저장 작업
     webhook_url: str
     person_key: str
+    image_uuid: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+    @property
+    def result_url(self) -> str:
+        """AI 저장 작업의 가짜 결과 URL(허용 호스트·token 쿼리 포함, 실제로 요청하지 않음)."""
+        return f"https://im.runware.ai/image/fake/{self.task_uuid}.webp?token=fake-cdn-token"
 
 
 @dataclass
@@ -373,6 +436,8 @@ class FakeRunware:
     llm_requests: list = field(default_factory=list)
     gate: threading.Event | None = None  # 비동기 접수 응답 전에 기다릴 때(종료 검증)
     entered: threading.Event = field(default_factory=threading.Event)
+    cdn: dict = field(default_factory=dict)  # 결과 URL → bytes (AI 저장 작업, complete 때 생김)
+    downloads: list = field(default_factory=list)  # AI 가 내려받은 결과 URL
 
     def __call__(self, request, timeout=None):
         url = request.full_url if hasattr(request, "full_url") else str(request)
@@ -411,10 +476,11 @@ class FakeRunware:
 
     # 비동기 접수
     def _async(self, url, task):
+        upload = task.get("uploadEndpoint")
         submission = Submission(
             task["taskUUID"],
             task,
-            key_of(task["uploadEndpoint"]),
+            key_of(upload) if upload is not None else None,
             task["webhookURL"],
             key_of(task["inputs"]["referenceImages"][0]["image"]),
         )
@@ -501,10 +567,24 @@ class FakeRunware:
 
     # Runware 쪽 완료 흉내
     def complete(self, task_uuid: str, *, put: bool = True, cost: float | None = 0.023) -> bytes:
-        """결과를 uploadEndpoint 로 PUT 하고(put=True) 성공 Webhook 본문을 돌려준다."""
+        """결과를 uploadEndpoint 로 PUT 하고(put=True) 성공 Webhook 본문을 돌려준다.
+
+        uploadEndpoint 없이 요청한 AI 저장 작업은 PUT 하지 않고 결과를 가짜 CDN 에 두며, 그 URL 을 imageURL 로 알린다.
+        """
         submission = self.submissions[task_uuid]
+        if submission.upload_key is None:
+            self.cdn[submission.result_url] = webp_bytes()
+            body = {
+                "taskType": "imageInference",
+                "taskUUID": task_uuid,
+                "imageUUID": submission.image_uuid,
+                "imageURL": submission.result_url,
+            }
+            if cost is not None:
+                body["cost"] = cost
+            return json.dumps(body).encode()
         if put:
-            self.s3.store(submission.upload_key)
+            self.s3.store(submission.upload_key, content_type="binary/octet-stream")
         body = {
             "taskType": "imageInference",
             "taskUUID": task_uuid,
@@ -531,16 +611,27 @@ class FakeRunware:
         ).encode()
 
     def success_status(self, task_uuid: str, cost: float = 0.023) -> None:
-        self.statuses[task_uuid] = {
-            "data": [
-                {
-                    "taskType": "imageInference",
-                    "taskUUID": task_uuid,
-                    "status": "success",
-                    "cost": cost,
-                }
-            ]
+        item = {
+            "taskType": "imageInference",
+            "taskUUID": task_uuid,
+            "status": "success",
+            "cost": cost,
         }
+        submission = self.submissions.get(task_uuid)
+        if submission is not None and submission.upload_key is None:
+            # AI 저장 작업: getResponse 도 결과 참조를 준다(결과가 가짜 CDN 에 있어야 함).
+            self.cdn.setdefault(submission.result_url, webp_bytes())
+            item |= {"imageUUID": submission.image_uuid, "imageURL": submission.result_url}
+        self.statuses[task_uuid] = {"data": [item]}
+
+    def download(self, url: str) -> bytes:
+        """AI 결과 다운로드 경계(result_image.download_runware_image 자리). 실제 DNS·HTTP 없음."""
+        from app.virtual_fitting.result_image import ResultImageError
+
+        self.downloads.append(url)
+        if url not in self.cdn:
+            raise ResultImageError("http_error", http_status=404)
+        return self.cdn[url]
 
     def count(self, kind: str) -> int:
         return sum(1 for k, _ in self.calls if k == kind)
@@ -670,6 +761,9 @@ def make_env(monkeypatch, url: str, schema: str) -> V2Env:
         "virtual_fitting_async_jobs.sql",
         "virtual_fitting_fallback.sql",
         "virtual_fitting_auth_hold.sql",
+        "virtual_fitting_runware_image_ref.sql",
+        "virtual_fitting_ai_result_storage.sql",
+        "virtual_fitting_pruna_retry.sql",
         "virtual_fitting_pruna_limits.sql",
     ):
         env.sql(Path(f"{ROOT_SQL}/{name}").read_text(encoding="utf-8"))
@@ -722,6 +816,12 @@ def make_env(monkeypatch, url: str, schema: str) -> V2Env:
 
     for module_name in RUNWARE_MODULES:
         monkeypatch.setattr(importlib.import_module(module_name), "urlopen", env.runware)
+    # AI 저장 작업의 결과 다운로드 경계(실제 구현은 http.client 로 im.runware.ai 에 직접 연결): 가짜 CDN 으로.
+    monkeypatch.setattr(
+        importlib.import_module("app.virtual_fitting.result_image"),
+        "download_runware_image",
+        env.runware.download,
+    )
     env.network_attempts = block_network(monkeypatch)
     env.real_boto_client = real_client
     register_result_publisher(None)
@@ -730,12 +830,40 @@ def make_env(monkeypatch, url: str, schema: str) -> V2Env:
     return env
 
 
+def prepared_by_previous_version(monkeypatch, *job_ids: int) -> None:
+    """이 작업들은 전환 전 코드가 준비한 것으로 둔다(ai_stores_result=False: uploadEndpoint 직접 업로드 계약).
+
+    실제 전환 뒤에도 DB 에 이미 준비된 기존 작업은 그 기록대로 처리된다. 이전 계약(Runware PUT·S3 HEAD 확인·그 뒤 fallback
+    판단)의 검증은 이 경로로 유지한다. 새 작업의 계약은 별도 테스트가 새 기대값으로 검증한다.
+    """
+    from app.virtual_fitting.repositories.async_job_state import AsyncJobStateRepository
+
+    original = AsyncJobStateRepository.prepare_pruna_submission
+    legacy = set(job_ids)
+
+    def prepare(self, fitting_job_id, token, task_uuid, async_image_key, *, ai_stores_result=False):
+        if fitting_job_id in legacy:
+            ai_stores_result = False
+        return original(
+            self,
+            fitting_job_id,
+            token,
+            task_uuid,
+            async_image_key,
+            ai_stores_result=ai_stores_result,
+        )
+
+    monkeypatch.setattr(AsyncJobStateRepository, "prepare_pruna_submission", prepare)
+
+
 def close_env(env: V2Env) -> None:
+    from app.virtual_fitting.postprocess_worker import register_postprocess_worker
     from app.virtual_fitting.result_publisher import register_result_publisher
     from app.virtual_fitting.watchdog import register_watchdog
 
     register_result_publisher(None)
     register_watchdog(None)
+    register_postprocess_worker(None)
     for pool in env.pools:
         if not pool.closed:
             pool.close()
@@ -768,14 +896,19 @@ class Stack:
         self.publisher = create_result_publisher()
         self.watchdog = create_watchdog(dict)
 
-    def mark_running(self, publisher: bool = True, watchdog: bool = True) -> "Stack":
+    def mark_running(
+        self, publisher: bool = True, watchdog: bool = True, postprocess: bool = True
+    ) -> "Stack":
+        from app.virtual_fitting import postprocess_worker as postprocess_module
         from app.virtual_fitting.result_publisher import register_result_publisher
         from app.virtual_fitting.watchdog import register_watchdog
 
         self.publisher.status.running = publisher
         self.watchdog.status.running = watchdog
+        self.postprocess.status.running = postprocess
         register_result_publisher(self.publisher if publisher else None)
         register_watchdog(self.watchdog if watchdog else None)
+        postprocess_module.register_postprocess_worker(self.postprocess if postprocess else None)
         return self
 
     @staticmethod

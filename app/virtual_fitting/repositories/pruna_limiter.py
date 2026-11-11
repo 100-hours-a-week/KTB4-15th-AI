@@ -1,19 +1,3 @@
-"""모든 AI 서버·프로세스가 PostgreSQL 로 공유하는 Pruna 생성 요청 제한과 작업별 비용 기록.
-
-테이블: scripts/db/virtual_fitting_pruna_limits.sql
-- 진행 중 생성 작업 자리(기본 3): 생성 요청 전에 잡고, 생성이 끝났다는 근거가 있을 때만 놓는다.
-- 생성 요청 HTTP 동시 전송 자리(기본 2): 전송하는 동안만 잡는다. 프로세스가 죽어도 held_until 이 지나면 빈 자리.
-- 생성 요청 전송 최소 간격(기본 10초): 전송 시도마다 다음 가능 시각을 늦춘다(실패한 시도도 포함). 429 대기 안내도 반영.
-- 공유 보류(send_hold_reason): 표현할 수 없게 긴 대기 안내를 받으면 기록한다. 기록이 있는 동안 어느 Worker 도 새 생성
-  요청 권한을 받지 못한다. 자동으로 풀리지 않으며 운영자가 원인을 확인한 뒤 SQL 로 지운다(scripts/db/virtual_fitting_pruna_limits.sql).
-
-begin_submission 은 한 트랜잭션에서 공유 상태 행 → 작업 행 순서로 잠그고(외부 호출 없음, lock_timeout 제한),
-잠금을 얻은 뒤의 DB 시각으로 실행 권한·상태·호출 시작 기록·자리·간격을 확인한 뒤, 자리 확보·간격 갱신과
-pruna_submit_started_at 기록을 함께 커밋한다. 그래서 제한 확보와 호출 시작 기록 사이에 다른 Worker 가 끼어들 수 없다.
-적용 범위: V2 Pruna 생성 요청(8단계). V2 의 V1 fallback 생성 요청도 이후 같은 메서드를 쓰도록 만든다.
-잔액 조회·사용량 조회·상태 조회는 생성 요청이 아니므로 이 제한에 들어가지 않는다.
-"""
-
 import logging
 import math
 import uuid
@@ -26,8 +10,8 @@ from typing import Any
 import psycopg
 
 from app.virtual_fitting.exceptions import FittingDatabaseError
+from app.virtual_fitting.repositories.async_job_repository import ATTEMPTS, _check_job_id
 from app.virtual_fitting.repositories.async_job_repository import TABLE as JOBS
-from app.virtual_fitting.repositories.async_job_repository import _check_job_id
 from app.virtual_fitting.repositories.usage_repository import ADD_SQL, add_params
 
 logger = logging.getLogger(__name__)
@@ -41,11 +25,12 @@ _LOCK_TIMEOUT = "SET LOCAL lock_timeout = '5s'"
 HOLD_RETRY_AFTER_UNREPRESENTABLE = "retry_after_unrepresentable"
 HOLD_RETRY_AFTER_OUT_OF_RANGE = "retry_after_out_of_range"
 # 시각·간격·숫자 범위 초과(22008·22015·22003)
-_OUT_OF_RANGE = (
+OUT_OF_RANGE_ERRORS = (
     psycopg.errors.DatetimeFieldOverflow,
     psycopg.errors.IntervalFieldOverflow,
     psycopg.errors.NumericValueOutOfRange,
 )
+_OUT_OF_RANGE = OUT_OF_RANGE_ERRORS
 
 
 class SubmissionReason(str, Enum):
@@ -63,6 +48,9 @@ class SubmissionReason(str, Enum):
     FALLBACK_LIMIT_REACHED = "fallback_limit_reached"
     OTHER_ATTEMPT_IN_FLIGHT = "other_attempt_in_flight"
     SENDS_FULL = "sends_full"
+    # 재요청: 미접수 뒤 예약한 다음 전송 시각 전이다 / 최대 전송 횟수(4)를 다 썼다.
+    RETRY_WAIT = "retry_wait"
+    RETRY_LIMIT_REACHED = "retry_limit_reached"
 
 
 @dataclass(frozen=True)
@@ -133,9 +121,120 @@ class PrunaLimiter:
                 "WHERE fitting_job_id = %s",
                 (now, now, job_id),
             )
+            # 1번 전송 시도 기록(전송 시작·횟수 확정). 같은 트랜잭션이라 시작 기록과 따로 남지 않는다.
+            cursor.execute(
+                f"INSERT INTO {ATTEMPTS} (fitting_job_id, attempt_no, task_uuid, started_at) "
+                "VALUES (%s, 1, %s, %s)",
+                (job_id, task, now),
+            )
             return SubmissionGrant(True, SubmissionReason.GRANTED, started_at=now)
 
         return self._transaction(work, "Pruna 생성 요청 자리 확보")
+
+    def begin_retry_submission(
+        self, fitting_job_id: int, token: str, previous_task_uuid: str, task_uuid: str
+    ) -> SubmissionGrant:
+        """확실한 미접수 뒤 같은 작업의 다음 전송 시도(새 task_uuid)를 시작한다. begin_submission 과 같은 공유 제한을 같은
+        순서로 적용하고, 자리 확보·간격 갱신과 새 시도 시작(task_uuid·pruna_submit_started_at·시도 줄)·예약 해제를 한
+        트랜잭션으로 커밋한다. 외부 호출·대기는 하지 않는다. 기다리기만 하면 횟수를 쓰지 않는다.
+
+        조건(잠금 뒤 DB 시각): 유효한 lease, RECEIVED / SUBMIT_PRUNA, 결과·접수 기록·인증 보류 없음, 현재 task 가
+        previous_task_uuid 이고 그 시도가 미접수로 기록됐으며(pruna_not_accepted_at), 예약 시각(pruna_retry_at)이 지났고,
+        지금까지 시도 수 < 4. 이전 시도 기록은 그대로 둔다. 기존 최초 준비 경로(prepare_pruna_submission)는 쓰지 않는다.
+        """
+        from app.virtual_fitting.repositories.async_job_state import PRUNA_SUBMIT_LIMIT
+
+        job_id = _check_job_id(fitting_job_id)
+        previous, task = uuid.UUID(previous_task_uuid), uuid.UUID(task_uuid)
+
+        def work(cursor) -> SubmissionGrant:
+            cursor.execute(f"SELECT send_hold_reason FROM {LIMITER} WHERE id = 1 FOR UPDATE")
+            limiter = cursor.fetchone()
+            if limiter is None:
+                raise FittingDatabaseError("Pruna 제한 상태 행이 없습니다(마이그레이션 확인).")
+            cursor.execute(
+                f"""
+                SELECT status, next_action, task_uuid, pruna_submit_started_at, runware_accepted_at,
+                       result_payload IS NULL, auth_hold_task_uuid IS NULL,
+                       pruna_not_accepted_at IS NOT NULL, pruna_retry_at IS NOT NULL,
+                       EXTRACT(EPOCH FROM pruna_retry_at - statement_timestamp()),
+                       worker_lease_token, worker_lease_until
+                FROM {JOBS} WHERE fitting_job_id = %s FOR UPDATE
+                """,
+                (job_id,),
+            )
+            job = cursor.fetchone()
+            if job is None:
+                return SubmissionGrant(False, SubmissionReason.NOT_FOUND)
+            cursor.execute("SELECT statement_timestamp()")
+            (now,) = cursor.fetchone()
+            (
+                status,
+                next_action,
+                job_task,
+                started,
+                accepted,
+                no_result,
+                no_auth_hold,
+                not_accepted,
+                scheduled,
+                retry_wait,
+                lease_token,
+                lease_until,
+            ) = job
+            if lease_token != token or lease_until is None or lease_until <= now:
+                return SubmissionGrant(False, SubmissionReason.LEASE_INVALID)
+            if (
+                status != "RECEIVED"
+                or next_action != "SUBMIT_PRUNA"
+                or job_task != previous
+                or started is None
+                or accepted is not None
+                or not no_result
+                or not no_auth_hold
+                or not not_accepted
+                or not scheduled
+            ):
+                return SubmissionGrant(False, SubmissionReason.STATE_MISMATCH)
+            cursor.execute(
+                f"SELECT max(attempt_no), bool_and(not_accepted_at IS NOT NULL) "
+                f"FILTER (WHERE task_uuid = %s) FROM {ATTEMPTS} WHERE fitting_job_id = %s",
+                (previous, job_id),
+            )
+            attempts, previous_recorded = cursor.fetchone()
+            if attempts is None or not previous_recorded:
+                return SubmissionGrant(False, SubmissionReason.STATE_MISMATCH)
+            if attempts >= PRUNA_SUBMIT_LIMIT:
+                return SubmissionGrant(False, SubmissionReason.RETRY_LIMIT_REACHED)
+            if retry_wait is not None and retry_wait > 0:
+                return SubmissionGrant(
+                    False, SubmissionReason.RETRY_WAIT, wait_seconds=float(retry_wait)
+                )
+            cursor.execute(
+                f"SELECT task_uuid FROM {IN_FLIGHT} WHERE fitting_job_id = %s", (job_id,)
+            )
+            held = cursor.fetchone()
+            if held is not None and held[0] != task:
+                return SubmissionGrant(False, SubmissionReason.OTHER_ATTEMPT_IN_FLIGHT)
+            refused = self._take_slot(cursor, job_id, task, now, limiter[0])
+            if refused is not None:
+                return refused
+            cursor.execute(
+                f"""
+                UPDATE {JOBS} SET task_uuid = %s, pruna_submit_started_at = %s,
+                       pruna_not_accepted_at = NULL, pruna_retry_at = NULL, updated_at = %s
+                WHERE fitting_job_id = %s
+                """,
+                (task, now, now, job_id),
+            )
+            cursor.execute(
+                f"INSERT INTO {ATTEMPTS} (fitting_job_id, attempt_no, task_uuid, started_at) "
+                "VALUES (%s, %s, %s, %s)",
+                (job_id, attempts + 1, task, now),
+            )
+            return SubmissionGrant(True, SubmissionReason.GRANTED, started_at=now)
+
+        return self._transaction(work, "Pruna 재요청 자리 확보")
 
     def begin_fallback(
         self, fitting_job_id: int, token: str, fallback_task_uuid: str
@@ -341,18 +440,39 @@ class PrunaLimiter:
 
         def work(cursor) -> bool:
             cursor.execute(f"SELECT 1 FROM {LIMITER} WHERE id = 1 FOR UPDATE")
+            # 보내지 않은 시도의 줄과 그 직전 시도(재요청이면). 재요청 시도를 되돌릴 때는 작업을 직전 시도의 미접수·예약
+            # 상태로 되돌린다(보내지 않은 것이 확실하므로 횟수를 쓰지 않음). 직전 시도 기록은 그대로다.
             cursor.execute(
                 f"""
-                UPDATE {JOBS} SET pruna_submit_started_at = NULL, updated_at = statement_timestamp()
+                SELECT p.task_uuid, p.started_at, p.not_accepted_at, p.next_attempt_at
+                FROM {ATTEMPTS} a JOIN {ATTEMPTS} p
+                  ON p.fitting_job_id = a.fitting_job_id AND p.attempt_no = a.attempt_no - 1
+                WHERE a.task_uuid = %s AND a.fitting_job_id = %s
+                """,
+                (task, job_id),
+            )
+            previous = cursor.fetchone()
+            if previous is None:
+                assignments, params = "pruna_submit_started_at = NULL", ()
+            else:
+                assignments = (
+                    "task_uuid = %s, pruna_submit_started_at = %s, pruna_not_accepted_at = %s, "
+                    "pruna_retry_at = COALESCE(%s, statement_timestamp())"
+                )
+                params = previous
+            cursor.execute(
+                f"""
+                UPDATE {JOBS} SET {assignments}, updated_at = statement_timestamp()
                 WHERE fitting_job_id = %s AND task_uuid = %s AND status = 'RECEIVED'
                   AND runware_accepted_at IS NULL AND pruna_submit_started_at IS NOT NULL
                   AND worker_lease_token = %s AND worker_lease_until > statement_timestamp()
                 RETURNING fitting_job_id
                 """,
-                (job_id, task, token),
+                (*params, job_id, task, token),
             )
             if cursor.fetchone() is None:
                 return False
+            cursor.execute(f"DELETE FROM {ATTEMPTS} WHERE task_uuid = %s", (task,))
             cursor.execute(f"DELETE FROM {IN_FLIGHT} WHERE fitting_job_id = %s", (job_id,))
             cursor.execute(f"DELETE FROM {SENDS} WHERE fitting_job_id = %s", (job_id,))
             return True

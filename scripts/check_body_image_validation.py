@@ -27,6 +27,8 @@ def main() -> int:
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.output is not None and args.output.suffix.lower() != ".webp":
+        parser.error("출력 파일 확장자는 .webp를 사용해주세요.")
 
     os.environ.setdefault("REMBG_HOME", str(args.model_dir.resolve()))
 
@@ -35,7 +37,7 @@ def main() -> int:
     from app.body_image_validation.exceptions import BodyImageValidationError
     from app.body_image_validation.service import BodyImageValidationService
 
-    output = args.output or args.image.with_name(f"{args.image.stem}-validated.png")
+    output = args.output or args.image.with_name(f"{args.image.stem}-validated.webp")
     person_detector = MediaPipePersonDetector(
         str(args.model_dir / "efficientdet_lite0.tflite")
     )

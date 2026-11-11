@@ -357,7 +357,7 @@ def run_smoke(ops, http, tmp_path, s3=None):
     image = tmp_path / "body.jpg"
     image.write_bytes(b"jpeg")
     return dc.smoke(ops, "app", CREDENTIALS, image, FAST, http=http,
-                    s3_checker=s3 or (lambda secret, key: {"format": "PNG"}), secret_name="secret",
+                    s3_checker=s3 or (lambda secret, key: {"format": "PNG", "content_type": "image/png"}), secret_name="secret",
                     clock=lambda: SINCE.timestamp())
 
 
@@ -367,6 +367,79 @@ def test_smoke_passes_on_snapshot_creation_then_hit(tmp_path):
     assert report["result"] == "PASS"
     assert [a["snapshot"] for a in report["validation"]] == ["hit"]
     assert report["validation"][0]["cuda"] is True
+
+
+@pytest.mark.parametrize(
+    ("extension", "image_format", "content_type"),
+    [("webp", "WEBP", "image/webp"), ("png", "PNG", "image/png")],
+)
+def test_smoke_accepts_decoded_webp_and_legacy_png(tmp_path, extension, image_format, content_type):
+    from io import BytesIO
+
+    from PIL import Image
+
+    key = f"body-images/result.{extension}"
+
+    class OutputHttp(FakeHttp):
+        def post(self, *args, **kwargs):
+            self.ops.next_phase()
+            return FakeResponse(200, {"data": {"s3_key": key}})
+
+    output = BytesIO()
+    Image.new("RGBA", (8, 12), (30, 60, 90, 128)).save(output, format=image_format)
+
+    def check(_secret, actual_key):
+        assert actual_key == key
+        with Image.open(BytesIO(output.getvalue())) as decoded:
+            decoded.load()
+            return {"format": decoded.format, "content_type": content_type}
+
+    report = run_smoke(FakeOps([WARMUP_OK, VALIDATION_HIT]), OutputHttp, tmp_path, s3=check)
+
+    assert report["result"] == "PASS"
+    assert report["s3"] == {"key": key, "format": image_format, "content_type": content_type}
+
+
+@pytest.mark.parametrize(
+    ("extension", "metadata"),
+    [
+        ("webp", {"format": "JPEG", "content_type": "image/jpeg"}),
+        ("webp", {"format": "GIF", "content_type": "image/gif"}),
+        ("webp", {"format": "PNG", "content_type": "image/png"}),
+        ("png", {"format": "WEBP", "content_type": "image/webp"}),
+        ("jpg", {"format": "JPEG", "content_type": "image/jpeg"}),
+        ("webp", {"format": "WEBP", "content_type": "binary/octet-stream"}),
+        ("webp", {"format": "WEBP"}),
+        ("webp", {"content_type": "image/webp"}),
+        ("webp", {"format": "WEBP", "content_type": "image/webp", "refused": "not a dev bucket"}),
+    ],
+)
+def test_smoke_rejects_invalid_or_mismatched_body_output(tmp_path, extension, metadata):
+    class OutputHttp(FakeHttp):
+        def post(self, *args, **kwargs):
+            self.ops.next_phase()
+            return FakeResponse(200, {"data": {"s3_key": f"body-images/result.{extension}"}})
+
+    with pytest.raises(dc.SmokeFailure) as failure:
+        run_smoke(FakeOps([WARMUP_OK, VALIDATION_HIT]), OutputHttp, tmp_path, s3=lambda *_: metadata)
+
+    assert failure.value.stage == "s3"
+
+
+def test_smoke_keeps_explicitly_unconfigured_s3_check_skipped(tmp_path):
+    ops = FakeOps([WARMUP_OK, VALIDATION_HIT])
+    image = tmp_path / "body.jpg"
+    image.write_bytes(b"jpeg")
+
+    def unexpected_check(*args):
+        pytest.fail("S3 check must stay skipped without a secret")
+
+    report = dc.smoke(ops, "app", CREDENTIALS, image, FAST, http=FakeHttp(ops),
+                      s3_checker=unexpected_check, secret_name=None,
+                      clock=lambda: SINCE.timestamp())
+
+    assert report["result"] == "PASS"
+    assert report["s3"]["skipped"] is True
 
 
 def test_smoke_retries_a_transient_miss_and_then_passes(tmp_path):

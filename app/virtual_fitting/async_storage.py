@@ -1,21 +1,7 @@
-"""V2 비동기 가상피팅이 쓰는 S3 Key 규칙과 Presigned URL 유효기간.
-
-S3 호출 자체는 app.clients.s3.S3ImageStorage 가 한다. 여기서는 용도별 Key 형식과 만료시간만 정한다.
-
-| 용도 | Key | 방식 | 기본 만료 |
-| --- | --- | --- | --- |
-| Pruna 가 사용자 원본을 읽음 | user_image_key (BE 전달) | Presigned GET | 1800초 |
-| Pruna 가 결과를 업로드 | virtual-fitting/results/{fitting_job_id}/pruna-async.jpg | Presigned PUT | 3600초 |
-| 결과가 올라왔는지 확인 | 같은 결과 Key | HEAD | — |
-| OpenAI 후처리에 결과 전달 | 같은 결과 Key | Presigned GET | 600초 |
-
-발급한 URL 은 그때그때 쓰고 버린다. DB 에는 Key 만 저장한다.
-"""
-
 from app.clients.s3 import S3ImageStorage, S3ObjectCheck
 from app.config import settings
 
-ASYNC_RESULT_FILENAME = "pruna-async.jpg"
+ASYNC_RESULT_FILENAME = "pruna-async.webp"
 
 
 def async_result_key(fitting_job_id: int) -> str:
@@ -27,6 +13,18 @@ def async_result_key(fitting_job_id: int) -> str:
     ):
         raise ValueError("fitting_job_id 는 1 이상의 정수여야 합니다.")
     return f"virtual-fitting/results/{fitting_job_id}/{ASYNC_RESULT_FILENAME}"
+
+
+def async_output_format(result_key: str) -> str:
+    """이미 준비한 Key 가 출력 계약이다. 구 JPG 작업은 재개해도 JPG 를 유지한다."""
+    from app.clients.s3 import validate_s3_key
+
+    key = validate_s3_key(result_key)
+    if key.endswith(".webp"):
+        return "WEBP"
+    if key.endswith((".jpg", ".jpeg")):
+        return "JPG"
+    raise ValueError("비동기 결과 Key 의 출력 형식이 유효하지 않습니다.")
 
 
 def user_image_get_url(

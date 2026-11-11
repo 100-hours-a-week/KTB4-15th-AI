@@ -282,11 +282,14 @@ def test_recorded_state_but_failed_follow_up_is_distinguished(env, rendered, fau
 # 기록은 했지만 남은 일(결과 발행)을 이어 갈 경로가 없음: deferred
 
 
-def test_recorded_but_follow_up_path_not_ready_is_deferred(env, rendered):  # noqa: F811
+def test_recorded_but_follow_up_path_not_ready_is_deferred(env, rendered, monkeypatch):  # noqa: F811
+    from tests.runware_codes import register_generation_failed_code
+
     stack = Stack(env).mark_running()
     task = submitted(env, stack, JOB)
     stack.mark_running(publisher=False, watchdog=False)  # 결과 전송·복구 경로 없음
-    response = post_webhook(client(), env.runware.failure(task, "someNewCode"))
+    code = register_generation_failed_code(monkeypatch)  # 확정 생성 실패 → 최종 결과 저장
+    response = post_webhook(client(), env.runware.failure(task, code))
     assert response.status_code == 503 and response.json()["code"] == "WEBHOOK_FOLLOW_UP_NOT_READY"
     (processed,) = events(rendered, "runware_result_processed")
     assert processed["outcome"] == "deferred"

@@ -96,6 +96,8 @@ def open_webhook_service() -> Iterator[RunwareWebhookService]:
         follow_up=webhook_follow_up_paths(),
         source="webhook",
         request_id=_REQUEST_ID.get(),
+        # DB 일시 장애 재시도는 응답 시한 안에서만 새로 시작한다(시한 뒤에는 이미 503 으로 답했다).
+        db_deadline_seconds=WEBHOOK_DEADLINE_SECONDS,
     )
 
 

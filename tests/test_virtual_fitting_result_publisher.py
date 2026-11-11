@@ -31,6 +31,7 @@ from app.virtual_fitting.result_publisher import (
     ResultPublishProcessor,
     register_result_publisher,
 )
+from tests.runware_codes import GENERATION_FAILED_TEST_CODE, register_generation_failed_code
 from tests.test_virtual_fitting_async_job_state import pg  # noqa: F401 (pytest fixture)
 from tests.test_virtual_fitting_pruna_submit import JOB, db, job  # noqa: F401 (pytest fixture)
 
@@ -41,6 +42,7 @@ SYNC_KEY = f"virtual-fitting/results/{JOB}/pruna-sync.jpg"
 
 @pytest.fixture(autouse=True)
 def be_queue(monkeypatch):
+    register_generation_failed_code(monkeypatch)  # Webhook 최종 실패 결과를 만드는 데 쓴다
     monkeypatch.setattr(settings, "AWS_REGION", "ap-northeast-2")
     monkeypatch.setattr(settings, "BE_FITTING_RESPONSE_QUEUE_URL", QUEUE_URL)
     register_result_publisher(None)
@@ -115,7 +117,7 @@ def saved_by_fallback(db):  # noqa: F811
     assert job(db).result_payload["result_image_key"] == SYNC_KEY
 
 
-def saved_by_webhook(db, code="someNewCode"):  # noqa: F811
+def saved_by_webhook(db, code=GENERATION_FAILED_TEST_CODE):  # noqa: F811
     from app.virtual_fitting.repositories.pruna_limiter import TaskCostRepository
     from app.virtual_fitting.runware_webhook import (
         RunwareWebhookService,
@@ -131,6 +133,9 @@ def saved_by_webhook(db, code="someNewCode"):  # noqa: F811
         "AI_FITTING_RESPONSE_QUEUE_URL",
         "https://sqs.ap-northeast-2.amazonaws.com/123456789012/ai-fitting-response",
     )
+    register_generation_failed_code(
+        monkey
+    )  # 다른 테스트 파일에서 불러 써도 확정 생성 실패로 저장되게
     try:
         task = submitted(db)
         service = RunwareWebhookService(
@@ -512,16 +517,18 @@ from tests.test_virtual_fitting_webhook import (  # noqa: F401
 
 def test_webhook_permanent_failure_is_200_when_a_publisher_runs_else_503(api):  # noqa: F811
     task = submitted(api["db"])
-    assert post(api, error_body(task, code="someNewCode")).status_code == 503  # 루프 없음
+    assert (
+        post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE)).status_code == 503
+    )  # 루프 없음
     register_result_publisher(Alive())
-    response = post(api, error_body(task, code="someNewCode"))
+    response = post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE))
     assert (
         response.status_code == 200
         and response.json()["data"]["results"][0]["outcome"] == "duplicate"
     )
     assert job(api["db"]).result_payload == FAILED_PAYLOAD
     register_result_publisher(Alive(False))  # 멈췄거나 비정상 종료
-    assert post(api, error_body(task, code="someNewCode")).status_code == 503
+    assert post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE)).status_code == 503
 
 
 def test_webhook_auth_error_hold_is_not_solved_by_the_publisher(api):  # noqa: F811
@@ -581,7 +588,7 @@ def test_late_webhook_before_publish_preserves_the_saved_result(api):  # noqa: F
     # 발행 전(PENDING) 저장된 결과: 늦은 Webhook 이 결과를 덮지 않는다(이전 이름의 테스트가 실제로 확인하던 상황).
     task = submitted(api["db"])
     register_result_publisher(Alive())
-    post(api, error_body(task, code="someNewCode"))
+    post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE))
     saved = job(api["db"])
     assert saved.result_message_status is ResultMessageStatus.PENDING
     assert saved.next_action is NextAction.PUBLISH_RESULT
@@ -593,7 +600,7 @@ def test_late_webhook_after_publish_preserves_the_result(api):  # noqa: F811
     db_ = api["db"]
     task = submitted(db_)
     register_result_publisher(Alive())
-    post(api, error_body(task, code="someNewCode"))
+    post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE))
     # 준비 단계(submitted)의 요청 Worker 실행 권한을 정상 반납한다(실제 Worker 는 처리 뒤 반납한다).
     db_["sql"](
         "UPDATE virtual_fitting_async_jobs SET worker_lease_token = NULL, worker_lease_until = NULL "
@@ -613,7 +620,7 @@ def test_late_webhook_after_publish_preserves_the_result(api):  # noqa: F811
 
     for loops in (True, False):  # 결과 전송 루프가 돌거나 꺼져 있어도 발행 완료 중복은 안전하게 200
         register_result_publisher(Alive() if loops else None)
-        for body in (error_body(task), error_body(task, code="someNewCode")):
+        for body in (error_body(task), error_body(task, code=GENERATION_FAILED_TEST_CODE)):
             response = post(api, body)
             assert response.status_code == 200
             assert job(db_) == final  # payload·최종 이미지·상태·전송 횟수 그대로
@@ -806,7 +813,7 @@ def test_bad_queue_config_keeps_webhook_503_messages_results_and_counts(api, mon
     register_result_publisher(Alive())
     monkeypatch.setattr(settings, "BE_FITTING_RESPONSE_QUEUE_URL", bad)
     task = submitted(db_)
-    response = post(api, error_body(task, code="someNewCode"))
+    response = post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE))
     assert response.status_code == 503
     assert response.json()["data"]["pending"][0]["next_step"] == "publish_result"
     assert bad not in response.text or bad == ""  # 큐 URL 을 응답에 싣지 않는다
@@ -864,7 +871,7 @@ def test_bad_queue_config_keeps_the_postprocess_message(db, monkeypatch):  # noq
 def test_good_config_keeps_the_existing_200_and_deletion(api):  # noqa: F811
     register_result_publisher(Alive())
     task = submitted(api["db"])
-    assert post(api, error_body(task, code="someNewCode")).status_code == 200
+    assert post(api, error_body(task, code=GENERATION_FAILED_TEST_CODE)).status_code == 200
 
 
 # --- 14단계 보완: 잠금 대기 초과의 발생 시점 ---
