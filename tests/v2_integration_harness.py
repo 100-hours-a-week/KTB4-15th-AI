@@ -256,7 +256,7 @@ class FakeSqsClient:
 class FakeS3Backend:
     def __init__(self) -> None:
         self.objects: dict[str, tuple[bytes, str, datetime]] = {}
-        # 일반 Metadata(x-amz-meta-*): 조건부 PUT 으로 만든 객체, IDM-VTON 결과처럼 Presigned PUT 헤더로 올린 객체
+        # 일반 Metadata(x-amz-meta-*): 조건부 PUT 으로 만든 객체
         self.metadata: dict[str, dict] = {}
         self.puts: list[dict] = []  # PutObject 요청(Body 제외)
         self.gets: list[str] = []
@@ -344,15 +344,12 @@ class FakeS3Client:
         if item is None:
             raise _client_error("404", 404, "HeadObject")
         body, content_type, modified = item
-        response = {
+        return {
             "ResponseMetadata": {"HTTPStatusCode": 200},
             "ContentLength": len(body),
             "ContentType": content_type,
             "LastModified": modified,
         }
-        if Key in b.metadata:
-            response["Metadata"] = dict(b.metadata[Key])
-        return response
 
     def __getattr__(self, name):
         # 기존 Get/Put/HEAD 외의 메타데이터 보정 권한은 제공하지 않는다.

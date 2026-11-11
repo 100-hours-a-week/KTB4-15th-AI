@@ -718,12 +718,12 @@ def test_settings_are_range_checked(monkeypatch, name, value):
 
 def test_real_assembly_has_both_handlers_but_incomplete_ones_refuse_to_build():
     # 13단계: 두 핸들러가 모두 연결됐다. 핸들러가 빠진 조립은 여전히 만들지 않는다(not_ready 보호).
-    from app.virtual_fitting.idm_fallback_handler import IdmVtonFallbackHandler
+    from app.virtual_fitting.fallback_handler import RunFallbackHandler
     from app.virtual_fitting.postprocess_handler import PostprocessHandler
 
     handlers = pw.connected_postprocess_handlers()
     assert isinstance(handlers.postprocess, PostprocessHandler)
-    assert isinstance(handlers.run_fallback, IdmVtonFallbackHandler)
+    assert isinstance(handlers.run_fallback, RunFallbackHandler)
     assert handlers.missing() == []
     with pytest.raises(ValueError):
         pw.create_postprocess_worker(PostprocessHandlers(postprocess=handlers.postprocess))
