@@ -890,36 +890,6 @@ class AsyncJobStateRepository:
             lambda job: job.result_payload is not None,
         )
 
-    def claim_idm_vton_attempt(self, fitting_job_id: int, token: str) -> StateChange:
-        """IDM-VTON(Modal) 생성 함수를 부르기 직전에 작업당 1회의 호출 기회를 원자적으로 선점한다.
-
-        한 UPDATE 로 fallback_attempt_count + 1 과 fallback_started_at(DB 시각)을 함께 기록한다. 유효한 lease,
-        FALLBACK_RUNNING / RUN_FALLBACK, 결과·확인 이미지·fallback 이미지 없음, 시작 기록 없음, 횟수 < FALLBACK_LIMIT 일 때만.
-        선점 뒤 호출 전에 Worker 가 멈춰도 되돌리지 않는다(중복 호출 방지가 우선, 복구는 S3 확인만).
-        Pruna 동기 fallback 의 claim_fallback_attempt·PrunaLimiter.begin_fallback 과 별개이며 공유 제한 자리를 쓰지 않는다.
-        """
-
-        def diagnose(job: AsyncFittingJob, now: Any) -> ChangeReason:
-            if job.fallback_attempt_count >= FALLBACK_LIMIT or job.fallback_started_at is not None:
-                return ChangeReason.LIMIT_REACHED
-            if job.result_payload is not None or job.fallback_image_key is not None:
-                return ChangeReason.ALREADY_RECORDED
-            return ChangeReason.STATE_MISMATCH
-
-        return self._update(
-            fitting_job_id,
-            "fallback_attempt_count = fallback_attempt_count + 1, "
-            f"fallback_started_at = {_NOW}",
-            """
-            status = 'FALLBACK_RUNNING' AND next_action = 'RUN_FALLBACK'
-            AND result_payload IS NULL AND verified_image_key IS NULL
-            AND fallback_image_key IS NULL AND fallback_started_at IS NULL
-            AND fallback_attempt_count < %(limit)s
-            """,
-            {"token": token, "limit": FALLBACK_LIMIT},
-            diagnose,
-        )
-
     # --- 최종 결과와 발행 ---
 
     def save_final_result(

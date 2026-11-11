@@ -42,7 +42,3 @@ scripts/db/load_products.sql
 /tests/local_be_ai/
 /tests/real_sqs_local/
 /deploy/modal/README.md
-
-# Modal IDM-VTON 추론 테스트 결과 이미지
-/deploy/modal/idm_vton/test_outputs/
-/deploy/modal/idm_vton/test_inputs/

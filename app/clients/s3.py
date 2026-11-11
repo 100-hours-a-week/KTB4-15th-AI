@@ -92,8 +92,6 @@ class S3ObjectCheck:
     content_type: str | None = None
     # 객체의 마지막 수정 시각(HEAD 응답의 LastModified). Watchdog 이 "이 생성 시도 뒤에 저장된 객체인지" 확인할 때 쓴다.
     last_modified: Any = None
-    # 사용자 정의 메타데이터(x-amz-meta-*, 소문자 이름). IDM-VTON 결과가 이 작업·이 시도의 것인지 확인할 때 쓴다.
-    metadata: dict[str, str] | None = None
 
     @property
     def exists(self) -> bool | None:
@@ -284,35 +282,15 @@ class S3ImageStorage:
         return self._presign("get_object", validate_s3_key(key), expires_in)
 
     def presigned_put_url(
-        self,
-        key: str,
-        *,
-        expires_in: int,
-        content_type: str | None = None,
-        metadata: dict[str, str] | None = None,
+        self, key: str, *, expires_in: int, content_type: str | None = None
     ) -> str:
         """key 위치에 raw binary 를 PUT 할 수 있는 URL. 업로드는 하지 않는다.
 
         content_type 을 주면 Content-Type 이 서명에 들어가, PUT 요청이 정확히 같은 헤더를 보내야 한다.
         Runware 가 보내는 Content-Type 이 확인되기 전까지는 None(서명에 넣지 않음)으로 둔다.
-        metadata 를 주면 x-amz-meta-<이름> 헤더가 서명에 들어가, PUT 요청이 같은 헤더를 보내야 한다.
         """
-        params: dict[str, Any] = {"ContentType": content_type} if content_type else {}
-        if metadata:
-            params["Metadata"] = dict(metadata)
+        params = {"ContentType": content_type} if content_type else {}
         return self._presign("put_object", validate_s3_key(key), expires_in, params)
-
-    def read_object(self, key: str, *, max_bytes: int) -> bytes:
-        """key 객체 본문을 max_bytes 까지 읽는다. 없거나 더 크거나 읽기 실패면 ImageStorageError."""
-        key = validate_s3_key(key)
-        try:
-            response = self._client.get_object(Bucket=self._bucket, Key=key)
-            body = response["Body"].read(max_bytes + 1)
-        except Exception as error:
-            raise ImageStorageError("S3 객체를 읽지 못했습니다.") from error
-        if len(body) > max_bytes:
-            raise ImageStorageError("S3 객체 크기가 허용 범위를 벗어났습니다.")
-        return body
 
     def head_object(self, key: str) -> S3ObjectCheck:
         """HEAD 를 한 번 보내 결과를 분류한다. 예외를 던지지 않는다(잘못된 key 제외).
@@ -346,7 +324,6 @@ class S3ImageStorage:
                 content_length=response.get("ContentLength"),
                 content_type=response.get("ContentType"),
                 last_modified=response.get("LastModified"),
-                metadata=dict(response["Metadata"]) if "Metadata" in response else None,
             )
         if check.state is not S3ObjectState.EXISTS:
             logger.info(
@@ -445,7 +422,7 @@ class S3ImageStorage:
         )
 
     def _presign(
-        self, method: str, key: str, expires_in: int, extra: dict[str, Any] | None = None
+        self, method: str, key: str, expires_in: int, extra: dict[str, str] | None = None
     ) -> str:
         expires_in = _validate_expires(expires_in)
         if self._presign_client is None:
