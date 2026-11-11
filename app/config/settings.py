@@ -25,7 +25,7 @@ BODY_IMAGE_REMOTE_API_KEY = os.getenv("BODY_IMAGE_REMOTE_API_KEY", "")
 # gpt@6-luna 는 되묻기 직후 라우팅(103/114)과 첫 말풍선 지연(최댓값 5.19·6.26s)에서 합격선을
 # 넘지 못해 5.6 을 쓴다 (2026-10-07 로컬 측정).
 MODEL = os.getenv("CHAT_MODEL", "openai:gpt@5.6-luna")
-LLM_BASE_URL = "https://api.runware.ai/v1"
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.runware.ai/v1")
 # 채팅 LLM(Runware) HTTP timeout(초). 지정하지 않으면 SDK 기본값 600초라 Runware 가 멈추면
 # 사용자는 10분 동안 빈 말풍선을 본다. Runware + 5.6 의 첫 토큰까지 최대 3.81초(2026-10-07
 # 로컬 측정)에 여유를 두어 6초로 잡았다 (2026-10-12 결정). 임베딩 클라이언트에는 걸지 않았다.
