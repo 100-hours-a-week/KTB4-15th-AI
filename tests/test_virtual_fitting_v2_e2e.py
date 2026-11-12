@@ -201,6 +201,19 @@ def test_restart_between_accept_and_webhook_continues_from_db(env, monkeypatch):
 
 
 def test_fallback_flow_through_the_real_loops_and_a_late_async_webhook(env, monkeypatch):
+    # 보존된 Pruna V1 동기 RunFallbackHandler 회귀: 실제 연결은 IDM-VTON 이므로 이 테스트만 Pruna 동기 조립을 주입한다.
+    import app.main as app_env
+    from app.virtual_fitting.fallback_handler import RunFallbackHandler
+    from app.virtual_fitting.postprocess_handler import PostprocessHandler
+    from app.virtual_fitting.postprocess_worker import PostprocessHandlers
+
+    monkeypatch.setattr(
+        app_env,
+        "connected_postprocess_handlers",
+        lambda: PostprocessHandlers(
+            postprocess=PostprocessHandler(), run_fallback=RunFallbackHandler()
+        ),
+    )
     enable_all(monkeypatch)
     env.send_request(JOB)
     with TestClient(app()) as client:

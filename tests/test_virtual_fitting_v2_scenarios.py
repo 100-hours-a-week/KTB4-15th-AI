@@ -87,6 +87,12 @@ def clocked_handlers(clock):
     )
 
 
+def pruna_sync_handlers():
+    """보존된 Pruna V1 동기 RunFallbackHandler 를 명시해 조립한다. 실제 연결(connected_postprocess_handlers)은
+    IdmVtonFallbackHandler 다. 아래 Pruna 동기 시나리오는 보존 코드의 회귀 검증으로 이 조립을 쓴다."""
+    return PostprocessHandlers(postprocess=PostprocessHandler(), run_fallback=RunFallbackHandler())
+
+
 def client():
     from app.main import app
 
@@ -181,13 +187,14 @@ def finish(env, stack):
 def test_fallback_from_a_task_linked_generation_timeout_in_the_submit_response(env):
     # 2-1 보완: 예전에는 providerRateLimitExceeded(연결 task 없음)를 retryable 거절로 보고 fallback 했다. 이제 fallback 은
     # 이 task 에 연결된 생성 종료 실패 근거(timeoutProvider)일 때만이다(Webhook·getResponse 와 같은 기준).
+    # 보존된 Pruna 동기 핸들러 회귀(명시 조립): 실제 RUN_FALLBACK 연결은 IdmVtonFallbackHandler 다.
     env.runware.async_modes.append(
         lambda submission: (
             "errors",
             [{"code": "timeoutProvider", "message": "x", "taskUUID": submission.task_uuid}],
         )
     )
-    stack = Stack(env).mark_running()
+    stack = Stack(env, pruna_sync_handlers()).mark_running()
     env.send_request(JOB)
     (outcome,) = stack.request_once()
     assert outcome.delete is True  # RUN_FALLBACK 발행 확인 뒤에만 지운다
@@ -520,7 +527,7 @@ def test_internal_publish_unknown_creates_a_duplicate_that_runs_once(env):
 
 def test_fallback_started_without_a_result_is_kept_for_operators(env):
     env.runware.sync_modes.append("timeout")
-    stack = Stack(env).mark_running()
+    stack = Stack(env, pruna_sync_handlers()).mark_running()
     task = submitted(env, stack)
     post_webhook(client(), env.runware.failure(task, "timeoutProvider"))
     stack.postprocess_once()
@@ -528,7 +535,7 @@ def test_fallback_started_without_a_result_is_kept_for_operators(env):
     assert started.fallback_started_at is not None and started.fallback_image_key is None
     fb = started.fallback_task_uuid
     assert in_flight(env) == [(JOB, fb)]  # 결과 불명확: 자리 유지
-    stack = restart(env)
+    stack = restart(env, pruna_sync_handlers())
     env.sqs.expire_visibility("ai-fitting-response")
     expire_lease(env)
     stack.postprocess_once()
@@ -549,8 +556,12 @@ def test_fallback_started_without_a_result_is_kept_for_operators(env):
     assert in_flight(env) == [(JOB, fb)] and current.fallback_task_uuid == fb
 
 
-def test_s3_saved_before_the_db_image_record_is_recovered_without_regeneration(env, monkeypatch):
-    stack = Stack(env).mark_running()
+def test_pruna_sync_result_saved_before_the_db_record_is_held_without_regeneration(
+    env, monkeypatch
+):
+    """보존된 Pruna 동기 fallback 이 S3 저장 뒤 DB 기록 전에 멈췄다. Watchdog 의 fallback 복구는 IDM-VTON 결과만 보므로
+    pruna-sync.webp 를 기록하지 않고 운영 확인으로 남긴다(다시 생성·배경 제거하지 않는다)."""
+    stack = Stack(env, pruna_sync_handlers()).mark_running()
     task = submitted(env, stack)
     post_webhook(client(), env.runware.failure(task, "timeoutProvider"))
     real = AsyncJobStateRepository.record_fallback_image
@@ -565,20 +576,18 @@ def test_s3_saved_before_the_db_image_record_is_recovered_without_regeneration(e
     monkeypatch.setattr(AsyncJobStateRepository, "record_fallback_image", fail_once)
     stack.postprocess_once()
     assert SYNC_KEY in env.s3.objects and row(env).fallback_image_key is None
-    stack = restart(env)
+    stack = restart(env, pruna_sync_handlers())
     age(env, "updated_at", 700)
     expire_lease(env)
-    stack.watchdog_once()  # 고정 Key HEAD(이 시도 뒤 저장) → 기록 → RUN_FALLBACK 재발행
-    assert row(env).fallback_image_key == SYNC_KEY
+    stack.watchdog_once()  # idm-vton.webp 만 HEAD(없음, 업로드 기한 전) → 기록·재발행 없음
+    assert SYNC_KEY not in env.s3.heads
+    alerts = {r for (r,) in env.sql("SELECT reason FROM virtual_fitting_watchdog_alerts")}
+    assert "fallback_result_unknown" in alerts
     env.sqs.expire_visibility("ai-fitting-response")
     finish(env, stack)
     final = row(env)
-    assert (
-        final.result_image_key == TRANSPARENT_KEY
-        and final.result_message_status is ResultMessageStatus.PUBLISHED
-    )
-    assert final.fallback_image_key == SYNC_KEY
-    assert env.runware.count("sync_generate") == 1 and env.runware.count("rembg") == 1
+    assert final.fallback_image_key is None and final.result_payload is None
+    assert env.runware.count("sync_generate") == 1 and env.runware.count("rembg") == 0
 
 
 def test_result_saved_before_publish_is_published_after_restart(env):

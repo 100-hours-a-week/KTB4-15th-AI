@@ -316,7 +316,7 @@ class BackgroundRemoval:
     RemBG 는 작업당 최대 1회(transparent_image.store_transparent_image, S3 호출 표시로 재수신·재시작에도 유지)이고
     재시도하지 않는다. 그 1회가 실패하면 FITTING_BACKGROUND_REMOVAL_FAILED 최종 실패 결과를 저장한다. 호출 여부·결과가
     불명확하면 다시 부르지 않고 보류(메시지 유지 → 재수신·Watchdog 재발행 1회 → 운영 알림)한다.
-    어느 경우에도 Pruna 재생성·V1 fallback 은 하지 않는다(생성 실패가 아니다).
+    어느 경우에도 Pruna 재생성·fallback(IDM-VTON)은 하지 않는다(생성 실패가 아니다).
     """
 
     def __init__(

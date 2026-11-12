@@ -1,4 +1,6 @@
-"""배경 제거: 저장한 Pruna 원본 → Runware RemBG → 투명 WebP 를 별도 Key 에 저장 (V2 비동기·V1 fallback 공용).
+"""배경 제거: 저장한 Pruna 원본 → Runware RemBG → 투명 WebP 를 별도 Key 에 저장 (V2 비동기·보존된 V1 fallback 공용).
+
+실제 RUN_FALLBACK 은 IDM-VTON(idm_fallback_handler)이고 그 결과(idm-vton.webp)에는 배경 제거를 하지 않는다.
 
 원본(V2 pruna-async.webp / V1 fallback pruna-sync.webp, 이전 작업은 .jpg)은 그대로 두고, 같은 작업 폴더의 transparent.webp 에
 결과를 저장한다. 최종 결과(result_image_key)와 LLM 입력은 이 투명 이미지다.

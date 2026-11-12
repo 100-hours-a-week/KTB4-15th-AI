@@ -13,7 +13,7 @@ FastAPI lifespan 이 시작·종료한다(별도 실행 명령 없음). VIRTUAL_
 
 | action       | 실행 대상(status / next_action)        | 핸들러(연결 단계) |
 | POSTPROCESS  | POSTPROCESSING / POSTPROCESS           | 11단계(연결됨)    |
-| RUN_FALLBACK | FALLBACK_RUNNING / RUN_FALLBACK        | 13단계(연결됨)    |
+| RUN_FALLBACK | FALLBACK_RUNNING / RUN_FALLBACK        | IDM-VTON(연결됨)  |
 
 삭제는 (1) 결과 발행까지 끝난 같은 작업의 중복(COMPLETED/FAILED + PUBLISHED), 또는 (2) 핸들러가 완료를 알렸고
 DB 기록상 그 단계가 끝났으며 남은 일의 실제 경로가 있을 때(deletion_allowed + FollowUpPaths)만 한다. 메시지 수신·실행 권한
@@ -108,7 +108,7 @@ class ActionHandler(Protocol):
 @dataclass(frozen=True)
 class PostprocessHandlers:
     postprocess: ActionHandler | None = None  # 11단계: S3 HEAD·제목·코멘트
-    run_fallback: ActionHandler | None = None  # 13단계: V1 fallback
+    run_fallback: ActionHandler | None = None  # IDM-VTON fallback(Pruna 동기 핸들러는 미연결)
 
     def for_action(self, action: NextAction) -> ActionHandler | None:
         return {
@@ -128,16 +128,19 @@ class PostprocessHandlers:
 
 
 def connected_postprocess_handlers() -> PostprocessHandlers:
-    """실제 조립에 연결된 핸들러: POSTPROCESS(11단계 PostprocessHandler)와 RUN_FALLBACK(13단계 RunFallbackHandler).
+    """실제 조립에 연결된 핸들러: POSTPROCESS(11단계 PostprocessHandler)와 RUN_FALLBACK(IdmVtonFallbackHandler).
 
-    두 핸들러가 모두 연결돼 not_ready 는 풀린다. 그래도 Worker 는 VIRTUAL_FITTING_POSTPROCESS_WORKER_ENABLED(기본 false)로만
-    켜지고, 결과 발행(14단계)·복구(15단계) 경로는 여전히 없다(FollowUpPaths 미준비 → 결과를 저장해도 메시지를 지우지 않음).
-    설정값으로 채우지 않는다. 두 핸들러는 처음 불릴 때 DB·S3·Runware client 를 만든다.
+    RUN_FALLBACK 은 Modal IDM-VTON 을 작업당 최대 1회 부른다(idm_fallback_handler). Pruna V1 동기 생성
+    RunFallbackHandler(13단계, fallback_handler.py)는 코드·테스트를 그대로 두고 실제 경로에는 연결하지 않는다.
+    Worker 는 VIRTUAL_FITTING_POSTPROCESS_WORKER_ENABLED(기본 false)로만 켜진다. 설정값으로 채우지 않는다.
+    두 핸들러는 처음 불릴 때 DB·S3·LLM·Modal client 를 만든다.
     """
-    from app.virtual_fitting.fallback_handler import RunFallbackHandler
+    from app.virtual_fitting.idm_fallback_handler import IdmVtonFallbackHandler
     from app.virtual_fitting.postprocess_handler import PostprocessHandler
 
-    return PostprocessHandlers(postprocess=PostprocessHandler(), run_fallback=RunFallbackHandler())
+    return PostprocessHandlers(
+        postprocess=PostprocessHandler(), run_fallback=IdmVtonFallbackHandler()
+    )
 
 
 # --- 실행 중인 후처리 Worker (인계 판단용) ---

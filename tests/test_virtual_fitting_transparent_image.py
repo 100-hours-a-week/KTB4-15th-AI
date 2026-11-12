@@ -1,4 +1,7 @@
-"""배경 제거(Runware RemBG v1.4 → 투명 WebP) 검증. V2 비동기·V1 fallback 공용.
+"""배경 제거(Runware RemBG v1.4 → 투명 WebP) 검증. V2 비동기·V1 fallback(보존 코드) 공용.
+
+실제 RUN_FALLBACK 연결은 IDM-VTON 이고 그 결과에는 배경 제거를 하지 않는다(tests/test_virtual_fitting_idm_v2_flow.py).
+아래 V1 fallback 시나리오는 보존된 RunFallbackHandler 를 명시해 조립한 회귀 검증이다.
 
 1. Provider: 요청 형식(성공한 단독 테스트 설정)·taskUUID 지정·응답 해석·오류 분류(retryable·결과 불명확)
 2. Alpha 검증: RGBA·Alpha 0/255·투명 픽셀 존재
@@ -51,6 +54,7 @@ from tests.test_virtual_fitting_v2_scenarios import (  # noqa: F401 (pytest fixt
     env,
     expire_lease,
     finish,
+    pruna_sync_handlers,
     rembg_costs,
     restart,
     row,
@@ -805,7 +809,7 @@ def fallback_flow(env):  # noqa: F811
             [{"code": "timeoutProvider", "message": "x", "taskUUID": submission.task_uuid}],
         )
     )
-    stack = Stack(env).mark_running()
+    stack = Stack(env, pruna_sync_handlers()).mark_running()  # 보존된 Pruna 동기 fallback 명시 조립
     env.send_request(JOB)
     stack.request_once()
     return stack
