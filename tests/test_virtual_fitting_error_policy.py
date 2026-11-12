@@ -202,7 +202,7 @@ def test_client_timeout_is_unclear_and_timeout_provider_is_a_fallback_candidate(
         ai_stores_result=True,
     )
     assert (result.outcome, result.reason) == (SubmissionOutcome.UNKNOWN, "timeout")
-    assert FALLBACK_ERROR_CODES == frozenset({"timeoutProvider"})
+    assert FALLBACK_ERROR_CODES == frozenset({"timeoutProvider", "providerError"})
     linked = submit_body({"code": "timeoutProvider", "taskUUID": TASK})
     assert classify_response(200, linked, TASK).reason == "generation_fallback"
     unlinked = submit_body({"code": "timeoutProvider"})
@@ -336,7 +336,14 @@ def test_unknown_or_unproven_codes_never_default_to_generation_failure(db, queue
 
 
 @pytest.mark.parametrize(
-    "code", [*UNRESOLVED_CODES, "timeoutProvider", "invalidApiKey", GENERATION_FAILED_TEST_CODE]
+    "code",
+    [
+        *UNRESOLVED_CODES,
+        "timeoutProvider",
+        "providerError",
+        "invalidApiKey",
+        GENERATION_FAILED_TEST_CODE,
+    ],
 )
 def test_the_same_failure_gives_the_same_result_via_webhook_and_get_response(
     wdb,  # noqa: F811
@@ -357,6 +364,7 @@ def test_the_same_failure_gives_the_same_result_via_webhook_and_get_response(
         assert (f"pruna_error_{code}", "pruna", 7) in reasons(w.sink)  # 운영 확인 알림
     expected = {
         "timeoutProvider": (AsyncJobStatus.FALLBACK_RUNNING, NextAction.RUN_FALLBACK, None),
+        "providerError": (AsyncJobStatus.FALLBACK_RUNNING, NextAction.RUN_FALLBACK, None),
         GENERATION_FAILED_TEST_CODE: (
             AsyncJobStatus.WAITING_PRUNA,
             NextAction.PUBLISH_RESULT,
