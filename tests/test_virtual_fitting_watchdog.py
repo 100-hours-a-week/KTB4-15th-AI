@@ -251,6 +251,18 @@ class Opener:
         (HTTPError("u", 401, "x", {}, io.BytesIO(b"{}")), TaskStatusKind.AUTH_ERROR),
         (HTTPError("u", 403, "x", {}, io.BytesIO(b"{}")), TaskStatusKind.AUTH_ERROR),
         (HTTPError("u", 500, "x", {}, io.BytesIO(b"{}")), TaskStatusKind.UNKNOWN),
+        (
+            HTTPError(
+                "u",
+                502,
+                "x",
+                {},
+                io.BytesIO(
+                    json.dumps({"errors": [{"taskUUID": TASK, "code": "providerError"}]}).encode()
+                ),
+            ),
+            TaskStatusKind.FAILED,
+        ),
         (TimeoutError(), TaskStatusKind.UNKNOWN),
     ],
 )

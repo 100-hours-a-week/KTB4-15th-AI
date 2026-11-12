@@ -390,5 +390,5 @@ def test_no_unverified_balance_mapping_was_added():
     assert (
         "FITTING_BALANCE_EXHAUSTED" not in source and "FittingBalanceExhaustedError" not in source
     )
-    assert FALLBACK_ERROR_CODES == frozenset({"timeoutProvider"})
+    assert FALLBACK_ERROR_CODES == frozenset({"timeoutProvider", "providerError"})
     assert AUTH_ERROR_CODES == frozenset({"invalidApiKey"})
