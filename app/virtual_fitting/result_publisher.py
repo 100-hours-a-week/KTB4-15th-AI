@@ -20,8 +20,10 @@ AI 의 PUBLISHED 는 "SQS 가 등록 성공을 응답했다"는 뜻이다. BE �
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -57,6 +59,13 @@ class PublishOutcome(str, Enum):
     EXHAUSTED = "exhausted"
     SKIPPED = "skipped"  # 선점 실패·이미 처리됨 등(아무것도 하지 않음)
     HELD = "held"  # 보내기 전 확인 실패(형식·설정). 횟수를 쓰지 않음
+
+
+def _since_ms(at: datetime | None) -> int | None:
+    """DB 시각부터 지금(이 프로세스 벽시계)까지 ms. AI·DB 서버 시계 차이만큼 틀릴 수 있다."""
+    if at is None:
+        return None
+    return int((datetime.now(UTC) - at).total_seconds() * 1000)
 
 
 def payload_problem(job: AsyncFittingJob) -> str | None:
@@ -131,12 +140,17 @@ class ResultPublishProcessor:
                     return self._exhaust(job, token, "attempts_already_used")
                 return PublishOutcome.SKIPPED
             attempt = claim.job.result_message_attempt_count
+            send_started = time.perf_counter()
             outcome, reason, message_id = self._send(job)
             fields = {
                 "component": "result_publisher",
                 "fitting_job_id": job.fitting_job_id,
                 "result_status": job.result_payload.get("status"),
                 "attempt": attempt,
+                # SendMessage 1번(perf_counter)과, 요청 처리 시작(작업 저장)·Pruna 전송 시작(DB 시각)부터 지금(벽시계)까지.
+                "send_ms": int((time.perf_counter() - send_started) * 1000),
+                "since_job_created_ms": _since_ms(job.created_at),
+                "since_pruna_submit_ms": _since_ms(job.pruna_submit_started_at),
             }
             if outcome is SqsOutcome.SUCCEEDED:
                 # SQS 가 MessageId 와 함께 성공을 응답했다(BE 처리 완료 뜻은 아님).

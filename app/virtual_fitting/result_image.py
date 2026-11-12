@@ -58,6 +58,10 @@ _RETRYABLE = {
     "s3_access_denied": False,
     "existing_object_conflict": False,
     "existing_object_unverified": False,
+    # 배경 제거 결과 검증(transparent_image). 같은 입력으로 다시 만들어도 달라진다고 볼 근거가 없다.
+    "no_alpha": False,
+    "no_transparency": False,
+    "no_foreground": False,
 }
 
 
@@ -331,13 +335,19 @@ def _metadata(fitting_job_id: int, task: str, digest: str) -> dict[str, str]:
 
 
 def _existing(
-    storage: S3ImageStorage, key: str, fitting_job_id: int, task: str, *, max_bytes: int
+    storage: S3ImageStorage,
+    key: str,
+    fitting_job_id: int,
+    task: str,
+    *,
+    max_bytes: int,
+    validate: Callable[[bytes], Any] = validate_static_webp,
 ) -> StoredResultImage | None:
     """같은 Key 의 기존 객체를 확인한다. 없으면 None. 이 작업·task 의 정상 결과로 확인되면 그 정보.
 
     객체 존재·확장자·LastModified 만으로는 판단하지 않는다. Metadata(작업·task·sha256)·실제 bytes 의 sha256·Content-Type·
-    길이·정상 정지 WebP 가 모두 맞아야 한다. 다른 작업·출처 불명이면 existing_object_conflict, 그 밖에 근거가 부족하면
-    existing_object_unverified. 객체를 고치거나 지우지 않는다.
+    길이·정상 정지 WebP(validate, 투명 결과는 Alpha 검증까지)가 모두 맞아야 한다. 다른 작업·출처 불명이면
+    existing_object_conflict, 그 밖에 근거가 부족하면 existing_object_unverified. 객체를 고치거나 지우지 않는다.
     """
     check, found = storage.get_object_limited(key, max_bytes)
     if check.state is S3ObjectState.NOT_FOUND:
@@ -361,7 +371,7 @@ def _existing(
     ):
         raise ResultImageError("existing_object_unverified")
     try:
-        validate_static_webp(found.body)
+        validate(found.body)
     except ResultImageError:
         raise ResultImageError("existing_object_unverified") from None
     return StoredResultImage(key, len(found.body), digest, reused=True)

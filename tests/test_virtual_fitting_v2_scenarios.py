@@ -1,10 +1,3 @@
-"""16단계: 실제 조립 객체(create_* 로 만든 요청·후처리 Worker·결과 전송·Watchdog)와 실제 Router 를 연결한 분기·중단·경합 검증.
-
-루프 Task 대신 루프가 한 번에 하는 일을 테스트가 차례로 부른다(tests/v2_integration_harness.Stack). 재시작은 새 DB pool 과
-새로 조립한 객체로 가정한다(DB·가짜 SQS/S3/Runware 상태는 유지). 시간은 가짜 시계·DB 시각 조정으로만 옮긴다.
-외부 경계만 가짜다: SQS·S3 boto3 client, Runware HTTP(urlopen). 실제 AWS·Runware·OpenAI 는 부르지 않는다.
-"""
-
 import os
 import threading
 import uuid
@@ -40,7 +33,9 @@ from tests.v2_integration_harness import (
 
 JOB = 9101
 ASYNC_KEY = f"virtual-fitting/results/{JOB}/pruna-async.webp"
-SYNC_KEY = f"virtual-fitting/results/{JOB}/pruna-sync.jpg"
+TRANSPARENT_KEY = f"virtual-fitting/results/{JOB}/transparent.webp"  # 배경 제거된 최종 결과
+REMBG_CALL_KEY = f"virtual-fitting/results/{JOB}/rembg-call.json"  # RemBG 작업당 1회 호출 표시
+SYNC_KEY = f"virtual-fitting/results/{JOB}/pruna-sync.webp"  # V1 fallback 원본
 
 
 @pytest.fixture
@@ -92,12 +87,6 @@ def clocked_handlers(clock):
     )
 
 
-def pruna_sync_handlers():
-    """보존된 Pruna V1 동기 RunFallbackHandler 를 명시해 조립한다. 실제 연결(connected_postprocess_handlers)은
-    IdmVtonFallbackHandler 다. 아래 Pruna 동기 시나리오는 보존 코드의 회귀 검증으로 이 조립을 쓴다."""
-    return PostprocessHandlers(postprocess=PostprocessHandler(), run_fallback=RunFallbackHandler())
-
-
 def client():
     from app.main import app
 
@@ -125,7 +114,21 @@ def snapshot(env, job_id=JOB):
     )
 
 
+def rembg_tasks(env):
+    """배경 제거 호출 taskUUID(가짜 Runware 가 받은 순서)."""
+    return [task for kind, task in env.runware.calls if kind == "rembg"]
+
+
 def costs(env):
+    """생성(Pruna) task 의 비용 기록. 배경 제거 호출 비용은 rembg_costs 로 따로 본다(같은 표, 호출 taskUUID 별)."""
+    return [row for row in all_costs(env) if row[0] not in rembg_tasks(env)]
+
+
+def rembg_costs(env):
+    return [row for row in all_costs(env) if row[0] in rembg_tasks(env)]
+
+
+def all_costs(env):
     return env.sql("SELECT task_uuid::text, cost FROM virtual_fitting_task_costs ORDER BY 1")
 
 
@@ -178,24 +181,24 @@ def finish(env, stack):
 def test_fallback_from_a_task_linked_generation_timeout_in_the_submit_response(env):
     # 2-1 보완: 예전에는 providerRateLimitExceeded(연결 task 없음)를 retryable 거절로 보고 fallback 했다. 이제 fallback 은
     # 이 task 에 연결된 생성 종료 실패 근거(timeoutProvider)일 때만이다(Webhook·getResponse 와 같은 기준).
-    # 보존된 Pruna 동기 핸들러 회귀(명시 조립): 실제 RUN_FALLBACK 연결은 IdmVtonFallbackHandler 다.
     env.runware.async_modes.append(
         lambda submission: (
             "errors",
             [{"code": "timeoutProvider", "message": "x", "taskUUID": submission.task_uuid}],
         )
     )
-    stack = Stack(env, pruna_sync_handlers()).mark_running()
+    stack = Stack(env).mark_running()
     env.send_request(JOB)
     (outcome,) = stack.request_once()
     assert outcome.delete is True  # RUN_FALLBACK 발행 확인 뒤에만 지운다
     assert [b["action"] for b in env.sqs.bodies("ai-fitting-response")] == ["RUN_FALLBACK"]
     finish(env, stack)
     final = row(env)
-    assert final.result_image_key == SYNC_KEY and final.status is AsyncJobStatus.COMPLETED
+    assert final.result_image_key == TRANSPARENT_KEY and final.status is AsyncJobStatus.COMPLETED
+    assert final.fallback_image_key == SYNC_KEY and env.runware.rembg_inputs == [SYNC_KEY]
     assert final.fallback_task_uuid != final.task_uuid
     assert env.runware.count("sync_generate") == 1
-    assert env.sqs.bodies("be-fitting-response")[0]["result_image_key"] == SYNC_KEY
+    assert env.sqs.bodies("be-fitting-response")[0]["result_image_key"] == TRANSPARENT_KEY
 
 
 def test_fallback_after_both_s3_check_bundles_find_nothing(env):
@@ -211,7 +214,8 @@ def test_fallback_after_both_s3_check_bundles_find_nothing(env):
     assert current.s3_check_attempt_count == 2 and current.next_action is NextAction.RUN_FALLBACK
     assert env.s3.heads.count(ASYNC_KEY) == 6
     finish(env, stack)
-    assert row(env).result_image_key == SYNC_KEY and env.runware.count("sync_generate") == 1
+    assert row(env).result_image_key == TRANSPARENT_KEY and env.runware.count("sync_generate") == 1
+    assert row(env).fallback_image_key == SYNC_KEY
 
 
 # --- C. PUT 보다 Webhook 이 먼저 ---
@@ -283,7 +287,7 @@ def test_comment_failing_twice_uses_default_text_without_a_title_call(env):
     assert current.llm_generation_attempt_count == 2
     assert env.runware.count("llm_comment") == 2 and env.runware.count("llm_title") == 0
     assert current.result_payload["status"] == "COMPLETED"  # 이미지 성공 유지(기본 문구)
-    assert current.result_payload["result_image_key"] == ASYNC_KEY
+    assert current.result_payload["result_image_key"] == TRANSPARENT_KEY
     presigned = len(env.s3.presigned)
     env.sqs.expire_visibility("ai-fitting-response")
     stack.postprocess_once()  # 결과 저장 뒤 재수신: URL 발급·LLM 호출 없음
@@ -516,7 +520,7 @@ def test_internal_publish_unknown_creates_a_duplicate_that_runs_once(env):
 
 def test_fallback_started_without_a_result_is_kept_for_operators(env):
     env.runware.sync_modes.append("timeout")
-    stack = Stack(env, pruna_sync_handlers()).mark_running()
+    stack = Stack(env).mark_running()
     task = submitted(env, stack)
     post_webhook(client(), env.runware.failure(task, "timeoutProvider"))
     stack.postprocess_once()
@@ -524,7 +528,7 @@ def test_fallback_started_without_a_result_is_kept_for_operators(env):
     assert started.fallback_started_at is not None and started.fallback_image_key is None
     fb = started.fallback_task_uuid
     assert in_flight(env) == [(JOB, fb)]  # 결과 불명확: 자리 유지
-    stack = restart(env, pruna_sync_handlers())
+    stack = restart(env)
     env.sqs.expire_visibility("ai-fitting-response")
     expire_lease(env)
     stack.postprocess_once()
@@ -546,7 +550,7 @@ def test_fallback_started_without_a_result_is_kept_for_operators(env):
 
 
 def test_s3_saved_before_the_db_image_record_is_recovered_without_regeneration(env, monkeypatch):
-    stack = Stack(env, pruna_sync_handlers()).mark_running()
+    stack = Stack(env).mark_running()
     task = submitted(env, stack)
     post_webhook(client(), env.runware.failure(task, "timeoutProvider"))
     real = AsyncJobStateRepository.record_fallback_image
@@ -561,7 +565,7 @@ def test_s3_saved_before_the_db_image_record_is_recovered_without_regeneration(e
     monkeypatch.setattr(AsyncJobStateRepository, "record_fallback_image", fail_once)
     stack.postprocess_once()
     assert SYNC_KEY in env.s3.objects and row(env).fallback_image_key is None
-    stack = restart(env, pruna_sync_handlers())
+    stack = restart(env)
     age(env, "updated_at", 700)
     expire_lease(env)
     stack.watchdog_once()  # 고정 Key HEAD(이 시도 뒤 저장) → 기록 → RUN_FALLBACK 재발행
@@ -570,10 +574,11 @@ def test_s3_saved_before_the_db_image_record_is_recovered_without_regeneration(e
     finish(env, stack)
     final = row(env)
     assert (
-        final.result_image_key == SYNC_KEY
+        final.result_image_key == TRANSPARENT_KEY
         and final.result_message_status is ResultMessageStatus.PUBLISHED
     )
-    assert env.runware.count("sync_generate") == 1
+    assert final.fallback_image_key == SYNC_KEY
+    assert env.runware.count("sync_generate") == 1 and env.runware.count("rembg") == 1
 
 
 def test_result_saved_before_publish_is_published_after_restart(env):
@@ -713,11 +718,13 @@ def test_webp_octet_stream_completes_without_extra_permissions_or_rewrite(env):
     finish(env, stack)
     final = row(env)
     assert final.result_payload["status"] == "COMPLETED"
-    assert final.result_image_key == final.async_image_key == final.verified_image_key == ASYNC_KEY
+    assert final.async_image_key == final.verified_image_key == ASYNC_KEY
+    assert final.result_image_key == TRANSPARENT_KEY
     assert final.s3_check_attempt_count == 1 and final.llm_generation_attempt_count == 2
     assert final.fallback_attempt_count == 0
     assert env.s3.objects[ASYNC_KEY] == original_object  # bytes/MIME/LastModified 모두 유지
-    assert set(env.s3.objects) == original_keys  # 별도 최종 객체 없음
+    # 투명 결과와 RemBG 호출 표시(작업당 1회 기록)만 추가
+    assert set(env.s3.objects) == original_keys | {TRANSPARENT_KEY, REMBG_CALL_KEY}
     assert env.runware.count("async_submit") == 1 and env.runware.count("sync_generate") == 0
     assert costs(env) == [(task, Decimal("0.023"))]
     # 완료 Webhook 재수신도 생성·LLM·S3 저장을 반복하지 않는다.
@@ -725,5 +732,7 @@ def test_webp_octet_stream_completes_without_extra_permissions_or_rewrite(env):
     env.sqs.expire_visibility("ai-fitting-response")
     finish(env, stack)
     assert row(env).llm_generation_attempt_count == 2
-    assert env.s3.objects[ASYNC_KEY] == original_object and set(env.s3.objects) == original_keys
+    assert env.s3.objects[ASYNC_KEY] == original_object
+    assert set(env.s3.objects) == original_keys | {TRANSPARENT_KEY, REMBG_CALL_KEY}
+    assert env.runware.count("rembg") == 1  # 재수신에도 배경 제거를 다시 부르지 않음
     assert env.runware.count("async_submit") == 1 and env.runware.count("sync_generate") == 0

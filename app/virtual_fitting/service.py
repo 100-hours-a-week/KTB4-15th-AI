@@ -163,7 +163,7 @@ class VirtualFittingService:
     def store_result(self, fitting_result: FittingResult, *, key: str | None = None) -> str:
         """결과 이미지를 S3 로 옮기고 Key 를 돌려준다. key 를 주지 않으면 V1 방식(results/ 아래 새 이름)이다.
 
-        V2 fallback 은 key="virtual-fitting/results/{id}/pruna-sync.jpg" 를 넘긴다(async_image_key 와 분리).
+        V2 fallback 은 key="virtual-fitting/results/{id}/pruna-sync.webp" 를 넘긴다(async_image_key 와 분리).
         """
         # LLM 이 실패해도 S3 저장까지 가서 정상 응답한다. S3 실패는 숨기지 않는다.
         try:

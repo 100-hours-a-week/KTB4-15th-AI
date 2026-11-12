@@ -300,13 +300,14 @@ def test_runware_402_is_balance_exhausted_not_a_model_failure():
     )
 
 
-def test_usage_payload_is_one_utc_day_of_the_fitting_model_only():
+def test_usage_payload_is_one_utc_day_of_the_fitting_cost_models_only():
     [task] = build_usage_payload(TODAY, "t")
 
     assert task["taskType"] == "accountManagement"
     assert task["operation"] == "getUsageActivity"
     assert (task["startDate"], task["endDate"]) == ("2026-09-28", "2026-09-28")
-    assert task["models"] == [RUNWARE_MODEL]
+    # 하루 예산 = Pruna 생성 + RemBG 배경 제거(코멘트·채팅 LLM 은 넣지 않는다)
+    assert task["models"] == [RUNWARE_MODEL, "runware:109@1"]
     assert task["timezone"] == "UTC"
 
 

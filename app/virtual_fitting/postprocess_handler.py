@@ -2,9 +2,11 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from app.clients.s3 import ImageStorageError, S3ObjectState
+from app.virtual_fitting import diagnostics as diag
 from app.virtual_fitting.exceptions import FittingPostprocessError
 from app.virtual_fitting.postprocess_worker import HandlerContext, HandlerResult, HandlerStatus
 from app.virtual_fitting.repositories.async_job_repository import (
@@ -59,6 +61,8 @@ class PostprocessHandler:
         offsets: Sequence[float] = S3_CHECK_OFFSETS,
         result_url_expires_seconds: int | None = None,
         store_result: Callable[..., Any] | None = None,
+        remove_background: Callable[..., Any] | None = None,
+        remove_background_enabled: bool | None = None,
     ) -> None:
         self._given = (jobs, state, products, storage, comments)
         self._deps: _Deps | None = None
@@ -66,6 +70,12 @@ class PostprocessHandler:
         self._expires = result_url_expires_seconds
         # AI 저장 작업의 결과 저장(기본 store_runware_result_image). 처음 쓸 때 가져온다.
         self._store_result = store_result
+        # 배경 제거·투명 결과 저장(기본 store_transparent_image + RunwareRembgProvider). enabled 가 None 이면 설정값을 따른다.
+        self._background = BackgroundRemoval(
+            store=remove_background,
+            enabled=remove_background_enabled,
+            expires=result_url_expires_seconds,
+        )
 
     # --- 의존성 ---
 
@@ -103,28 +113,56 @@ class PostprocessHandler:
         if job.result_payload is not None:
             # 이미 결과가 있다(재수신). 이미지 확인·LLM 호출을 반복하지 않는다.
             return HandlerResult(HandlerStatus.DONE, "result_already_saved")
+        started = time.perf_counter()
+        timings: dict[str, Any] = {}
         verified = job.verified_image_key
         if verified is None:
+            step = time.perf_counter()
             if job.ai_stores_result:
                 verified, stop = self._store_image(deps, job, token, context)
             else:
                 verified, stop = self._verify_image(deps, job, token, context)
+            timings["pruna_image_ms"] = _ms(step)
+            timing(
+                job,
+                "pruna_image_store" if job.ai_stores_result else "pruna_image_check",
+                "stopped" if stop else "done",
+                timings["pruna_image_ms"],
+            )
             if stop is not None:
                 return stop
+        # 원본(verified)은 S3 확인 기록으로 그대로 두고, 최종 결과·LLM 입력은 배경을 지운 이미지다.
+        final, stop = self._background(deps, job, token, context, verified, timings)
+        if stop is not None:
+            return stop
         title, comment, stop = title_and_comment(
             deps,
             job,
             token,
             context,
-            verified,
+            final,
             stage_ok=postprocess_stage(verified),
             expires_in=self._expires,
+            timings=timings,
         )
         if stop is not None:
             return stop
         if not context.may_continue():
             return HandlerResult(HandlerStatus.DEFERRED, "stopped_before_save")
-        return save_completed(deps.state, job_id, token, verified, title, comment)
+        result = save_completed(deps.state, job_id, token, final, title, comment)
+        diag.event(
+            "postprocess_timing_summary",
+            component="postprocess_handler",
+            fitting_job_id=job_id,
+            task_uuid=getattr(job, "task_uuid", None),
+            result=result.reason,
+            result_image_key=final,
+            original_image_key=verified,
+            handler_ms=_ms(started),
+            since_pruna_submit_ms=since_pruna_submit_ms(job),
+            **timings,
+        )
+        return result
 
     # --- 1'. AI 저장 작업: 결과 다운로드·저장 ---
 
@@ -268,6 +306,182 @@ class PostprocessHandler:
             # 첫 묶음 실패 → 같은 실행 안에서 두 번째 묶음.
 
 
+# --- 1''. 배경 제거 (POSTPROCESS·RUN_FALLBACK 공용) ---
+
+
+class BackgroundRemoval:
+    """저장한 Pruna 원본 → RemBG → 투명 WebP(transparent.webp). 실행 권한을 쥔 핸들러가 원본 Key 로 부른다.
+
+    끄면(enabled=False, 설정 VIRTUAL_FITTING_REMOVE_BACKGROUND_ENABLED) 원본 Key 를 그대로 결과로 쓴다.
+    RemBG 는 작업당 최대 1회(transparent_image.store_transparent_image, S3 호출 표시로 재수신·재시작에도 유지)이고
+    재시도하지 않는다. 그 1회가 실패하면 FITTING_BACKGROUND_REMOVAL_FAILED 최종 실패 결과를 저장한다. 호출 여부·결과가
+    불명확하면 다시 부르지 않고 보류(메시지 유지 → 재수신·Watchdog 재발행 1회 → 운영 알림)한다.
+    어느 경우에도 Pruna 재생성·V1 fallback 은 하지 않는다(생성 실패가 아니다).
+    """
+
+    def __init__(
+        self,
+        *,
+        store: Callable[..., Any] | None = None,
+        enabled: bool | None = None,
+        expires: int | None = None,
+    ) -> None:
+        self._store, self._enabled, self._expires = store, enabled, expires
+        self._clients: dict[str, Any] | None = None
+
+    def enabled(self) -> bool:
+        if self._enabled is not None:
+            return self._enabled
+        from app.config import settings
+
+        return settings.VIRTUAL_FITTING_REMOVE_BACKGROUND_ENABLED
+
+    def _default_store(self, storage: Any, **kwargs: Any) -> Any:
+        from app.virtual_fitting.transparent_image import store_transparent_image
+
+        if self._clients is None:
+            from app.config.database import get_connection_pool
+            from app.virtual_fitting.providers.runware_rembg import RunwareRembgProvider
+            from app.virtual_fitting.repositories.pruna_limiter import TaskCostRepository
+
+            self._clients = {
+                "rembg": RunwareRembgProvider(),
+                "costs": TaskCostRepository(get_connection_pool()),
+            }
+        return store_transparent_image(
+            storage, source_url_expires_seconds=self._expires, **self._clients, **kwargs
+        )
+
+    def __call__(
+        self,
+        deps: Any,
+        job: AsyncFittingJob,
+        token: str,
+        context: HandlerContext,
+        source: str,
+        timings: dict[str, Any],
+        source_task: str | None = None,
+    ) -> tuple[str | None, HandlerResult | None]:
+        """(결과 Key, None) 또는 (None, 멈출 때의 HandlerResult).
+
+        source_task 는 원본을 만든 생성 task 다(없으면 비동기 task_uuid, V1 fallback 은 fallback_task_uuid 를 넘긴다).
+        """
+        if not self.enabled():
+            return source, None
+        if source_task is None:
+            source_task = job.task_uuid
+        from app.virtual_fitting.exceptions import VirtualFittingError
+        from app.virtual_fitting.result_image import ResultImageError
+        from app.virtual_fitting.transparent_image import (
+            BackgroundRemovalFailed,
+            BackgroundRemovalPending,
+        )
+
+        job_id = job.fitting_job_id
+        if not context.may_continue():
+            return None, HandlerResult(HandlerStatus.DEFERRED, "stopped_before_rembg")
+        store = self._store or self._default_store
+        step = time.perf_counter()
+        try:
+            image = store(
+                deps.storage,
+                fitting_job_id=job_id,
+                task_uuid=source_task,
+                source_key=source,
+            )
+        except BackgroundRemovalFailed as error:
+            logger.error(
+                "background removal failed fitting_job_id=%s reason=%s; final failure, no retry",
+                job_id,
+                error.reason,
+            )
+            timing(job, "rembg", "failed", _ms(step), reason=error.reason)
+            return None, self._fail(deps, job_id, token, context)
+        except BackgroundRemovalPending as error:
+            logger.warning(
+                "postprocess background removal deferred fitting_job_id=%s reason=%s",
+                job_id,
+                error.reason,
+            )
+            timing(job, "rembg", f"deferred_{error.reason}", _ms(step))
+            return None, HandlerResult(HandlerStatus.DEFERRED, error.reason)
+        except ResultImageError as error:
+            log = logger.warning if error.retryable else logger.error
+            log(
+                "postprocess transparent image deferred fitting_job_id=%s reason=%s retryable=%s "
+                "http_status=%s",
+                job_id,
+                error.reason,
+                error.retryable,
+                error.http_status,
+            )
+            timing(job, "rembg", f"failed_{error.reason}", _ms(step), retryable=error.retryable)
+            return None, HandlerResult(HandlerStatus.DEFERRED, f"transparent_{error.reason}")
+        except ImageStorageError:
+            logger.exception("postprocess rembg source url failed fitting_job_id=%s", job_id)
+            return None, HandlerResult(HandlerStatus.DEFERRED, "rembg_source_presign_failed")
+        except VirtualFittingError as error:  # 호출 자리·표시 확인의 DB 오류(부르지 않았다)
+            logger.exception("postprocess background removal error fitting_job_id=%s", job_id)
+            return None, HandlerResult(HandlerStatus.DEFERRED, f"rembg_{error.code.lower()}")
+        except ValueError:
+            logger.error("postprocess transparent image input rejected fitting_job_id=%s", job_id)
+            return None, HandlerResult(HandlerStatus.DEFERRED, "transparent_invalid_input")
+        if image.reused:
+            timings["rembg_reused"] = True
+            timing(job, "rembg", "reused", _ms(step), check_ms=image.check_ms)
+            return image.key, None
+        alpha, rembg = image.alpha, image.rembg
+        cost = rembg.cost if rembg else None
+        timings.update(
+            rembg_check_ms=image.check_ms,
+            rembg_api_ms=image.rembg_ms,
+            rembg_store_ms=image.store_ms,
+            rembg_download_ms=image.download_ms,
+            rembg_put_ms=image.put_ms,
+            rembg_store_tries=image.store_tries,
+            rembg_cost=cost,
+        )
+        timing(
+            job,
+            "rembg_api",
+            "done",
+            image.rembg_ms,
+            rembg_task_uuid=image.rembg_task_uuid,
+            cost=cost,
+        )
+        timing(
+            job,
+            "rembg_store",
+            "done",
+            image.store_ms,
+            download_ms=image.download_ms,
+            put_ms=image.put_ms,
+            key=image.key,
+            bytes=image.byte_count,
+            mode=alpha.mode if alpha else None,
+            alpha_min=alpha.alpha_min if alpha else None,
+            alpha_max=alpha.alpha_max if alpha else None,
+            translucent_ratio=alpha.translucent_ratio if alpha else None,
+        )
+        return image.key, None
+
+    @staticmethod
+    def _fail(deps: Any, job_id: int, token: str, context: HandlerContext) -> HandlerResult:
+        """최종 실패 결과(FITTING_BACKGROUND_REMOVAL_FAILED)를 저장한다. 기존 결과는 덮어쓰지 않는다."""
+        from app.virtual_fitting.exceptions import FittingBackgroundRemovalError
+        from app.virtual_fitting.pruna_submitter import failure_payload
+
+        if not context.may_continue():
+            return HandlerResult(HandlerStatus.DEFERRED, "stopped_before_failure_save")
+        error = FittingBackgroundRemovalError
+        saved = deps.state.save_final_result(
+            job_id, token, failure_payload(job_id, error.code, error.message)
+        )
+        if saved.applied or saved.reason is ChangeReason.ALREADY_RECORDED:
+            return HandlerResult(HandlerStatus.DONE, "failure_saved_background_removal")
+        return HandlerResult(HandlerStatus.DEFERRED, f"failure_not_saved_{saved.reason.value}")
+
+
 # --- 2. 제목·코멘트 (POSTPROCESS·RUN_FALLBACK 공용) ---
 
 
@@ -301,6 +515,7 @@ def title_and_comment(
     *,
     stage_ok: Callable[[AsyncFittingJob], bool],
     expires_in: int | None = None,
+    timings: dict[str, Any] | None = None,
 ) -> tuple[str | None, str | None, HandlerResult | None]:
     """확인한 이미지 key 로 코멘트 → 제목을 만든다. 항목별 최초 1회 + 재시도 1회(각 최대 2회).
 
@@ -313,8 +528,24 @@ def title_and_comment(
     - 종료·실행 권한 상실·상태 변경·DB 오류는 기본 문구로 성공 처리하지 않는다(보류하거나 예외를 그대로 올림).
     deps 는 jobs·state·products·storage·comments 를 가진다. stage_ok 는 최신 기록이 아직 이 단계(POSTPROCESS 또는
     RUN_FALLBACK, 같은 이미지)인지 본다. 반환: (제목, 코멘트, None) 또는 (None, None, 멈출 때의 HandlerResult).
+    timings 를 주면 코멘트·제목 호출 시간(perf_counter, 시도 합계 ms)을 llm_comment_ms·llm_title_ms 로 더한다.
     """
     job_id = job.fitting_job_id
+    timings = timings if timings is not None else {}
+
+    def call(item: str, attempt: int, generate: Callable[..., Any], *args: Any) -> Any:
+        """LLM 호출 1번의 시간을 남긴다. 예외는 그대로 올린다(실패 판단은 아래 루프)."""
+        started, result = time.perf_counter(), "error"
+        try:
+            text = generate(*args)
+            result = "done" if _usable(text) else "empty"
+            return text
+        finally:
+            elapsed = _ms(started)
+            name = f"llm_{item}_ms"
+            timings[name] = timings.get(name, 0) + elapsed
+            timing(job, f"llm_{item}", result, elapsed, attempt=attempt)
+
     summaries = product_summaries(deps.products, job)
     if not summaries:
         logger.warning(
@@ -380,7 +611,7 @@ def title_and_comment(
         if not claimed:
             break
         try:
-            text = deps.comments.generate_comment(url, summaries)
+            text = call("comment", attempt, deps.comments.generate_comment, url, summaries)
         except (FittingPostprocessError, ValueError) as error:
             failed("comment", attempt, type(error).__name__)
             continue
@@ -405,7 +636,7 @@ def title_and_comment(
         if not claimed:
             break
         try:
-            text = deps.comments.generate_title(comment)
+            text = call("title", attempt, deps.comments.generate_title, comment)
         except (FittingPostprocessError, ValueError) as error:
             failed("title", attempt, type(error).__name__)
             continue
@@ -443,3 +674,38 @@ def save_completed(
 
 def _usable(text: Any) -> bool:
     return isinstance(text, str) and bool(text.strip())
+
+
+# --- 처리 시간 계측(vf_diag) ---
+
+
+def _ms(started: float) -> int:
+    """time.perf_counter() 로 잰 프로세스 내부 구간(ms)."""
+    return int((time.perf_counter() - started) * 1000)
+
+
+def since_pruna_submit_ms(job: AsyncFittingJob) -> int | None:
+    """Pruna 전송 시작(DB statement_timestamp)부터 지금(이 프로세스의 벽시계)까지 ms. 누적 시간 확인용.
+
+    두 시계가 다르므로 AI 서버와 DB 서버의 시계 차이만큼 틀릴 수 있다(차이는 측정 쪽에서 따로 확인).
+    진단 값이라 계산하지 못하면 None 이다(업무 처리를 막지 않는다).
+    """
+    started = getattr(job, "pruna_submit_started_at", None)
+    if not isinstance(started, datetime):
+        return None
+    return int((datetime.now(UTC) - started).total_seconds() * 1000)
+
+
+def timing(job: AsyncFittingJob, step: str, result: str, elapsed_ms: int | None, **fields: Any):
+    """후처리 단계 하나의 처리 시간. fitting_job_id 로 Webhook·결과 발행 로그와 잇는다."""
+    diag.event(
+        "postprocess_timing",
+        component="postprocess_handler",
+        fitting_job_id=getattr(job, "fitting_job_id", None),
+        task_uuid=getattr(job, "task_uuid", None),
+        step=step,
+        result=result,
+        elapsed_ms=elapsed_ms,
+        since_pruna_submit_ms=since_pruna_submit_ms(job),
+        **fields,
+    )

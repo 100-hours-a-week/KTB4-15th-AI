@@ -834,29 +834,26 @@ class Watchdog:
         ):
             self._republish(job, NextAction.RUN_FALLBACK, report)
             return
-        # 생성 함수를 불렀을 수 있는데 이미지 기록이 없다. IDM-VTON(Modal)을 다시 부르지 않고 고정 Key 만 확인한다
-        # (전환기 Pruna 동기 결과 pruna-sync.jpg 포함, idm_fallback_handler.inspect_fallback_result).
-        from app.virtual_fitting.idm_fallback_handler import ResultState, inspect_fallback_result
+        # 생성 요청을 보냈을 수 있는데 이미지 기록이 없다. 동기 결과는 getResponse 근거가 없어 고정 Key 만 확인한다.
+        # 현재 코드는 pruna-sync.webp 에, 이전 코드가 시작한 fallback 은 pruna-sync.jpg 에 저장한다(둘 다 확인).
+        from app.virtual_fitting.fallback_handler import fallback_result_keys
 
-        check = inspect_fallback_result(self._storage, job)
-        report.actions.append(f"fallback_result_{check.state.value}")
-        if check.state is ResultState.FOUND:
-            # 고정 Key·작업·시도 메타데이터(또는 시작 뒤 저장 시각)가 맞는 객체만 그 시도의 결과로 기록한다.
-            recovered = self._recover_with_lease(
-                job,
-                NextAction.RUN_FALLBACK,
-                lambda token: self._state.record_fallback_image(
-                    job.fitting_job_id, token, check.key
-                ),
-            )
-            if recovered:
-                self._republish(job, NextAction.RUN_FALLBACK, report)
-                return
-        elif check.state in (ResultState.ABSENT, ResultState.INVALID):
-            # 더 올라올 수 없거나 쓸 수 없는 결과. 실패 결과 저장은 핸들러가 한다(메시지를 다시 보내 이어 가게 한다).
-            self._republish(job, NextAction.RUN_FALLBACK, report)
-            self._alert(f"fallback_result_{check.state.value}", "fallback", job.fitting_job_id)
-            return
+        for key in fallback_result_keys(job.fitting_job_id):
+            check = self._storage.head_object(key)
+            report.actions.append(f"fallback_head_{check.state.value}")
+            if check.state is S3ObjectState.EXISTS and self._fresh(check, job.fallback_started_at):
+                # 고정 Key 는 이 작업의 fallback 저장만 쓰고 fallback 은 작업당 1회라, 시작 뒤 저장된 객체는 그 시도의 결과다.
+                recovered = self._recover_with_lease(
+                    job,
+                    NextAction.RUN_FALLBACK,
+                    lambda token, key=key: self._state.record_fallback_image(
+                        job.fitting_job_id, token, key
+                    ),
+                )
+                if recovered:
+                    self._republish(job, NextAction.RUN_FALLBACK, report)
+                    return
+                break
         self._alert("fallback_result_unknown", "fallback", job.fitting_job_id)
 
     def _publish(self, job: AsyncFittingJob, timing: dict) -> None:
