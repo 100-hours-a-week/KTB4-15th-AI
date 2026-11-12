@@ -672,9 +672,13 @@ def test_connected_handlers_build_without_io(monkeypatch):
     monkeypatch.setattr(
         database, "get_connection_pool", lambda: pytest.fail("연결만으로 DB 를 열지 않는다")
     )
+    from app.virtual_fitting.idm_fallback_handler import IdmVtonFallbackHandler
+
     handlers = pw.connected_postprocess_handlers()
     assert isinstance(handlers.postprocess, PostprocessHandler)
-    assert isinstance(handlers.run_fallback, RunFallbackHandler) and handlers.missing() == []
+    # 실제 RUN_FALLBACK 연결은 IDM-VTON 이다. RunFallbackHandler(Pruna 동기)는 보존만 하고 연결하지 않는다.
+    assert isinstance(handlers.run_fallback, IdmVtonFallbackHandler) and handlers.missing() == []
+    assert not isinstance(handlers.run_fallback, RunFallbackHandler)
 
 
 def test_real_worker_runs_run_fallback_through_real_clients(db, monkeypatch):  # noqa: F811

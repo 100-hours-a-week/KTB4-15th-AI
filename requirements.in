@@ -16,3 +16,5 @@ prometheus-fastapi-instrumentator
 rembg[cpu]
 # app/body_image_validation/remote.py 가 직접 쓴다(httpx.AsyncClient). 0.x 는 minor 마다 API 가 바뀐다.
 httpx>=0.28.1,<0.29
+# app/virtual_fitting/idm_modal_client.py 가 배포된 IDM-VTON Modal 함수를 부른다(deploy/modal 과 같은 버전).
+modal==1.6.1
