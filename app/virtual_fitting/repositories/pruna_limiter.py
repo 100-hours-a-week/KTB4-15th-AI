@@ -497,6 +497,10 @@ class TaskCostRepository:
 
     비용을 받지 못했으면 부르지 않는다(0 으로 확정하지 않음). 같은 task 를 다시 기록하면 아무것도 바꾸지 않는다.
     UNKNOWN·Worker 종료를 이유로 기록을 지우거나 환급하지 않는다.
+
+    배경 제거(RemBG)는 작업당 1회 호출의 DB 근거로도 쓴다(스키마 변경 없음): 호출 직전에 claim 으로 cost 0 자리를 만들고
+    (같은 taskUUID 가 있으면 이미 보낸 적이 있다), 응답 비용을 settle 로 한 번만 더한다. 비용을 받지 못한 호출은 0 으로
+    남는다(실제 차감액은 Runware 사용량 보정이 메운다). S3 호출 표시(rembg-call.json)를 지워도 이 자리가 재호출을 막는다.
     """
 
     def __init__(self, connection_pool: Any) -> None:
@@ -523,6 +527,57 @@ class TaskCostRepository:
                     if cursor.fetchone() is None:
                         return False
                     cursor.execute(ADD_SQL, add_params(usage_date, cost))
+                    return True
+        except psycopg.Error as error:
+            raise FittingDatabaseError("AI PostgreSQL 작업 비용 기록에 실패했습니다.") from error
+
+    def claim(self, task_uuid: str, fitting_job_id: int, usage_date: date) -> bool:
+        """호출 직전 자리(cost 0). 새로 만들었으면 True, 같은 taskUUID 가 이미 있으면 False. 하루 합계는 바꾸지 않는다."""
+        task = uuid.UUID(task_uuid)
+        job_id = _check_job_id(fitting_job_id)
+        try:
+            with self._pool.connection() as connection:
+                connection.autocommit = True
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        f"INSERT INTO {COSTS} (task_uuid, fitting_job_id, cost, usage_date) "
+                        "VALUES (%s, %s, 0, %s) ON CONFLICT (task_uuid) DO NOTHING RETURNING task_uuid",
+                        (task, job_id, usage_date),
+                    )
+                    return cursor.fetchone() is not None
+        except psycopg.Error as error:
+            raise FittingDatabaseError("AI PostgreSQL 호출 자리 기록에 실패했습니다.") from error
+
+    def exists(self, task_uuid: str) -> bool:
+        task = uuid.UUID(task_uuid)
+        try:
+            with self._pool.connection() as connection:
+                connection.autocommit = True
+                with connection.cursor() as cursor:
+                    cursor.execute(f"SELECT 1 FROM {COSTS} WHERE task_uuid = %s", (task,))
+                    return cursor.fetchone() is not None
+        except psycopg.Error as error:
+            raise FittingDatabaseError("AI PostgreSQL 작업 비용 조회에 실패했습니다.") from error
+
+    def settle(self, task_uuid: str, cost: Decimal) -> bool:
+        """claim 한 자리(cost 0)에 응답 비용을 한 번만 넣고 하루 개별 기록 합계에 더한다. 이미 넣었으면 False."""
+        if not isinstance(cost, Decimal) or not cost.is_finite() or cost < 0:
+            raise ValueError("cost 는 0 이상의 유한한 Decimal 이어야 합니다.")
+        task = uuid.UUID(task_uuid)
+        try:
+            with self._pool.connection() as connection:
+                connection.autocommit = True
+                with connection.transaction(), connection.cursor() as cursor:
+                    cursor.execute(_LOCK_TIMEOUT)
+                    cursor.execute(
+                        f"UPDATE {COSTS} SET cost = %s WHERE task_uuid = %s AND cost = 0 "
+                        "RETURNING usage_date",
+                        (cost, task),
+                    )
+                    row = cursor.fetchone()
+                    if row is None or cost == 0:
+                        return False
+                    cursor.execute(ADD_SQL, add_params(row[0], cost))
                     return True
         except psycopg.Error as error:
             raise FittingDatabaseError("AI PostgreSQL 작업 비용 기록에 실패했습니다.") from error

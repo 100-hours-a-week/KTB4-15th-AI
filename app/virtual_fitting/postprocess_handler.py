@@ -370,6 +370,7 @@ class BackgroundRemoval:
             return source, None
         if source_task is None:
             source_task = job.task_uuid
+        from app.virtual_fitting.exceptions import VirtualFittingError
         from app.virtual_fitting.result_image import ResultImageError
         from app.virtual_fitting.transparent_image import (
             BackgroundRemovalFailed,
@@ -419,6 +420,9 @@ class BackgroundRemoval:
         except ImageStorageError:
             logger.exception("postprocess rembg source url failed fitting_job_id=%s", job_id)
             return None, HandlerResult(HandlerStatus.DEFERRED, "rembg_source_presign_failed")
+        except VirtualFittingError as error:  # 호출 자리·표시 확인의 DB 오류(부르지 않았다)
+            logger.exception("postprocess background removal error fitting_job_id=%s", job_id)
+            return None, HandlerResult(HandlerStatus.DEFERRED, f"rembg_{error.code.lower()}")
         except ValueError:
             logger.error("postprocess transparent image input rejected fitting_job_id=%s", job_id)
             return None, HandlerResult(HandlerStatus.DEFERRED, "transparent_invalid_input")

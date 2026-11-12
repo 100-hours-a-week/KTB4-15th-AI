@@ -3,16 +3,19 @@
 원본(V2 pruna-async.webp / V1 fallback pruna-sync.webp, 이전 작업은 .jpg)은 그대로 두고, 같은 작업 폴더의 transparent.webp 에
 결과를 저장한다. 최종 결과(result_image_key)와 LLM 입력은 이 투명 이미지다.
 
-RemBG 는 작업당 최대 1회만 부른다(자동 재시도 없음). DB 를 바꾸지 않고 같은 작업 폴더의 호출 표시 객체(rembg-call.json)로
-1회를 지킨다. 호출 직전에 조건부 PUT(같은 Key 가 없을 때만)으로 만들고, 있으면 다시 부르지 않는다.
+RemBG 는 작업당 최대 1회만 부른다(자동 재시도 없음). DB 스키마를 바꾸지 않고 두 근거로 1회를 지킨다.
+  - S3 호출 표시(rembg-call.json): 호출 직전에 조건부 PUT(같은 Key 가 없을 때만)으로 만든다. 동시에 들어온 Worker 중
+    하나만 만들 수 있고, 실패 원인(state=failed)을 남긴다.
+  - DB 호출 자리(virtual_fitting_task_costs, 작업별로 정해진 RemBG taskUUID 의 cost 0 행): 표시를 만든 뒤 호출 전에 만든다.
+    표시를 지워도 이 행이 남아 다시 부르지 않는다(표시를 지워 재실행하는 복구는 막는다).
   0. transparent.webp 에 이 작업·원본 task 의 Metadata·sha256·Alpha 검증이 맞는 객체가 있으면 재사용한다.
   1. 호출 표시가 "failed" 면 다시 부르지 않고 최종 실패(BackgroundRemovalFailed)로 이어 간다.
      "called" 인데 결과가 없으면(응답 전 중단·결과 저장 실패 등) 호출 여부·결과가 불명확하다. 다시 부르지 않고
-     운영 확인으로 보류한다(BackgroundRemovalPending).
+     운영 확인으로 보류한다(BackgroundRemovalPending). 표시가 없는데 DB 호출 자리가 있어도(표시 삭제·유실) 보류한다.
   2. 호출 표시를 만든 실행만 한 번 부른다. 실패(timeout·429·5xx·오류 응답 포함)는 다시 부르지 않고 표시를 "failed" 로 바꾼 뒤
      최종 실패. 받은 결과를 쓸 수 없을 때(Alpha 없음 등)도 같다.
   3. 결과 내려받기·S3 저장의 일시 오류는 같은 결과 URL 로만 짧게 다시 해 본다(RemBG 재호출 아님).
-비용은 호출 taskUUID(작업·원본 task 로 정해지는 값)로 한 번만 하루 사용액에 더한다. 원본 객체는 읽기만 하고,
+비용은 호출 taskUUID(작업·원본 task 로 정해지는 값)의 자리에 한 번만 넣고 하루 사용액에 더한다. 원본 객체는 읽기만 하고,
 URL·token 은 로그·표시 객체에 남기지 않는다. DB 실행 권한(lease)은 호출부가 쥔 채 부른다.
 """
 
@@ -283,6 +286,15 @@ def store_transparent_image(
             rembg_task,
         )
         raise BackgroundRemovalPending("rembg_call_unconfirmed")
+    if costs is not None and costs.exists(rembg_task):
+        # DB 에는 호출 자리가 있는데 S3 표시가 없다(지워졌거나 유실). 다시 부르지 않는다.
+        logger.error(
+            "rembg call marker missing but the call was recorded fitting_job_id=%s "
+            "rembg_task_uuid=%s; not calling again, operator check required",
+            fitting_job_id,
+            rembg_task,
+        )
+        raise BackgroundRemovalPending("rembg_call_marker_missing")
 
     # 2. 호출 표시(조건부 PUT)를 만든 실행만 한 번 부른다. 원본 URL 서명은 표시 전에 한다(실패해도 호출 기회를 쓰지 않음).
     source_url = result_image_get_url(storage, source, expires_in=source_url_expires_seconds)
@@ -300,6 +312,10 @@ def store_transparent_image(
         current = _read_marker(storage, marker_key, fitting_job_id, task)
         if current is None or current.get("claim") != claim or current["state"] != CALLED:
             raise BackgroundRemovalPending("rembg_call_unconfirmed")
+    # DB 호출 자리. 이미 있으면(표시를 지운 뒤 다시 만든 경우 등) 부르지 않는다. DB 오류면 부르지 않고 예외를 올린다
+    # (표시는 "called" 로 남아 이후 실행은 보류한다 — 보내지 않은 호출을 두 번 보낼 위험보다 운영 확인을 택한다).
+    if costs is not None and not costs.claim(rembg_task, fitting_job_id, datetime.now(UTC).date()):
+        raise BackgroundRemovalPending("rembg_call_marker_missing")
 
     def fail(reason: str) -> BackgroundRemovalFailed:
         try:
@@ -418,14 +434,14 @@ def _put(storage, body, key, job_id, task, digest, max_bytes) -> tuple[StoredRes
 
 
 def _record_cost(costs: Any, job_id: int, rembg_task: str, cost: Any) -> None:
-    """호출 taskUUID 로 한 번만 하루 사용액에 더한다. 실패해도 결과 처리는 계속한다."""
+    """호출 자리(cost 0)에 응답 비용을 한 번만 넣고 하루 사용액에 더한다. 실패해도 결과 처리는 계속한다."""
     if cost is None:
         logger.warning("rembg cost missing fitting_job_id=%s; not recorded", job_id)
         return
     if costs is None:
         return
     try:
-        costs.record(rembg_task, job_id, cost, datetime.now(UTC).date())
+        costs.settle(rembg_task, cost)
     except ValueError:
         logger.warning("rembg cost invalid fitting_job_id=%s; not recorded", job_id)
     except VirtualFittingError:

@@ -272,15 +272,26 @@ class Rembg:
 
 
 class Costs:
-    """TaskCostRepository 대역: 같은 taskUUID 는 한 번만 더한다."""
+    """TaskCostRepository 대역: 호출 자리(cost 0)는 taskUUID 당 하나, 비용은 자리에 한 번만 넣는다."""
 
     def __init__(self):
-        self.records = {}
+        self.records, self.added = {}, []
 
-    def record(self, task_uuid, job_id, cost, usage_date):
+    def claim(self, task_uuid, job_id, usage_date):
         if task_uuid in self.records:
             return False
+        self.records[task_uuid] = (job_id, Decimal(0))
+        return True
+
+    def exists(self, task_uuid):
+        return task_uuid in self.records
+
+    def settle(self, task_uuid, cost):
+        job_id, current = self.records[task_uuid]
+        if current != 0:
+            return False
         self.records[task_uuid] = (job_id, cost)
+        self.added.append(cost)
         return True
 
 
@@ -400,7 +411,10 @@ def test_any_call_failure_is_final_without_calling_again(error, reason):
         case.run()
     assert caught.value.reason == reason and len(case.rembg.calls) == 1
     assert (case.marker()["state"], case.marker()["reason"]) == ("failed", reason)
-    assert CLEAR not in case.backend.objects and case.costs.records == {}
+    assert CLEAR not in case.backend.objects
+    # 호출 자리는 남고(보낸 근거) 받은 비용이 없으므로 0, 하루 합계에는 더하지 않았다
+    assert case.costs.records == {rembg_task_uuid(JOB, TASK): (JOB, Decimal(0))}
+    assert case.costs.added == []
     # 재수신·재시작: 표시가 "failed" 라 부르지 않고 같은 최종 실패로 이어 간다.
     with pytest.raises(BackgroundRemovalFailed) as again:
         case.run()
@@ -444,6 +458,37 @@ def test_called_without_a_stored_result_is_held_without_calling_again():
             case.run()
         assert held.value.reason == "rembg_call_unconfirmed"
     assert len(case.rembg.calls) == 1 and len(case.costs.records) == 1
+
+
+@pytest.mark.parametrize("state", ["called", "failed"])
+def test_deleting_the_marker_does_not_allow_a_second_call(state):
+    """rembg-call.json 을 지워 같은 작업을 다시 돌려도 DB 호출 자리가 남아 부르지 않는다(운영 확인 보류)."""
+    case = (
+        Case(RembgError("timeout", retryable=True))
+        if state == "failed"
+        else Case(bodies=[ResultImageError("timeout")] * 3)
+    )
+    with pytest.raises((BackgroundRemovalFailed, ResultImageError)):
+        case.run()
+    assert case.marker()["state"] == state
+    del case.backend.objects[MARKER]
+    with pytest.raises(BackgroundRemovalPending) as caught:
+        case.run()
+    assert caught.value.reason == "rembg_call_marker_missing"
+    assert len(case.rembg.calls) == 1 and case.marker() is None  # 표시도 다시 만들지 않는다
+
+
+def test_recorded_call_without_marker_is_not_called_even_if_marker_is_recreated():
+    """표시가 없는 상태에서 다른 경로로 DB 자리 확인을 지나쳐도 자리 확보가 실패해 부르지 않는다."""
+    case = Case()
+    case.costs.claim(rembg_task_uuid(JOB, TASK), JOB, None)
+    exists = case.costs.exists
+    case.costs.exists = lambda task: False  # 확인과 확보 사이에 자리가 생긴 경쟁을 흉내
+    with pytest.raises(BackgroundRemovalPending) as caught:
+        case.run()
+    case.costs.exists = exists
+    assert caught.value.reason == "rembg_call_marker_missing" and case.rembg.calls == []
+    assert case.marker()["state"] == "called"  # 이후 실행도 보류
 
 
 class MarkerPut:
@@ -675,7 +720,16 @@ def test_unconfirmed_call_is_held_across_restart_and_watchdog_without_calling_ag
     )
     assert current.result_payload is None and current.fallback_attempt_count == 0
     assert env.runware.count("sync_generate") == 0 and env.runware.count("llm_comment") == 0
-    assert len(rembg_costs(env)) == 1  # 받은 응답의 비용은 한 번 기록됐다
+    assert rembg_costs(env) == [(rembg_task_uuid(JOB, task), Decimal("0.0006"))]  # 한 번 기록
+    # 표시(rembg-call.json)를 지우고 다시 돌려도 DB 호출 자리가 남아 부르지 않는다.
+    del env.s3.objects[MARKER]
+    env.sqs.put(
+        "ai-fitting-response", {"fitting_job_id": JOB, "task_uuid": task, "action": "POSTPROCESS"}
+    )
+    redeliver(env)
+    (outcome,) = stack.postprocess_once()
+    assert outcome.delete is False and env.runware.count("rembg") == 1
+    assert env_marker(env) is None and row(env).result_payload is None
 
 
 def test_db_failure_after_the_transparent_save_reuses_it_on_redelivery(env):  # noqa: F811
