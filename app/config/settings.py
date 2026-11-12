@@ -25,7 +25,7 @@ BODY_IMAGE_REMOTE_API_KEY = os.getenv("BODY_IMAGE_REMOTE_API_KEY", "")
 # gpt@6-luna 는 되묻기 직후 라우팅(103/114)과 첫 말풍선 지연(최댓값 5.19·6.26s)에서 합격선을
 # 넘지 못해 5.6 을 쓴다 (2026-10-07 로컬 측정).
 MODEL = os.getenv("CHAT_MODEL", "openai:gpt@5.6-luna")
-LLM_BASE_URL = "https://api.runware.ai/v1"
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.runware.ai/v1")
 # 채팅 LLM(Runware) HTTP timeout(초). 지정하지 않으면 SDK 기본값 600초라 Runware 가 멈추면
 # 사용자는 10분 동안 빈 말풍선을 본다. Runware + 5.6 의 첫 토큰까지 최대 3.81초(2026-10-07
 # 로컬 측정)에 여유를 두어 6초로 잡았다 (2026-10-12 결정). 임베딩 클라이언트에는 걸지 않았다.
@@ -241,3 +241,14 @@ VIRTUAL_FITTING_PRUNA_MAX_CONCURRENT_SENDS = int(
 VIRTUAL_FITTING_PRUNA_MIN_SEND_INTERVAL_SECONDS = float(
     os.getenv("VIRTUAL_FITTING_PRUNA_MIN_SEND_INTERVAL_SECONDS", "10")
 )
+# V2 RUN_FALLBACK 의 IDM-VTON(Modal L40S, deploy/modal/idm_vton/service.py). 작업당 생성 호출은 최대 1회다.
+# Modal 인증은 SDK 표준 환경변수 MODAL_TOKEN_ID·MODAL_TOKEN_SECRET 으로 받는다(여기서 읽지 않고 로그에 남기지 않는다).
+IDM_VTON_MODAL_APP_NAME = os.getenv("IDM_VTON_MODAL_APP_NAME", "lookddak-idm-vton-fallback").strip()
+IDM_VTON_MODAL_FUNCTION_NAME = os.getenv("IDM_VTON_MODAL_FUNCTION_NAME", "generate").strip()
+# 비우면 토큰의 기본 Modal environment 를 쓴다.
+IDM_VTON_MODAL_ENVIRONMENT = os.getenv("IDM_VTON_MODAL_ENVIRONMENT", "").strip() or None
+# 결과 업로드 Presigned PUT 유효기간(초). Modal 대기열·실행 상한(각 600초)보다 길어야 하고, 이 시간 + 여유가 지나도록
+# 결과가 없으면 더 올라올 수 없다고 보고 최종 실패로 확정한다(복구 판단 기준).
+IDM_VTON_UPLOAD_URL_EXPIRES_SECONDS = int(os.getenv("IDM_VTON_UPLOAD_URL_EXPIRES_SECONDS", "1800"))
+# Worker 가 한 번의 처리에서 Modal 결과를 기다리는 최대 시간(초). 넘으면 보류하고 다음 수신·Watchdog 이 S3 로 확인한다.
+IDM_VTON_WAIT_SECONDS = float(os.getenv("IDM_VTON_WAIT_SECONDS", "1260"))

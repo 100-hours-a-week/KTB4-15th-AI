@@ -3,7 +3,7 @@ from enum import Enum
 # 이 task 가 처리되지 않았다(재요청 가능). 자동 재요청 연결은 다음 단계다(지금은 보류).
 NOT_ACCEPTED_CODES = frozenset({"serviceOverloaded", "inferenceRateLimitExceeded"})
 # 그 task 의 생성 단계 종료 실패 중 V1 fallback 으로 다시 만들어 볼 수 있다고 확인한 코드.
-FALLBACK_ERROR_CODES = frozenset({"timeoutProvider"})
+FALLBACK_ERROR_CODES = frozenset({"timeoutProvider", "providerError"})
 # 그 task 의 생성 단계 종료 실패이고 fallback 대상이 아니라고 근거로 확인한 코드(최종 FITTING_MODEL_FAILED).
 # 공식 문서에 그런 코드가 아직 없다. 근거 없이 채우지 않는다.
 GENERATION_FAILED_CODES: frozenset[str] = frozenset()
