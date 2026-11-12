@@ -224,4 +224,11 @@ class RunwareTaskStatusClient:
             return TaskStatus(
                 TaskStatusKind.RATE_LIMITED, task, retry_after=retry.seconds, http_status=429
             )
+        if error.code >= 500:
+            try:
+                parsed = parse_status(error.read(), task, error.code)
+            except (OSError, HTTPException):
+                parsed = None
+            if parsed is not None and parsed.kind is TaskStatusKind.FAILED:
+                return parsed
         return TaskStatus(TaskStatusKind.UNKNOWN, task, http_status=error.code)
