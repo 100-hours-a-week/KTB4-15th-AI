@@ -1,11 +1,3 @@
-"""4단계: 신규 요청의 AI 직접 S3 저장 전환을 실제 조립 경로(요청 Worker·Submitter·Provider·Webhook Router·후처리 Worker·
-결과 전송 루프·Watchdog)로 검증한다. 외부 경계만 v2_integration_harness 의 가짜(SQS·S3·Runware·결과 다운로드)로 바꾼다.
-
-- 처음 준비하는 작업: ai_stores_result=True, Presigned PUT 발급 없음, payload 에 uploadEndpoint 필드 없음.
-- 이미 준비된 작업: DB 에 기록된 저장 방식 그대로(기존 false 는 PUT·uploadEndpoint 직접 업로드 계약).
-실제 네트워크·DNS 는 쓰지 않는다(하네스가 막고 확인한다).
-"""
-
 import hashlib
 import json
 import uuid
@@ -41,6 +33,8 @@ from tests.v2_integration_harness import (
 )
 
 KEY = f"virtual-fitting/results/{JOB}/pruna-async.webp"
+# 배경 제거 결과(최종 결과·LLM 입력). 원본 KEY 는 그대로 남는다.
+TRANSPARENT_KEY = f"virtual-fitting/results/{JOB}/transparent.webp"
 SECRETS = ("fake-cdn-token", "FAKESIGNATURE", WEBHOOK_URL.split("token=")[1])
 
 
@@ -290,18 +284,27 @@ def test_new_request_flows_to_the_be_result_with_the_original_webp_bytes(env):  
         "task-uuid": task,
         "sha256": hashlib.sha256(original).hexdigest(),
     }
-    assert env.runware.downloads == [url]  # 저장된 URL 그대로(token 포함)
+    # 저장된 URL 그대로(token 포함) 원본을 받고, 그다음 배경 제거 결과를 받는다.
+    assert env.runware.downloads[0] == url and len(env.runware.downloads) == 2
+    assert env.runware.rembg_inputs == [KEY] and env.runware.count("rembg") == 1
+    transparent, transparent_type, _ = env.s3.objects[TRANSPARENT_KEY]
+    assert transparent_type == "image/webp" and transparent != original
     assert (
         KEY not in env.s3.heads
     )  # 결과는 Runware 업로드 확인(HEAD) 경로를 쓰지 않음(사용자 이미지 HEAD 는 기존대로)
     (be,) = env.sqs.bodies("be-fitting-response")
     assert set(be) == {"fitting_job_id", "status", "result_image_key", "llm_title", "llm_comment"}
-    assert be["result_image_key"] == KEY and be["status"] == "COMPLETED"
+    assert be["result_image_key"] == TRANSPARENT_KEY and be["status"] == "COMPLETED"
+    assert final.verified_image_key == final.async_image_key == KEY  # 원본 확인 기록은 그대로
     # 내부 큐에는 작업 참조만
     for message in env.sqs.bodies("ai-fitting-response"):
         assert set(message) == {"fitting_job_id", "task_uuid", "action"}
     assert env.runware.count("llm_comment") == 1 and env.runware.count("llm_title") == 1
-    assert ("get_object", KEY) in env.s3.presigned  # LLM 에는 S3 이미지의 Presigned GET
+    assert ("get_object", KEY) in env.s3.presigned  # RemBG 에는 원본의 Presigned GET
+    assert (
+        "get_object",
+        TRANSPARENT_KEY,
+    ) in env.s3.presigned  # LLM 에는 투명 이미지의 Presigned GET
     assert_no_secret(json.dumps(env.sqs.bodies("be-fitting-response")))
 
 
@@ -327,12 +330,17 @@ def test_new_and_existing_jobs_run_side_by_side(env):  # noqa: F811
     legacy_key = f"virtual-fitting/results/{legacy}/pruna-async.webp"
     new_key = f"virtual-fitting/results/{new}/pruna-async.webp"
     assert legacy_key in env.s3.heads and new_key not in env.s3.heads  # 기존: HEAD 확인
-    assert [p["Key"] for p in env.s3.puts] == [
-        new_key
-    ]  # 새 작업만 AI 가 저장(기존 객체는 덮어쓰지 않음)
+    legacy_clear = f"virtual-fitting/results/{legacy}/transparent.webp"
+    new_clear = f"virtual-fitting/results/{new}/transparent.webp"
+    # 원본은 새 작업만 AI 가 저장(기존 객체는 덮어쓰지 않음). 투명 결과·RemBG 호출 표시는 두 작업 모두 별도 Key 에 저장.
+    markers = [f"virtual-fitting/results/{job}/rembg-call.json" for job in (legacy, new)]
+    assert sorted(p["Key"] for p in env.s3.puts) == sorted(
+        [new_key, legacy_clear, new_clear, *markers]
+    )
     assert presigned_puts(env) == [legacy_key]
+    assert sorted(env.runware.rembg_inputs) == sorted([legacy_key, new_key])
     assert sorted(b["result_image_key"] for b in env.sqs.bodies("be-fitting-response")) == sorted(
-        [legacy_key, new_key]
+        [legacy_clear, new_clear]
     )
 
 
@@ -474,7 +482,9 @@ def test_s3_saved_then_db_failure_resumes_without_a_second_download(env):  # noq
     expire_lease(env)
     stack.publish_once()
     assert row(env).status is AsyncJobStatus.COMPLETED
-    assert len(env.runware.downloads) == 1 and len(env.s3.puts) == 1  # 다시 받지도 올리지도 않음
+    # 원본 1번 + 배경 제거 결과 1번(+ RemBG 호출 표시 1번). 다시 받지도 올리지도 않음
+    assert len(env.runware.downloads) == 2 and len(env.s3.puts) == 3
+    assert env.runware.count("rembg") == 1  # 배경 제거도 한 번(유료 API 재호출 없음)
     assert env.runware.count("llm_comment") == 1  # LLM 도 한 번
 
 
@@ -519,7 +529,7 @@ def test_publish_failure_after_the_result_is_recovered_without_llm(env):  # noqa
     stack.publish_once()
     assert row(env).result_message_status is ResultMessageStatus.PUBLISHED
     assert (env.runware.count("llm_comment"), env.runware.count("llm_title")) == calls
-    assert len(env.runware.downloads) == 1
+    assert len(env.runware.downloads) == 2 and env.runware.count("rembg") == 1
 
 
 # === 18. 내부 큐 삭제 시점·재발행 제한 ===

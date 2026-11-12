@@ -1,32 +1,3 @@
-"""가상피팅 V2 RUN_FALLBACK 핸들러 (13단계): V1 동기 생성 최대 1회 → 고정 Key 저장 → 제목·코멘트 → V2 결과 저장.
-
-10단계 후처리 Worker 가 실행 권한(token)을 확보한 뒤 FALLBACK_RUNNING / RUN_FALLBACK 작업의 최신 기록으로 부른다.
-V1 VirtualFittingService.fit 은 부르지 않는다(예산·비용 기록·LLM 이 중복된다). 12단계 경계만 재사용한다:
-prepare_fitting(상품 검증·입력), RunwarePrunaProvider.try_on(task_uuid=…, strict_cost=False), store_result(key=…).
-
-순서(외부 호출 전 실패는 fallback 1회를 쓰지 않는다):
-  0. 결과가 있으면 끝. fallback_image_key 가 있으면 생성·저장은 끝났으므로 4 부터. 시작 기록(fallback_started_at)만 있고
-     이미지 기록이 없으면 생성 결과를 알 수 없으므로 다시 생성하지 않고 보류한다(15단계 복구 대상).
-  1. 입력 준비: 저장된 상품 코드로 prepare_fitting(상품 없음·조합·이미지·분류 실패 → V2 실패 결과), 원본 사진 HEAD
-     (없음 → 실패 결과, 권한·일시 오류 → 보류), 일일 예산(5달러 이상 → FITTING_DAILY_BUDGET_EXCEEDED)·잔액(1달러 이하 →
-     FITTING_BALANCE_EXHAUSTED, 조회 실패 → 보류). fallback 으로 해결할 수 없는 문제에는 생성하지 않는다.
-  2. fallback taskUUID 를 외부 호출 전에 저장한다(prepare_fallback, 재수신 때 재사용). 비동기 task_uuid 는 그대로다.
-  3. 공유 제한 자리 대기(PrunaLimiter.begin_fallback: 진행 중 3·동시 전송 2·간격 10초·SEND_HOLD 를 비동기 생성과 같이
-     적용). 기다리기만 하면 횟수를 쓰지 않는다. 매 확인 직전에 원본 Presigned GET 을 새로 발급하고, 오래 기다리면 예산·잔액을
-     다시 확인한다. 자리를 얻는 트랜잭션에서 fallback_attempt_count + 1·fallback_started_at 을 함께 기록한다.
-     → 곧바로 try_on 한 번. 자동 재시도 없음. 응답 뒤 동시 전송 자리를 놓는다.
-     - 성공: 진행 중 자리 반환(이 fallback task 만) → 유효한 비용이면 TaskCostRepository(fallback task, 시작 UTC 날짜)
-       → store_result(key=virtual-fitting/results/{id}/pruna-sync.jpg) → record_fallback_image.
-     - 402 잔액 부족: 자리 반환, FITTING_BALANCE_EXHAUSTED 실패 결과(추가 fallback 없음).
-     - 401·403: 자리 반환, 결과 저장 없이 운영 확인으로 보류(8단계 정책과 같음).
-     - 그 밖의 명확한 4xx 거절: 자리 반환, FITTING_MODEL_FAILED 실패 결과.
-     - timeout·연결 오류·5xx·429·응답 해석 실패·그 밖의 예외: 결과 불명확. 진행 중 자리를 유지하고 보류(다시 보내지 않음).
-  4. 저장한 fallback 이미지로 11단계와 같은 코멘트·제목(title_and_comment: 항목별 최대 2회, 같은
-     llm_generation_attempt_count 로 호출 합계 최대 4번, 실패 시 V1 기본 문구) → save_final_result(COMPLETED,
-     result_image_key = fallback 이미지 Key) + PUBLISH_RESULT.
-결과 발행·최종 상태 확정은 14단계, 중단된 시도 복구는 15단계다. Presigned URL·Runware 결과 URL 은 저장·로그하지 않는다.
-"""
-
 import dataclasses
 import logging
 import time
@@ -48,7 +19,12 @@ from app.virtual_fitting.exceptions import (
     UnsupportedSubCategoryError,
     VirtualFittingError,
 )
-from app.virtual_fitting.postprocess_handler import save_completed, title_and_comment
+from app.virtual_fitting.postprocess_handler import (
+    BackgroundRemoval,
+    save_completed,
+    timing,
+    title_and_comment,
+)
 from app.virtual_fitting.postprocess_worker import HandlerContext, HandlerResult, HandlerStatus
 from app.virtual_fitting.pruna_submitter import failure_payload
 from app.virtual_fitting.repositories.async_job_repository import (
@@ -61,7 +37,8 @@ from app.virtual_fitting.repositories.pruna_limiter import SubmissionReason
 
 logger = logging.getLogger(__name__)
 
-FALLBACK_RESULT_FILENAME = "pruna-sync.jpg"
+# 동기 생성 출력(WEBP, outputQuality 90) 원본. 이전 작업의 원본(pruna-sync.jpg)은 기록된 Key 를 그대로 쓴다.
+FALLBACK_RESULT_FILENAME = "pruna-sync.webp"
 _INPUT_FAILURES = (
     ProductNotFoundError,
     InvalidFittingCombinationError,
@@ -75,9 +52,18 @@ _WAIT_REASONS = (
 )
 
 
+LEGACY_FALLBACK_RESULT_FILENAME = "pruna-sync.jpg"
+
+
 def fallback_result_key(fitting_job_id: int) -> str:
-    """fallback 결과 이미지 Key. 비동기 결과(pruna-async.jpg)와 분리한다."""
+    """fallback 원본 이미지 Key. 비동기 원본(pruna-async.webp)·투명 결과(transparent.webp)와 분리한다."""
     return f"virtual-fitting/results/{fitting_job_id}/{FALLBACK_RESULT_FILENAME}"
+
+
+def fallback_result_keys(fitting_job_id: int) -> tuple[str, str]:
+    """복구 때 확인할 fallback 원본 Key(현재 .webp, 이전 코드가 시작한 작업의 .jpg)."""
+    folder = f"virtual-fitting/results/{fitting_job_id}"
+    return (fallback_result_key(fitting_job_id), f"{folder}/{LEGACY_FALLBACK_RESULT_FILENAME}")
 
 
 def fallback_stage(key: str) -> Callable[[AsyncFittingJob], bool]:
@@ -132,6 +118,8 @@ class RunFallbackHandler:
         recheck_after_seconds: float = 30.0,
         result_url_expires_seconds: int | None = None,
         new_task_uuid: Callable[[], str] = lambda: str(uuid.uuid4()),
+        remove_background: Callable[..., Any] | None = None,
+        remove_background_enabled: bool | None = None,
         **deps: Any,
     ) -> None:
         self._given = deps
@@ -144,6 +132,11 @@ class RunFallbackHandler:
         )
         self._expires = result_url_expires_seconds
         self._new_task_uuid = new_task_uuid
+        self._background = BackgroundRemoval(
+            store=remove_background,
+            enabled=remove_background_enabled,
+            expires=result_url_expires_seconds,
+        )
 
     # --- 의존성 ---
 
@@ -174,7 +167,9 @@ class RunFallbackHandler:
         job_id = job.fitting_job_id
         if job.result_payload is not None:
             return HandlerResult(HandlerStatus.DONE, "result_already_saved")
-        image = job.fallback_image_key
+        started = time.perf_counter()
+        timings: dict[str, Any] = {}
+        image, source_task = job.fallback_image_key, job.fallback_task_uuid
         if image is None:
             if job.fallback_started_at is not None or job.fallback_attempt_count >= FALLBACK_LIMIT:
                 # 생성 요청을 보냈을 수 있는데 결과 이미지 기록이 없다. 다시 생성하지 않는다(15단계 복구 대상).
@@ -183,23 +178,40 @@ class RunFallbackHandler:
                     job_id,
                 )
                 return HandlerResult(HandlerStatus.DEFERRED, "fallback_started_unconfirmed")
-            image, stop = self._generate(deps, job, token, context)
+            image, source_task, stop = self._generate(deps, job, token, context)
             if stop is not None:
                 return stop
+        # 원본(image)은 fallback_image_key 로 그대로 두고, 최종 결과·LLM 입력은 배경을 지운 이미지다.
+        final, stop = self._background(
+            deps, job, token, context, image, timings, source_task=source_task
+        )
+        if stop is not None:
+            return stop
         title, comment, stop = title_and_comment(
             deps,
             job,
             token,
             context,
-            image,
+            final,
             stage_ok=fallback_stage(image),
             expires_in=self._expires,
+            timings=timings,
         )
         if stop is not None:
             return stop
         if not context.may_continue():
             return HandlerResult(HandlerStatus.DEFERRED, "stopped_before_save")
-        return save_completed(deps.state, job_id, token, image, title, comment)
+        result = save_completed(deps.state, job_id, token, final, title, comment)
+        timing(
+            job,
+            "fallback_summary",
+            result.reason,
+            int((time.perf_counter() - started) * 1000),
+            result_image_key=final,
+            original_image_key=image,
+            **timings,
+        )
+        return result
 
     def _fail(self, deps, job_id: int, token: str, code: str, message: str) -> HandlerResult:
         saved = deps.state.save_final_result(job_id, token, failure_payload(job_id, code, message))
@@ -230,7 +242,17 @@ class RunFallbackHandler:
 
         return user_image_get_url(deps.storage, job.user_image_key)
 
-    def _generate(self, deps, job, token, context) -> tuple[str | None, HandlerResult | None]:
+    def _generate(
+        self, deps, job, token, context
+    ) -> tuple[str | None, str | None, HandlerResult | None]:
+        """(원본 Key, fallback taskUUID, None) 또는 (None, None, 멈출 때의 HandlerResult)."""
+        key, stop = self._generate_image(deps, job, token, context)
+        if stop is not None:
+            return None, None, stop
+        latest = deps.jobs.find_by_fitting_job_id(job.fitting_job_id)
+        return key, latest.fallback_task_uuid if latest is not None else None, None
+
+    def _generate_image(self, deps, job, token, context) -> tuple[str | None, HandlerResult | None]:
         from app.virtual_fitting.request_worker import (
             USER_IMAGE_NOT_FOUND_CODE,
             USER_IMAGE_NOT_FOUND_MESSAGE,

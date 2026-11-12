@@ -1,3 +1,4 @@
+import json
 import os
 import threading
 import uuid
@@ -141,22 +142,37 @@ def test_normal_flow_through_the_real_lifespan_loops(env, monkeypatch, input_ext
     assert payload == {  # 합의한 평평한 JSON(code/data/message 로 감싸지 않음)
         "fitting_job_id": JOB,
         "status": "COMPLETED",
-        "result_image_key": f"virtual-fitting/results/{JOB}/pruna-async.webp",
+        "result_image_key": f"virtual-fitting/results/{JOB}/transparent.webp",  # 배경 제거 결과
         "llm_title": TITLE,
         "llm_comment": COMMENT,
     }
     assert final.status is AsyncJobStatus.COMPLETED and final.next_action is None
     assert final.user_image_key == input_key  # 원본·비동기·최종 Key 구분 유지
-    assert final.result_image_key == final.async_image_key == final.verified_image_key
-    assert env.s3.objects[final.result_image_key][1] == "binary/octet-stream"  # MIME 만으로 보류하지 않음
+    # 원본(비동기·확인 Key)은 그대로 두고 투명 WebP 를 별도 Key 로 저장해 최종 결과로 쓴다.
+    assert final.async_image_key == final.verified_image_key != final.result_image_key
+    assert final.result_image_key == f"virtual-fitting/results/{JOB}/transparent.webp"
+    assert (
+        env.s3.objects[final.async_image_key][1] == "binary/octet-stream"
+    )  # MIME 만으로 보류하지 않음
+    assert env.s3.objects[final.result_image_key][1] == "image/webp"
+    assert env.runware.rembg_inputs == [final.async_image_key]
     # LLM: 코멘트에는 생성된 결과 이미지(Presigned GET)만, 제목에는 그 코멘트만
     comment_request, title_request = env.runware.llm_requests
     image_url = comment_request["messages"][1]["content"][1]["image_url"]["url"]
-    assert f"/virtual-fitting/results/{JOB}/pruna-async.webp?" in image_url
+    assert (
+        f"/virtual-fitting/results/{JOB}/transparent.webp?" in image_url
+    )  # 배경 제거된 최종 이미지
     assert input_key not in image_url
     assert title_request["messages"][1]["content"] == f"코디 설명: {COMMENT}"
-    # 비용·횟수·자리·실행 권한
-    assert costs(env) == [(task, JOB, Decimal("0.023"))]
+    # 비용·횟수·자리·실행 권한: Pruna 생성 + RemBG 1회(호출 taskUUID 별), 하루 개별 기록 합계에 둘 다 들어간다
+    (rembg_task,) = [t for k, t in env.runware.calls if k == "rembg"]
+    assert sorted(costs(env)) == sorted(
+        [(task, JOB, Decimal("0.023")), (rembg_task, JOB, Decimal("0.0006"))]
+    )
+    assert env.sql("SELECT recorded_amount FROM usage_amount") == [(Decimal("0.0236"),)]
+    # RemBG 는 작업당 1회: 호출 표시 객체(S3)가 남는다(DB 표 없음)
+    marker = json.loads(env.s3.objects[f"virtual-fitting/results/{JOB}/rembg-call.json"][0])
+    assert (marker["state"], marker["rembg_task_uuid"]) == ("called", rembg_task)
     assert counts(env) == (1, 2, 0, 1, None)
     assert in_flight(env) == []
     assert env.runware.count("async_submit") == 1 and env.runware.count("sync_generate") == 0
@@ -185,19 +201,6 @@ def test_restart_between_accept_and_webhook_continues_from_db(env, monkeypatch):
 
 
 def test_fallback_flow_through_the_real_loops_and_a_late_async_webhook(env, monkeypatch):
-    # 보존된 Pruna V1 동기 RunFallbackHandler 회귀: 실제 연결은 IDM-VTON 이므로 이 테스트만 Pruna 동기 조립을 주입한다.
-    import app.main as app_env
-    from app.virtual_fitting.fallback_handler import RunFallbackHandler
-    from app.virtual_fitting.postprocess_handler import PostprocessHandler
-    from app.virtual_fitting.postprocess_worker import PostprocessHandlers
-
-    monkeypatch.setattr(
-        app_env,
-        "connected_postprocess_handlers",
-        lambda: PostprocessHandlers(
-            postprocess=PostprocessHandler(), run_fallback=RunFallbackHandler()
-        ),
-    )
     enable_all(monkeypatch)
     env.send_request(JOB)
     with TestClient(app()) as client:
@@ -214,11 +217,25 @@ def test_fallback_flow_through_the_real_loops_and_a_late_async_webhook(env, monk
         assert row(env) == final
     (payload,) = env.sqs.bodies("be-fitting-response")
     assert payload["status"] == "COMPLETED"
-    assert payload["result_image_key"] == f"virtual-fitting/results/{JOB}/pruna-sync.jpg"
+    # V1 fallback 도 원본(pruna-sync.webp) 저장 → RemBG → 투명 WebP 가 최종 결과다
+    original = f"virtual-fitting/results/{JOB}/pruna-sync.webp"
+    assert final.fallback_image_key == original and env.runware.rembg_inputs == [original]
+    assert payload["result_image_key"] == final.result_image_key == (
+        f"virtual-fitting/results/{JOB}/transparent.webp"
+    )
+    assert env.s3.objects[original][1] == "image/webp"  # 동기 생성도 WebP 로 받는다
+    assert env.s3.objects[final.result_image_key][1] == "image/webp"
+    comment_url = env.runware.llm_requests[0]["messages"][1]["content"][1]["image_url"]["url"]
+    assert f"/virtual-fitting/results/{JOB}/transparent.webp?" in comment_url
     assert final.fallback_task_uuid not in (None, task)  # 비동기 UUID 와 fallback UUID 분리
     assert env.runware.count("sync_generate") == 1 and env.runware.count("async_submit") == 1
+    (rembg_task,) = [t for k, t in env.runware.calls if k == "rembg"]
     recorded = {t: c for t, _, c in costs(env)}
-    assert recorded == {final.fallback_task_uuid: Decimal("0.015"), task: Decimal("0.02")}
+    assert recorded == {
+        final.fallback_task_uuid: Decimal("0.015"),
+        task: Decimal("0.02"),
+        rembg_task: Decimal("0.0006"),
+    }
     assert in_flight(env) == []
 
 

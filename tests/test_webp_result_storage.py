@@ -81,6 +81,7 @@ def test_original_async_key_reaches_llm_and_result_without_metadata_changes(exte
         products=SimpleNamespace(find_by_codes=lambda _: [SimpleNamespace(product_code="123", description_summary="셔츠")]),
         storage=storage, comments=SimpleNamespace(generate_comment=comment, generate_title=lambda _: "기존 제목"),
         offsets=(0,),
+        remove_background_enabled=False,  # 배경 제거는 test_virtual_fitting_transparent_image.py
     )
     context = SimpleNamespace(may_continue=lambda: True)
     assert handler(job, "lease", context).status is HandlerStatus.DONE

@@ -1,10 +1,3 @@
-"""3단계: AI 결과 저장 작업(ai_stores_result)의 후처리·Webhook·Watchdog 연결과 인계·복구.
-
-실제 FollowUpProcessor·PostprocessHandler·RunwareWebhookService·Watchdog·AsyncJobStateRepository 를 격리 PostgreSQL 에서 돌리고,
-S3(메모리)·결과 다운로드·LLM·getResponse 만 가짜로 바꾼다. 실제 Runware·S3·SQS·LLM 은 부르지 않는다.
-AI 저장 작업은 테스트에서만 만든다(prepare_pruna_submission(..., ai_stores_result=True)). 실제 요청 경로는 바꾸지 않았다.
-"""
-
 import functools
 import hashlib
 import json
@@ -174,6 +167,7 @@ def handler_env(db, downloads=None, comments=None, s3=None):  # noqa: F811
         sleep=clock.sleep,
         result_url_expires_seconds=600,
         store_result=functools.partial(store_runware_result_image, download=downloads),
+        remove_background_enabled=False,  # 배경 제거는 test_virtual_fitting_transparent_image.py
     )
     return handler, s3, downloads
 
@@ -232,6 +226,7 @@ def test_direct_upload_job_uses_the_existing_s3_check_not_the_download(db):  # n
         sleep=clock.sleep,
         result_url_expires_seconds=600,
         store_result=functools.partial(store_runware_result_image, download=downloads),
+        remove_background_enabled=False,  # 배경 제거는 test_virtual_fitting_transparent_image.py
     )
     outcome = run(db, handler)
     assert outcome.action == "handler_done" and downloads.calls == []
