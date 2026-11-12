@@ -89,10 +89,11 @@ VIRTUAL_FITTING_RESULT_IMAGE_URL_EXPIRES_SECONDS = int(
     os.getenv("VIRTUAL_FITTING_RESULT_IMAGE_URL_EXPIRES_SECONDS", "600")
 )
 
-# V2 배경 제거(Runware RemBG v1.4). 켜져 있으면 저장한 Pruna 원본(V2 비동기 pruna-async.webp, V1 fallback
+# V2 배경 제거(Runware RemBG v1.4). 켜져 있으면 저장한 Pruna 원본(V2 비동기 pruna-async.webp, 연결하지 않은 V1 fallback
 # pruna-sync.webp)은 그대로 두고 투명 WebP(virtual-fitting/results/<id>/transparent.webp)를 따로 저장해 LLM 입력·
 # result_image_key 로 쓴다. RemBG 는 작업당 최대 1회(재시도 없음, S3 호출 표시 rembg-call.json 으로 유지)이고 실패하면
 # FITTING_BACKGROUND_REMOVAL_FAILED. false 면 기존과 같이 원본을 결과로 쓴다(되돌리기용).
+# 실제 RUN_FALLBACK(IDM-VTON) 결과 idm-vton.webp 에는 적용하지 않는다(원본을 그대로 결과로 쓴다).
 VIRTUAL_FITTING_REMOVE_BACKGROUND_ENABLED = (
     os.getenv("VIRTUAL_FITTING_REMOVE_BACKGROUND_ENABLED", "true").strip().lower() == "true"
 )
@@ -249,3 +250,14 @@ VIRTUAL_FITTING_PRUNA_MAX_CONCURRENT_SENDS = int(
 VIRTUAL_FITTING_PRUNA_MIN_SEND_INTERVAL_SECONDS = float(
     os.getenv("VIRTUAL_FITTING_PRUNA_MIN_SEND_INTERVAL_SECONDS", "10")
 )
+# V2 RUN_FALLBACK 의 IDM-VTON(Modal L40S, deploy/modal/idm_vton/service.py). 작업당 생성 호출은 최대 1회다.
+# Modal 인증은 SDK 표준 환경변수 MODAL_TOKEN_ID·MODAL_TOKEN_SECRET 으로 받는다(여기서 읽지 않고 로그에 남기지 않는다).
+IDM_VTON_MODAL_APP_NAME = os.getenv("IDM_VTON_MODAL_APP_NAME", "lookddak-idm-vton-fallback").strip()
+IDM_VTON_MODAL_FUNCTION_NAME = os.getenv("IDM_VTON_MODAL_FUNCTION_NAME", "generate").strip()
+# 비우면 토큰의 기본 Modal environment 를 쓴다.
+IDM_VTON_MODAL_ENVIRONMENT = os.getenv("IDM_VTON_MODAL_ENVIRONMENT", "").strip() or None
+# 결과 업로드 Presigned PUT 유효기간(초). Modal 대기열·실행 상한(각 600초)보다 길어야 하고, 이 시간 + 여유가 지나도록
+# 결과가 없으면 더 올라올 수 없다고 보고 최종 실패로 확정한다(복구 판단 기준).
+IDM_VTON_UPLOAD_URL_EXPIRES_SECONDS = int(os.getenv("IDM_VTON_UPLOAD_URL_EXPIRES_SECONDS", "1800"))
+# Worker 가 한 번의 처리에서 Modal 결과를 기다리는 최대 시간(초). 넘으면 보류하고 다음 수신·Watchdog 이 S3 로 확인한다.
+IDM_VTON_WAIT_SECONDS = float(os.getenv("IDM_VTON_WAIT_SECONDS", "1260"))

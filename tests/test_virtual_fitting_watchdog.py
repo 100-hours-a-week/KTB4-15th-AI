@@ -490,25 +490,25 @@ def fallback_started(db, image=False):  # noqa: F811
     return fb
 
 
-def test_fallback_object_after_the_attempt_is_recorded_and_resumed(wdb):
+@pytest.mark.parametrize("sync_key", [SYNC_KEY, SYNC_KEY.replace(".jpg", ".webp")])
+def test_pruna_sync_object_after_the_attempt_is_not_recovered(wdb, sync_key):
+    # fallback 복구는 IDM-VTON 결과(idm-vton.webp)만 본다. 시작 뒤 저장된 Pruna 동기 결과가 있어도 HEAD·기록하지 않는다.
     fb = fallback_started(wdb)
     fresh = S3ObjectCheck(
-        S3ObjectState.EXISTS, SYNC_KEY, last_modified=datetime.now(UTC) - timedelta(minutes=19)
+        S3ObjectState.EXISTS, sync_key, last_modified=datetime.now(UTC) - timedelta(minutes=19)
     )
     status = FakeStatus()
-    w = watchdog(wdb, status, storage=FakeStorage({SYNC_KEY: fresh}))
+    storage = FakeStorage({sync_key: fresh})
+    w = watchdog(wdb, status, storage=storage)
     w.run_once()
     current = job(wdb)
-    assert current.fallback_image_key == SYNC_KEY and current.fallback_attempt_count == 1
-    assert [p["action"] for _, p in w.queue.sent] == ["RUN_FALLBACK"]
+    assert current.fallback_image_key is None and current.result_payload is None
+    assert current.fallback_attempt_count == 1 and w.queue.sent == []
+    assert sync_key not in storage.heads and storage.heads == [
+        f"virtual-fitting/results/{JOB}/idm-vton.webp"
+    ]
     assert fb not in status.calls  # 동기 fallback 은 getResponse 로 조회하지 않는다
-    # 재발행된 메시지를 처리하면 생성 없이 제목·코멘트부터 이어 간다.
-    from tests.test_virtual_fitting_fallback_handler import env as fallback_env
-    from tests.test_virtual_fitting_fallback_handler import run as run_fallback
-
-    e = fallback_env(wdb)
-    run_fallback(wdb, e)
-    assert e.opener.requests == [] and job(wdb).result_payload["result_image_key"] == SYNC_KEY
+    assert ("fallback_result_unknown", "fallback", JOB) in reasons(w.sink)  # 업로드 기한 전: 보류
 
 
 @pytest.mark.parametrize(
