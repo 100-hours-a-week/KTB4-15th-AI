@@ -89,6 +89,15 @@ VIRTUAL_FITTING_RESULT_IMAGE_URL_EXPIRES_SECONDS = int(
     os.getenv("VIRTUAL_FITTING_RESULT_IMAGE_URL_EXPIRES_SECONDS", "600")
 )
 
+# V2 배경 제거(Runware RemBG v1.4). 켜져 있으면 저장한 Pruna 원본(V2 비동기 pruna-async.webp, 연결하지 않은 V1 fallback
+# pruna-sync.webp)은 그대로 두고 투명 WebP(virtual-fitting/results/<id>/transparent.webp)를 따로 저장해 LLM 입력·
+# result_image_key 로 쓴다. RemBG 는 작업당 최대 1회(재시도 없음, S3 호출 표시 rembg-call.json 으로 유지)이고 실패하면
+# FITTING_BACKGROUND_REMOVAL_FAILED. false 면 기존과 같이 원본을 결과로 쓴다(되돌리기용).
+# 실제 RUN_FALLBACK(IDM-VTON) 결과 idm-vton.webp 에는 적용하지 않는다(원본을 그대로 결과로 쓴다).
+VIRTUAL_FITTING_REMOVE_BACKGROUND_ENABLED = (
+    os.getenv("VIRTUAL_FITTING_REMOVE_BACKGROUND_ENABLED", "true").strip().lower() == "true"
+)
+
 # V2 비동기 가상피팅 SQS Standard 큐 URL. 리전은 AWS_REGION 과 같아야 한다(app/clients/sqs.py 가 검사).
 # 큐·DLQ 생성과 IAM 설정은 Cloud 담당이다. 비어 있으면 그 큐를 쓰는 시점에 SQS_CONFIG_ERROR.
 # - be-fitting-request : BE 가 발행, AI 요청 Worker 가 수신·삭제·Visibility 연장

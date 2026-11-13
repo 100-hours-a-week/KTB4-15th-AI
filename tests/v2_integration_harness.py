@@ -49,6 +49,17 @@ def webp_bytes() -> bytes:
     return buffer.getvalue()
 
 
+def transparent_webp_bytes() -> bytes:
+    """RemBG 결과(RGBA 정지 WebP): 위쪽 절반은 완전 투명 배경, 아래쪽 절반은 불투명 인물."""
+    from PIL import Image
+
+    image = Image.new("RGBA", (8, 12), (255, 255, 255, 0))
+    image.paste((30, 60, 90, 255), (0, 6, 8, 12))
+    buffer = io.BytesIO()
+    image.save(buffer, format="WEBP", lossless=True)
+    return buffer.getvalue()
+
+
 def jpeg_bytes() -> bytes:
     from PIL import Image
 
@@ -356,8 +367,13 @@ class FakeS3Client:
 
     def __getattr__(self, name):
         # 기존 Get/Put/HEAD 외의 메타데이터 보정 권한은 제공하지 않는다.
-        if name in {"copy_object", "get_object_tagging", "get_object_acl",
-                    "get_object_retention", "get_object_legal_hold"}:
+        if name in {
+            "copy_object",
+            "get_object_tagging",
+            "get_object_acl",
+            "get_object_retention",
+            "get_object_legal_hold",
+        }:
             raise AssertionError(f"unexpected metadata permission dependency: {name}")
         raise AttributeError(name)
 
@@ -427,6 +443,10 @@ class FakeRunware:
     )  # "success" | ("http", code) | "timeout" | ("no_cost",)
     comment_modes: deque = field(default_factory=deque)  # str | ("http", code)
     title_modes: deque = field(default_factory=deque)
+    # 배경 제거: "success" | ("http", code) | "timeout" | ("errors", [...]) | "opaque"(Alpha 없는 결과)
+    rembg_modes: deque = field(default_factory=deque)
+    rembg_cost: float = 0.0006
+    rembg_inputs: list = field(default_factory=list)  # RemBG 가 읽은 원본 S3 Key
     statuses: dict = field(
         default_factory=dict
     )  # task_uuid → getResponse 응답 dict 또는 ("http", code)
@@ -444,7 +464,7 @@ class FakeRunware:
         host = urlparse(url).netloc
         if host == "im.runware.ai":
             self.calls.append(("download", url))
-            return _Response(jpeg_bytes())
+            return _Response(webp_bytes() if ".webp" in url else jpeg_bytes())
         if url.endswith("/chat/completions"):
             return self._llm(url, json.loads(request.data))
         if host != "api.runware.ai":
@@ -468,6 +488,8 @@ class FakeRunware:
             )
         if kind == "getResponse":
             return self._status(url, task["taskUUID"])
+        if kind == "removeBackground":
+            return self._rembg(url, task)
         if kind == "imageInference" and task.get("deliveryMethod") == "async":
             return self._async(url, task)
         if kind == "imageInference":
@@ -512,6 +534,31 @@ class FakeRunware:
             return _Response({"errors": mode[1]})
         raise AssertionError(mode)
 
+    # 배경 제거(동기)
+    def _rembg(self, url, task):
+        self.calls.append(("rembg", task["taskUUID"]))
+        self.rembg_inputs.append(key_of(task["inputs"]["image"]))
+        mode = self.rembg_modes.popleft() if self.rembg_modes else "success"
+        if mode == "timeout":
+            raise TimeoutError("fake timeout")
+        if isinstance(mode, tuple) and mode[0] == "http":
+            raise _http_error(url, mode[1])
+        if isinstance(mode, tuple) and mode[0] == "errors":
+            return _Response({"errors": mode[1]})
+        return _Response({"data": [self._rembg_result(task, opaque=mode == "opaque")]})
+
+    def _rembg_result(self, task, *, opaque=False):
+        result_url = f"https://im.runware.ai/image/fake/rembg-{uuid.uuid4().hex}.webp?token=fake"
+        self.cdn[result_url] = webp_bytes() if opaque else transparent_webp_bytes()
+        item = {
+            "taskType": "imageBackgroundRemoval",
+            "taskUUID": task["taskUUID"],
+            "imageUUID": str(uuid.uuid4()),
+            "imageURL": result_url,
+            "cost": self.rembg_cost,
+        }
+        return item
+
     # V1 동기(fallback)
     def _sync(self, url, task):
         self.calls.append(("sync_generate", task.get("taskUUID")))
@@ -520,10 +567,11 @@ class FakeRunware:
             raise TimeoutError("fake timeout")
         if isinstance(mode, tuple) and mode[0] == "http":
             raise _http_error(url, mode[1])
+        extension = "webp" if task.get("outputFormat") == "WEBP" else "jpg"
         item = {
             "taskType": "imageInference",
             "taskUUID": task.get("taskUUID"),
-            "imageURL": f"https://im.runware.ai/image/fake/{uuid.uuid4().hex}.jpg",
+            "imageURL": f"https://im.runware.ai/image/fake/{uuid.uuid4().hex}.{extension}",
         }
         if mode != ("no_cost",):
             item["cost"] = self.sync_cost
@@ -648,6 +696,7 @@ RUNWARE_MODULES = (
     "app.virtual_fitting.providers.runware_usage",
     "app.virtual_fitting.providers.runware_status",
     "app.virtual_fitting.providers.runware_comment",
+    "app.virtual_fitting.providers.runware_rembg",
     "app.clients.s3",
 )
 

@@ -60,12 +60,24 @@ def env(monkeypatch):
     url = os.getenv("TEST_DATABASE_URL")
     if not url:
         pytest.skip("TEST_DATABASE_URL 이 없다")
+
     admin = psycopg.connect(url, autocommit=True, connect_timeout=3)
+
+    # 실제 테스트 DB 이름과 사용자 조회
+    expected_database, expected_user = admin.execute(
+        "SELECT current_database(), current_user"
+    ).fetchone()
+
     schema = f"vf_diag_{uuid.uuid4().hex[:10]}"
     admin.execute(f"CREATE SCHEMA {schema}")
+
     e = make_env(monkeypatch, url, schema)
     e.schema_name = schema
+    e.expected_database = expected_database
+    e.expected_user = expected_user
+
     monkeypatch.setattr(diag, "_db_target_logged", False)
+
     try:
         yield e
     finally:
@@ -118,7 +130,8 @@ def test_enabled_flags_and_actual_loop_starts_are_separate_events(env, rendered,
     stopped = {e["component"] for e in events(rendered, "component_stopped")}
     assert stopped == started
     (target,) = events(rendered, "db_target")
-    assert target["database"] == "stage4_test" and target["db_user"] == "stage4"
+    assert target["database"] == env.expected_database
+    assert target["db_user"] == env.expected_user
     assert target["jobs_table_schema"] == env.schema_name == target["products_table_schema"]
     assert target["search_path_schemas"] == env.schema_name
     # 테스트 계정은 pg_control_system() 을 읽을 수 있다(권한 없는 경우는 db_target_without_fingerprint 테스트)

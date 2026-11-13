@@ -108,6 +108,8 @@ def env(db, states=(), comments=None, **kwargs):  # noqa: F811
         clock=clock,
         sleep=kwargs.pop("sleep", clock.sleep),
         result_url_expires_seconds=600,
+        # 원본 확인·LLM 계약만 본다. 배경 제거 단계는 test_virtual_fitting_transparent_image.py 가 검증한다.
+        remove_background_enabled=False,
     )
     return SimpleNamespace(clock=clock, storage=storage, llm=llm, handler=handler)
 

@@ -1,4 +1,7 @@
-"""13단계: RUN_FALLBACK 핸들러 (V1 동기 생성 1회 → pruna-sync.jpg → 제목·코멘트 → V2 결과).
+"""13단계: RUN_FALLBACK 핸들러 (V1 동기 생성 1회 → pruna-sync.webp → 제목·코멘트 → V2 결과).
+
+이 파일은 원본 이미지를 그대로 결과로 쓰는 계약(배경 제거 끔)을 검증한다. 배경 제거를 켠 fallback(투명 WebP·재시도·최종 실패)은
+tests/test_virtual_fitting_transparent_image.py 가 실제 클라이언트로 검증한다.
 
 실제 10단계 FollowUpProcessor + RunFallbackHandler + 실제 AsyncJobStateRepository·PrunaLimiter·TaskCostRepository
 (격리 PostgreSQL)로 돌린다. 실제 RunwarePrunaProvider 를 쓰고 HTTP(opener)만 가짜로 바꿔 유료 생성 요청 수를 센다.
@@ -166,6 +169,7 @@ def env(db, *responses, **kwargs):  # noqa: F811
         sleep=clock.sleep,
         max_wait_seconds=kwargs.pop("max_wait_seconds", 60),
         result_url_expires_seconds=600,
+        remove_background_enabled=False,
     )
     return e
 
@@ -222,6 +226,9 @@ def test_fallback_generates_once_stores_fixed_key_and_saves_the_result(db, input
     fallback_task = current.fallback_task_uuid
     assert request[0]["taskUUID"] == fallback_task and fallback_task != async_task
     assert request[0]["deliveryMethod"] == "sync"
+    # 동기 생성도 WebP(품질 90)로 받아 pruna-sync.webp 원본으로 저장한다.
+    assert (request[0]["outputFormat"], request[0]["outputQuality"]) == ("WEBP", 90)
+    assert KEY == f"virtual-fitting/results/{JOB}/pruna-sync.webp"
     person = request[0]["inputs"]["referenceImages"][0]
     assert person["role"] == "person" and person["image"].startswith(
         f"https://bucket.s3.ap-northeast-2.amazonaws.com/{input_key}?"

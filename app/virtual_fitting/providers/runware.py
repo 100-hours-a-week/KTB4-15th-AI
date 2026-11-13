@@ -4,7 +4,7 @@ POST https://api.runware.ai/v1
   헤더: Authorization: Bearer <RUNWARE_VTON_API_KEY>
   본문: [{"taskType": "imageInference", "model": "prunaai:p-image@try-on",
           "inputs": {"referenceImages": [{"image", "role": "person" | "garment"}]},
-          "positivePrompt", "deliveryMethod": "sync", ...}]
+          "positivePrompt", "deliveryMethod": "sync", "outputFormat": "WEBP", "outputQuality": 90, ...}]
   성공: {"data": [{"imageURL": "..."}]}
 """
 
@@ -67,6 +67,10 @@ def build_payload(fitting_input: FittingInput, task_uuid: str) -> list:
             "positivePrompt": fitting_input.prompt,
             "deliveryMethod": "sync",
             "outputType": "URL",
+            # V2 비동기 생성과 같은 WebP(품질 90). V2 fallback 원본은 pruna-sync.webp 로 저장하고, V1 HTTP 결과 Key 의
+            # 확장자는 내려받은 이미지 형식(store_remote_image)을 따른다.
+            "outputFormat": "WEBP",
+            "outputQuality": 90,
             # 응답에 이 호출의 차감액(cost)을 싣게 한다. 하루 사용액 합계가 이 값을 더한다.
             "includeCost": True,
         }

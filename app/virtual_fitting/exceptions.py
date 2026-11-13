@@ -106,6 +106,17 @@ class FittingPostprocessError(VirtualFittingError):
     message = "가상 피팅 결과 후처리에 실패했습니다."
 
 
+class FittingBackgroundRemovalError(VirtualFittingError):
+    """V2: Pruna 이미지는 만들어졌지만 배경 제거(RemBG, 작업당 1회·재시도 없음)가 실패했을 때의 최종 실패.
+
+    Pruna 생성 실패(FITTING_MODEL_FAILED)와 구분한다. 이 실패로 Pruna 를 다시 생성하거나 fallback(IDM-VTON)을 실행하지 않는다.
+    """
+
+    status_code = status.HTTP_502_BAD_GATEWAY
+    code = "FITTING_BACKGROUND_REMOVAL_FAILED"
+    message = "가상 피팅 결과 이미지의 배경 제거에 실패했습니다."
+
+
 class FittingDatabaseError(VirtualFittingError):
     """AI PostgreSQL 연결 또는 상품 조회 자체가 실패했을 때.
 

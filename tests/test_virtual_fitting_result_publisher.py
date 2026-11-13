@@ -37,7 +37,7 @@ from tests.test_virtual_fitting_pruna_submit import JOB, db, job  # noqa: F401 (
 
 QUEUE_URL = "https://sqs.ap-northeast-2.amazonaws.com/123456789012/be-fitting-response"
 ASYNC_KEY = f"virtual-fitting/results/{JOB}/pruna-async.jpg"
-SYNC_KEY = f"virtual-fitting/results/{JOB}/pruna-sync.jpg"
+SYNC_KEY = f"virtual-fitting/results/{JOB}/pruna-sync.webp"  # V1 fallback 원본(배경 제거 끔)
 
 
 @pytest.fixture(autouse=True)

@@ -834,14 +834,14 @@ class Watchdog:
         ):
             self._republish(job, NextAction.RUN_FALLBACK, report)
             return
-        # 생성 함수를 불렀을 수 있는데 이미지 기록이 없다. IDM-VTON(Modal)을 다시 부르지 않고 고정 Key 만 확인한다
-        # (전환기 Pruna 동기 결과 pruna-sync.jpg 포함, idm_fallback_handler.inspect_fallback_result).
+        # 생성 함수를 불렀을 수 있는데 이미지 기록이 없다. IDM-VTON(Modal)을 다시 부르지 않고 고정 Key(idm-vton.webp)만
+        # 확인한다(idm_fallback_handler.inspect_fallback_result, Pruna 동기 결과 pruna-sync.* 는 보지 않는다).
         from app.virtual_fitting.idm_fallback_handler import ResultState, inspect_fallback_result
 
         check = inspect_fallback_result(self._storage, job)
         report.actions.append(f"fallback_result_{check.state.value}")
         if check.state is ResultState.FOUND:
-            # 고정 Key·작업·시도 메타데이터(또는 시작 뒤 저장 시각)가 맞는 객체만 그 시도의 결과로 기록한다.
+            # 고정 Key·작업·시도 메타데이터가 맞는 객체만 그 시도의 결과로 기록한다.
             recovered = self._recover_with_lease(
                 job,
                 NextAction.RUN_FALLBACK,

@@ -1,7 +1,8 @@
 """Runware 계정 사용량 조회 (accountManagement / getUsageActivity).
 
 하루 사용액 보정에만 쓴다. Runware 집계는 늦게 반영되므로 이 값으로 피팅을 막지 않고,
-우리 합계와 비교해 큰 쪽을 남기는 데만 쓴다 (FittingBudget).
+우리 합계와 비교해 큰 쪽을 남기는 데만 쓴다 (FittingBudget). 대상은 가상피팅 비용 모델(Pruna 생성 + RemBG 배경 제거)이다.
+models 를 여러 개 주면 totalSpend 는 그 합계다(2026-11-12 실측: Pruna 0.009 + RemBG 0.0012 = 0.0102).
 
 POST https://api.runware.ai/v1
   본문: [{"taskType": "accountManagement", "operation": "getUsageActivity",
@@ -24,12 +25,15 @@ from app.virtual_fitting.providers.runware import (
     RUNWARE_MODEL,
     get_runware_vton_api_key,
 )
+from app.virtual_fitting.providers.runware_rembg import REMBG_MODEL
 
 DEFAULT_TIMEOUT = 10.0
+# 하루 예산에 넣는 모델. 같은 계정의 채팅·코멘트 LLM 사용액은 넣지 않는다.
+USAGE_MODELS = (RUNWARE_MODEL, REMBG_MODEL)
 
 
 def build_usage_payload(day: date, task_uuid: str) -> list:
-    """하루치, 가상피팅 모델만. models 로 거르면 같은 계정의 채팅 LLM 사용액이 섞이지 않는다."""
+    """하루치, 가상피팅 비용 모델(Pruna·RemBG)만. models 로 거르면 같은 계정의 채팅 LLM 사용액이 섞이지 않는다."""
     return [
         {
             "taskType": "accountManagement",
@@ -37,7 +41,7 @@ def build_usage_payload(day: date, task_uuid: str) -> list:
             "operation": "getUsageActivity",
             "startDate": day.isoformat(),
             "endDate": day.isoformat(),
-            "models": [RUNWARE_MODEL],
+            "models": list(USAGE_MODELS),
             "groupBy": ["date"],
             "timezone": "UTC",
         }

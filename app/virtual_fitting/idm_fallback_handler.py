@@ -43,7 +43,7 @@ from app.virtual_fitting.exceptions import (
     ProductNotFoundError,
     UnsupportedSubCategoryError,
 )
-from app.virtual_fitting.fallback_handler import fallback_result_key, fallback_stage
+from app.virtual_fitting.fallback_handler import fallback_stage
 from app.virtual_fitting.idm_image_validator import (
     IdmImageUnavailable,
     check_idm_products,
@@ -68,8 +68,6 @@ MAX_RESULT_BYTES = 20 * 1024 * 1024
 RECOVERY_MARGIN_SECONDS = 120
 # Modal 에 넘기는 시작 마감은 업로드 URL 만료보다 이만큼 이르다(추론을 시작해도 업로드 전에 만료되지 않게).
 SERVICE_DEADLINE_MARGIN_SECONDS = 60
-# 객체 시각과 DB 시각 사이 허용 오차(Watchdog 의 CLOCK_SKEW_SECONDS 와 같다).
-CLOCK_SKEW_SECONDS = 300
 _INPUT_FAILURES = (
     ProductNotFoundError,
     InvalidFittingCombinationError,
@@ -79,7 +77,7 @@ _INPUT_FAILURES = (
 
 
 def idm_result_key(fitting_job_id: int) -> str:
-    """IDM-VTON 결과 Key. Pruna 비동기(pruna-async.jpg)·동기(pruna-sync.jpg) 결과와 분리한다."""
+    """IDM-VTON 결과 Key. Pruna 비동기(pruna-async.webp)·배경 제거(transparent.webp)·동기(pruna-sync.*) 결과와 분리한다."""
     return f"virtual-fitting/results/{fitting_job_id}/{IDM_RESULT_FILENAME}"
 
 
@@ -160,8 +158,8 @@ def inspect_fallback_result(
 ) -> ResultCheck:
     """시작 기록은 있고 이미지 기록이 없는 fallback 의 결과를 S3 로만 확인한다(생성 함수를 부르지 않는다).
 
-    IDM-VTON 고정 Key 를 먼저 본다. 없으면 배포 전환기에 시작된 Pruna 동기 fallback 결과(pruna-sync.jpg)가 시작 뒤에
-    저장됐는지 본다(있으면 그 Key 로 이어 간다). 둘 다 없으면 업로드 URL 만료 전에는 PENDING, 뒤에는 ABSENT.
+    IDM-VTON 고정 Key(idm-vton.webp)만 본다. Pruna 동기 fallback 결과(pruna-sync.*)는 조회하지 않는다. 없으면 업로드 URL
+    만료 전에는 PENDING, 뒤에는 ABSENT. HEAD 403·5xx·timeout 은 없다는 근거가 아니다(UNKNOWN).
     """
     if upload_expires_seconds is None:
         from app.config import settings
@@ -170,15 +168,6 @@ def inspect_fallback_result(
     check = verify_result_object(storage, job.fitting_job_id, job.fallback_task_uuid)
     if check.state is not ResultState.ABSENT:
         return check
-    legacy = storage.head_object(fallback_result_key(job.fitting_job_id))
-    modified = getattr(legacy, "last_modified", None)
-    if (
-        legacy.state is S3ObjectState.EXISTS
-        and modified is not None
-        and job.fallback_started_at is not None
-        and modified >= job.fallback_started_at - timedelta(seconds=CLOCK_SKEW_SECONDS)
-    ):
-        return ResultCheck(ResultState.FOUND, "legacy_pruna_sync", legacy.key)
     closed = upload_window_closed(job.fallback_started_at, upload_expires_seconds, now)
     if closed is None:
         return ResultCheck(ResultState.UNKNOWN, "no_started_at", check.key)

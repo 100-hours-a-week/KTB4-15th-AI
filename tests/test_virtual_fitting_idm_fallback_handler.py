@@ -603,17 +603,75 @@ def test_transient_s3_errors_during_recovery_are_held(db):  # noqa: F811
     assert job(db).result_payload is None
 
 
-def test_legacy_pruna_sync_result_saved_after_the_start_is_used(db):  # noqa: F811
-    from app.virtual_fitting.fallback_handler import fallback_result_key
+PRUNA_SYNC_KEYS = (
+    f"virtual-fitting/results/{JOB}/pruna-sync.jpg",
+    f"virtual-fitting/results/{JOB}/pruna-sync.webp",
+)
 
+
+@pytest.mark.parametrize("legacy", PRUNA_SYNC_KEYS)
+def test_pruna_sync_results_are_not_looked_up_or_recorded(db, legacy):  # noqa: F811
+    """IDM 복구는 idm-vton.webp 만 본다. 시작 뒤 저장된 Pruna 동기 결과만 있어도 쓰지 않는다(HEAD·GET 도 없음)."""
     idm_job(db)
     e = env(db, modal_kwargs={"outcome": "unknown"})
     run(db, e)
-    legacy = fallback_result_key(JOB)
-    e.storage.put(legacy, b"jpeg", "image/jpeg", {})
+    e.storage.put(legacy, b"legacy", "image/jpeg" if legacy.endswith(".jpg") else "image/webp")
+    expire_lease(db)
+    assert run(db, env(db, modal=e.modal, storage=e.storage)).action == "handler_deferred_kept"
+    current = job(db)
+    assert current.fallback_image_key is None and current.result_payload is None
+    # 업로드 기한이 지나면 기존 정책대로 실패 확정. Pruna 결과로 완료하지 않는다.
+    age_start(db, UPLOAD_EXPIRES + RECOVERY_MARGIN_SECONDS + 5)
     expire_lease(db)
     run(db, env(db, modal=e.modal, storage=e.storage))
-    assert job(db).result_payload["result_image_key"] == legacy
+    current = job(db)
+    assert current.fallback_image_key is None and current.result_payload == model_failed()
+    assert legacy not in e.storage.heads and legacy not in e.storage.reads
+    assert len(e.modal.requests) == 1  # 재호출 없음
+
+
+def recovery_job(started_ago):
+    return SimpleNamespace(
+        fitting_job_id=JOB,
+        fallback_task_uuid="attempt-1",
+        fallback_started_at=datetime.now(UTC) - timedelta(seconds=started_ago),
+    )
+
+
+CLOSED = UPLOAD_EXPIRES + RECOVERY_MARGIN_SECONDS + 5
+
+
+@pytest.mark.parametrize(
+    ("setup", "started_ago", "state", "reason"),
+    [
+        ("valid", 60, ResultState.FOUND, "verified"),
+        ("none", 60, ResultState.PENDING, "upload_window_open"),
+        ("none", CLOSED, ResultState.ABSENT, "upload_window_closed"),
+        (S3ObjectState.ACCESS_DENIED, CLOSED, ResultState.UNKNOWN, "head_access_denied"),
+        (S3ObjectState.TRANSIENT_ERROR, CLOSED, ResultState.UNKNOWN, "head_transient_error"),
+        ("other_attempt", CLOSED, ResultState.INVALID, "metadata_mismatch"),
+        ("pruna_sync_only", 60, ResultState.PENDING, "upload_window_open"),
+        ("pruna_sync_only", CLOSED, ResultState.ABSENT, "upload_window_closed"),
+    ],
+)
+def test_inspect_fallback_result_checks_only_the_idm_key(setup, started_ago, state, reason):
+    storage = FakeStorage()
+    metadata = {META_JOB: str(JOB), META_ATTEMPT: "attempt-1"}
+    if setup == "valid":
+        storage.put(KEY, webp_bytes(), metadata=metadata)
+    elif setup == "other_attempt":
+        storage.put(KEY, webp_bytes(), metadata={**metadata, META_ATTEMPT: "attempt-0"})
+    elif setup == "pruna_sync_only":
+        for legacy in PRUNA_SYNC_KEYS:
+            storage.put(legacy, webp_bytes(), "image/webp", metadata)
+    elif isinstance(setup, S3ObjectState):
+        storage.head_faults.append(setup)  # 403·5xx·timeout 은 없다는 근거가 아니다
+    check = inspect_fallback_result(
+        storage, recovery_job(started_ago), upload_expires_seconds=UPLOAD_EXPIRES
+    )
+    assert (check.state, check.reason, check.key) == (state, reason, KEY)
+    assert storage.heads == [KEY]  # Pruna 동기 결과 Key 는 HEAD 하지 않는다
+    assert set(storage.reads) <= {KEY}
 
 
 # --- DB 1회 선점 ---
